@@ -1,0 +1,48 @@
+{
+  "name": "pi-apm",
+  "version": "0.1.0",
+  "description": "AgentPM (apm) integration for pi: claims, handover context, and a run-end side-run that keeps the work ledger honest.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "agentpm",
+    "apm",
+    "agents",
+    "task-ledger"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-apm/index.ts"
+    ],
+    "contextBudget": "~250 tokens"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:rust": "cargo test --all-targets",
+    "test:stress": "bash scripts/stress.sh 10",
+    "typecheck": "tsc -p tsconfig.json",
+    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && tsc -p tsconfig.json && vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^1.5.2",
+    "typebox": "^1.4.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Traveler0014/pi-apm.git"
+  },
+  "homepage": "https://github.com/Traveler0014/pi-apm#readme",
+  "bugs": {
+    "url": "https://github.com/Traveler0014/pi-apm/issues"
+  }
+}

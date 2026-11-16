@@ -1,0 +1,19 @@
+/target
+/node_modules
+/dist
+/vitest*
+/coverage
+*.log
+*.tgz
+
+# SQLite artefacts (a ledger is local state, never a repository file)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# AgentPM local state: the SQLite ledger plus 0600 claim-token files.
+# This project never ships a ledger or a token; a consumer repository that wants
+# a shared ledger opts in explicitly (see README).
+.apm/
