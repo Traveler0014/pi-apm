@@ -79,10 +79,14 @@ pi list                  # should show pi-apm
 pi -e ./pi-apm/index.ts
 ```
 
-The extension is TypeScript loaded through Pi's jiti runtime. Its runtime
-dependencies (`typebox`, `@earendil-works/pi-ai`) are declared so a
-`pi install`/`npm install --omit=dev` deployment resolves them. The only external
-program it needs is `apm` (or an explicit `--apm-bin /path/to/apm`).
+The extension is TypeScript loaded through Pi's jiti runtime. The modules Pi
+supplies to extensions (`@earendil-works/pi-coding-agent`,
+`@earendil-works/pi-ai`, `typebox`) are declared as `peerDependencies` with a
+`"*"` range — the host-provided contract — so Pi maps them to its own copies and
+a physical install cannot create duplicate runtime modules. Pinned versions for
+local development live in `devDependencies` only; the package has no runtime
+`dependencies`. The only external program it needs is `apm` (or an explicit
+`--apm-bin /path/to/apm`).
 
 If you configure `--apm-bin`, that binary wins: the extension compares real paths
 against whatever `apm` is on `PATH` and, if they differ, creates a private shim

@@ -829,6 +829,9 @@ describe("tool audit metadata", () => {
 		const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "60" });
 		extension(api as unknown as Parameters<typeof extension>[0]);
 		const ctx = fakeCtx(p.dir, p.sessionId);
+		// This process may itself run inside a pi session that exported APM_RUN_ID
+		// for bash-invoked apm calls; the hook must restore whatever it found.
+		const inheritedRunId = process.env.APM_RUN_ID;
 
 		await withEnv(
 			{
@@ -858,7 +861,7 @@ describe("tool audit metadata", () => {
 		expect(progress?.run_id).toBe(report?.runId);
 		expect(progress?.actor).toBe("agent-a");
 		// The run id is also exported for bash-invoked apm calls, then restored.
-		expect(process.env.APM_RUN_ID).toBeUndefined();
+		expect(process.env.APM_RUN_ID).toBe(inheritedRunId);
 
 		// The activity came from the tool during the run, so reconciliation
 		// correctly skipped it — no synthetic side-run event was needed.
