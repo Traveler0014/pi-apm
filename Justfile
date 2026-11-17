@@ -64,6 +64,7 @@ verify:
     npx vitest run
     bash scripts/test-release-scripts.sh
     bash scripts/test-package-windows.sh
+    bash scripts/test-release-gate.sh
 
 # Static validation of the GitHub Actions YAML. Install actionlint with
 # `go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7`.
@@ -75,6 +76,7 @@ lint-workflows:
 test-release-scripts:
     bash scripts/test-release-scripts.sh
     bash scripts/test-package-windows.sh
+    bash scripts/test-release-gate.sh
 
 # Build a distributable archive for the host target into dist/ (no tag, no
 # publish). CI builds the full platform matrix; see docs/release.md.

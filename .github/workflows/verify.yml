@@ -71,3 +71,4 @@ jobs:
         run: |
           bash scripts/test-release-scripts.sh
           bash scripts/test-package-windows.sh
+          bash scripts/test-release-gate.sh

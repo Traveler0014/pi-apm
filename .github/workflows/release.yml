@@ -1,7 +1,13 @@
 # Cross-platform build and GitHub Release.
 #
-#   tag push v*        verify → build matrix → package → publish release
-#   workflow_dispatch  verify → build matrix → artifacts only (no release)
+#   push main (Cargo.toml)  gate → verify → build → auto-tag v<version> → publish
+#   tag push v*             gate → verify → build → publish
+#   workflow_dispatch       gate → verify → build → artifacts only (no release)
+#
+# The gate reads Cargo.toml and skips the whole pipeline when both the tag and
+# its Release already exist, so bumping the version is the only action needed.
+# A tag created with GITHUB_TOKEN does not trigger another workflow run, which
+# is what keeps auto-tagging from recursing.
 #
 # Artifacts: apm, apm-mcp and apm-serve for Linux x64/arm64, macOS x64/arm64
 # and Windows x64. Each archive carries README.md, LICENSE and SHA256SUMS; the
@@ -16,6 +22,8 @@ name: release
 
 on:
   push:
+    branches: [main]
+    paths: ["Cargo.toml"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -27,7 +35,32 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    name: decide whether to release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      publish: ${{ steps.decide.outputs.publish }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      auto_tag: ${{ steps.decide.outputs.auto_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Read version, check tag and release
+        id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release-gate.sh >> "$GITHUB_OUTPUT"
+
   verify:
+    if: needs.gate.outputs.run == 'true'
+    needs: gate
     uses: ./.github/workflows/verify.yml
 
   build:
@@ -105,10 +138,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+  publish:
+    name: tag and publish GitHub release
+    if: needs.gate.outputs.publish == 'true'
+    needs: [gate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Least privilege: only this job may write, and only repository contents.
@@ -126,13 +159,25 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A GITHUB_TOKEN-created tag does not start another workflow run.
+      - name: Create tag when the version is new
+        if: needs.gate.outputs.auto_tag == 'true'
+        shell: bash
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
       - name: Verify tag matches Cargo.toml
         shell: bash
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          tag="${GITHUB_REF_NAME#v}"
-          if [[ "$version" != "$tag" ]]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+          tag="${{ needs.gate.outputs.tag }}"
+          if [[ "$version" != "${tag#v}" ]]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
             exit 1
           fi
 
@@ -148,4 +193,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # Idempotent: create on the first run, upload --clobber + title sync on
         # a workflow re-run or after a partial upload. See the script's header.
-        run: bash scripts/publish-release.sh "${GITHUB_REF_NAME}" dist
+        run: bash scripts/publish-release.sh "${{ needs.gate.outputs.tag }}" dist

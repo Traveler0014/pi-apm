@@ -11,8 +11,18 @@ package registry; the GitHub Release is the only distribution channel.
 |---|---|---|
 | `.github/workflows/ci.yml` | push to `main`, pull request, manual | calls the shared verify workflow |
 | `.github/workflows/verify.yml` | `workflow_call` | fmt, clippy `-D warnings`, Rust tests, `npm ci`, tsc + UI typecheck, vitest, both stress scripts |
-| `.github/workflows/release.yml` | tag `v*` | verify → build matrix → package → publish |
-| `.github/workflows/release.yml` | `workflow_dispatch` | verify → build matrix → upload artifacts only (no release) |
+| `.github/workflows/release.yml` | tag `v*` | gate → verify → build matrix → package → publish |
+| `.github/workflows/release.yml` | push `main` touching `Cargo.toml` | gate → verify → build → **auto-tag** `v<version>` → publish |
+| `.github/workflows/release.yml` | `workflow_dispatch` | gate → verify → build → upload artifacts only (no release) |
+
+`release-gate.sh` reads `Cargo.toml` and decides the run:
+
+| State | Result |
+|---|---|
+| tag `v<version>` **and** its GitHub Release both exist | whole pipeline skipped (`run=false`); `ci.yml` still verifies the commit |
+| tag exists, Release missing (partial earlier run) | build + publish reuse the tag; publish is idempotent |
+| neither exists (new version on `main`) | build, create the tag at `GITHUB_SHA`, publish |
+| `workflow_dispatch` | always builds artifacts, never publishes |
 
 Successful runs upload one artifact per target (`apm-<triple>`), kept for 7 days.
 A tag release additionally attaches every archive plus an aggregate
@@ -23,6 +33,31 @@ retrying after a partial upload) replaces the assets with
 `gh release upload --clobber` and keeps the release title in sync instead of
 failing with "release already exists". Notes are generated once on creation and
 are not rewritten on retries.
+
+## Automatic release on a version bump
+
+The normal flow needs no manual tag:
+
+1. bump `version` in `Cargo.toml` and merge it to `main`;
+2. `release.yml` triggers (it only watches `Cargo.toml` changes on `main`);
+3. the gate finds no `v<version>` tag/release, runs verify and the five-platform
+   build, creates `v<version>` at that commit with `GITHUB_TOKEN`, and publishes;
+4. the release assets are the same archives and aggregate `SHA256SUMS.txt` as a
+   manual tag.
+
+A tag created with `GITHUB_TOKEN` does **not** start another workflow run, so the
+auto-tag cannot recurse into the tag-push entry point. Tag pushes and
+`workflow_dispatch` remain available: the first behaves like a normal release,
+the second builds artifacts for inspection without publishing.
+
+Two operational notes:
+
+- If a run is interrupted *after* the Release was created but before all assets
+  uploaded, the gate will skip the next push (tag + release exist). Repair it by
+  re-running just the publish job with `--clobber`, or delete the incomplete
+  Release and push again; the script is create-or-update by design.
+- Deleting a published tag/release is not a rollback. Fix forward with a new
+  patch version; existing installs can still download older releases by tag.
 
 ```bash
 # manual dry run: Actions → release → Run workflow (no tag, no release)
