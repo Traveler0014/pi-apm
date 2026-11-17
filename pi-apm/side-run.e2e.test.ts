@@ -1157,6 +1157,7 @@ describe("side-run lifecycle", () => {
 	it("honours a small --apm-side-run-timeout instead of a hidden 15s floor", { timeout: 60_000 }, async () => {
 		const p = project();
 		const marker = path.join(p.dir, "timeout.pid");
+		const termMarker = path.join(p.dir, "timeout.sigterm");
 		const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "2" });
 		extension(api as unknown as Parameters<typeof extension>[0]);
 		const ctx = fakeCtx(p.dir, p.sessionId);
@@ -1165,7 +1166,7 @@ describe("side-run lifecycle", () => {
 		await withEnv(
 			{
 				APM_BIN: apmBin,
-				APM_SIDE_RUN_PI: writeWedgedPi(marker, path.join(p.dir, "timeout.sigterm")),
+				APM_SIDE_RUN_PI: writeWedgedPi(marker, termMarker),
 				APM_DB: path.join(p.dir, ".apm", "apm.db"),
 			},
 			async () => {
@@ -1179,6 +1180,19 @@ describe("side-run lifecycle", () => {
 				expect(isAlive(pid as number)).toBe(false);
 			},
 		);
+
+		// Positive control for the SIGTERM marker (APM-37). The timeout path
+		// deliberately takes the graceful route (SIGTERM, then SIGKILL 3s later), so
+		// the wedged fixture's SIGTERM handler must have run and left its marker.
+		//
+		// This is what makes the negated assertions in the two cancellation tests
+		// meaningful: they assert the *absence* of this same marker, and an absence
+		// is only evidence if the marker mechanism is known to work. Without this
+		// control, a broken fixture (handler not installed, path typo, child killed
+		// before the handler runs) would leave every marker missing and the negative
+		// assertions would pass vacuously.
+		expect(fs.existsSync(termMarker)).toBe(true);
+		expect(fs.readFileSync(termMarker, "utf8").trim()).toBe("sigterm");
 
 		// 2s timeout + 3s SIGKILL escalation; a 15s floor would exceed this bound.
 		expect(elapsed).toBeLessThan(12_000);
