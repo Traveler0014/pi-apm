@@ -270,7 +270,6 @@ export function createShell(root: HTMLElement): Shell {
 			doneList.addEventListener("click", open);
 			topologyGroups.addEventListener("click", open);
 			dagPanel.addEventListener("click", open);
-			summary.addEventListener("click", open);
 		},
 	};
 	return shell;
@@ -633,14 +632,10 @@ export function updateSelectionSummary(
 
 	const nodes: HTMLElement[] = [];
 	const head = el("div", { className: "summary-head" });
+	// No Details control here on purpose: the row/card that owns this item already
+	// has the entry point, and a duplicate inside the summary panel was a dead
+	// button (it lived outside the `[data-item-id]` container its handler needs).
 	head.append(el("span", { className: "identifier", text: item.identifier }), el("span", { className: "title", text: item.title }));
-	const open = el("button", {
-		className: "open-detail",
-		text: "Details",
-		attrs: { type: "button", "aria-label": `Open details for ${item.identifier}` },
-	});
-	open.dataset.action = "open-detail";
-	head.append(open);
 	nodes.push(head);
 
 	nodes.push(el("p", { className: "muted", text: `${item.status} · health ${item.health} · priority ${item.priority} · ${item.workflow_id ?? "no workflow"}@${item.workflow_version ?? 0}` }));

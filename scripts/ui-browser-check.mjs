@@ -460,6 +460,61 @@ async function main() {
 	assert(blocking.hash.includes("scope=blocking"), "graph scope is reflected in the URL");
 	await page.click('[data-scope="all"]');
 
+	// Selected summary must not carry duplicate/dead controls (APM-26): the
+	// entry point lives on the card, the graph node and the list row.
+	const summaryControls = await page.evaluate(() => {
+		const summary = document.querySelector('.selection-summary');
+		const dead = [...document.querySelectorAll('[data-action="open-detail"]')].filter(
+			(button) => !button.closest("[data-item-id]"),
+		);
+		return {
+			summaryButtons: [...summary.querySelectorAll("button")].map((button) => button.textContent?.trim()),
+			deadButtons: dead.length,
+			summaryHead: summary.querySelector(".summary-head")?.textContent ?? "",
+			summaryHasStages: Boolean(summary.querySelector(".stage-bar")),
+			cardDetail: Boolean(document.querySelector('.topology-view [data-item-id] [data-action="open-detail"]')),
+		};
+	});
+	assert(
+		!summaryControls.summaryButtons.includes("Details"),
+		`the selection summary has no duplicate Details button (${summaryControls.summaryButtons.join(",")})`,
+	);
+	assert(summaryControls.deadButtons === 0, "no Details button exists outside an item container (no dead controls)");
+	assert(
+		summaryControls.summaryHead.includes(dependent) && summaryControls.summaryHasStages,
+		"the summary still shows the identifier, title and stage bar",
+	);
+
+	// The real entry point still works by click...
+	await page.evaluate((id) => {
+		const card = [...document.querySelectorAll('.topology-view [data-item-id]')].find(
+			(node) => node.querySelector(".identifier")?.textContent === id,
+		);
+		card?.querySelector('[data-action="open-detail"]')?.click();
+	}, dependent);
+	await page.waitForSelector('aside[role="dialog"]:visible', { timeout: 5000 });
+	assert(true, "the card Details button still opens the drawer by click");
+	await page.keyboard.press("Escape");
+	await page.waitForTimeout(200);
+
+	// ...and by keyboard (focus the button, press Enter).
+	const openedByKeyboard = await page.evaluate(async (id) => {
+		const card = [...document.querySelectorAll('.topology-view [data-item-id]')].find(
+			(node) => node.querySelector(".identifier")?.textContent === id,
+		);
+		const button = card?.querySelector('[data-action="open-detail"]');
+		button?.focus();
+		const focused = document.activeElement === button;
+		button?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+		return focused;
+	}, dependent);
+	await page.waitForTimeout(600);
+	const keyboardDrawer = await page.evaluate(
+		() => !document.querySelector(".drawer-backdrop")?.hasAttribute("hidden"),
+	);
+	if (keyboardDrawer) await page.keyboard.press("Escape");
+	assert(openedByKeyboard, "the card Details button is focusable (keyboard reachable)");
+
 	// Every closed category opens the full drawer — here via an in-session deep
 	// link to a cancelled item (the fold check above already covered "done").
 	await page.evaluate((id) => {

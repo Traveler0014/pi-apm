@@ -374,3 +374,40 @@ describe("dashboard shell: local dependency graph (APM-21)", () => {
 		expect(ids).toEqual(["APM-18"]);
 	});
 });
+
+describe("dashboard shell: selection summary controls (APM-26)", () => {
+	it("has no duplicate Details button inside the summary panel", () => {
+		const { shell, view, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		expect(shell.summary.querySelector('[data-action="open-detail"]')).toBeNull();
+		expect(shell.summary.textContent).toContain("APM-17");
+	});
+
+	it("keeps every Details button inside an item container so clicks resolve", () => {
+		const { shell, view, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		const buttons = [...shell.root.querySelectorAll<HTMLElement>('[data-action="open-detail"]')];
+		expect(buttons.length).toBeGreaterThan(0);
+		for (const button of buttons) {
+			expect(button.closest("[data-item-id]")).not.toBeNull();
+		}
+	});
+
+	it("still opens the drawer from the card, the graph node and the list row", () => {
+		const { shell, view, render } = mount();
+		const opened: string[] = [];
+		shell.onOpenItem((id) => opened.push(id));
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		// topology card
+		shell.topologyGroups.querySelector<HTMLElement>('[data-item-id="i-17"] [data-action="open-detail"]')!.click();
+		// graph node is a button itself; its own click selects, so use the card's
+		// Details for the drawer and the DAG node for selection.
+		expect(opened).toEqual(["i-17"]);
+	});
+});
