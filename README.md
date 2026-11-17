@@ -52,6 +52,28 @@ BINDIR=/usr/local/bin just install   # or any directory on PATH
 apm --version && apm-mcp --version && apm-serve --version
 ```
 
+### Prebuilt binaries
+
+Tagged releases attach one archive per platform (Linux x64/arm64, macOS
+x64/arm64, Windows x64) with all three binaries, `README.md`, `LICENSE` and a
+`SHA256SUMS` file, plus an aggregate checksum list:
+
+```bash
+gh release download v0.1.0 \
+  --pattern 'apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz' \
+  --pattern 'SHA256SUMS.txt'
+grep ' apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
+tar -xzf apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+install -m 0755 apm-0.1.0-x86_64-unknown-linux-gnu/{apm,apm-mcp,apm-serve} ~/.local/bin/
+```
+
+Releases are cut only from `v*` tags (the tag must equal `Cargo.toml`'s
+version); `workflow_dispatch` builds the same artifacts without publishing.
+Upgrade by installing a newer archive over the binaries; **rollback** is
+reinstalling the previous tag's archive (the SQLite ledger is unchanged — never
+edit it to roll back). See [`docs/release.md`](docs/release.md) for the build
+matrix, the no-tag dry-run checklist and cross-compilation troubleshooting.
+
 `just install` builds first and installs **all three** binaries with mode `0755`;
 `BINDIR` defaults to `$HOME/.local/bin`. If that directory is not on your `PATH`,
 add it:
@@ -1040,7 +1062,16 @@ npm run ui:browser         # real Chromium against a throwaway ledger (needs
                            #   Chromium; prints SKIP when none is installed)
 
 npm run verify             # all of the above that can run non-interactively
+
+just release-package       # host release archive in dist/
+just release-check dist/apm-<version>-<target>.tar.gz  # layout + checksums + CLI smoke
 ```
+
+GitHub Actions runs the same verify workflow on every push/PR
+(`.github/workflows/ci.yml` → `verify.yml`). A `v*` tag builds the five-platform
+matrix and publishes the archives with a GitHub Release; `workflow_dispatch`
+builds the same artifacts without publishing. See
+[`docs/release.md`](docs/release.md).
 
 `scripts/stress.sh` spawns 10 independent `apm` processes against one database and
 asserts exactly one claim winner, exactly one successful write, and the expected
@@ -1196,6 +1227,10 @@ docs/mcp.md              MCP client guide: config, tools, errors, tokens
 docs/rest.md             REST guide: routes, protections, error mapping
 docs/rest-ops.md         REST operations: limits, multi-instance, backup, triage
 docs/ui.md               `apm ui`: ticket-to-token flow, CSP, embedded assets
+docs/release.md          CI matrix, packaging, download/install/rollback
+.github/workflows/       ci.yml (verify), verify.yml (shared), release.yml (matrix + tag)
+scripts/package-release.sh   build one target archive (binaries + docs + SHA256SUMS)
+scripts/verify-package.sh    offline check: layout, checksums, --version, CLI smoke
 ```
 
 ## 14. Design notes and boundaries

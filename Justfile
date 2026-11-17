@@ -5,6 +5,10 @@
 #   just ui-build       rebuild ui/dist with Vite (needs Node; committed after each build)
 #   just verify         fmt + clippy + Rust tests + extension/UI typecheck + tests
 #   just ui-check       frontend typecheck + vitest for the ui/ workspace
+#   just lint-workflows   actionlint the GitHub Actions YAML (needs actionlint)
+#   just release-package  build a release archive for this machine (dist/)
+#   just test-release-scripts  offline tests for the publish/create-or-update logic
+#   just release-check ARCHIVE  verify structure, checksums and CLI smoke
 #   just stress         multi-process claim/write contention check (CLI + REST)
 
 CARGO := env_var_or_default("CARGO", "cargo")
@@ -58,6 +62,26 @@ verify:
     npx tsc -p tsconfig.json
     npm run ui:typecheck
     npx vitest run
+    bash scripts/test-release-scripts.sh
+
+# Static validation of the GitHub Actions YAML. Install actionlint with
+# `go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7`.
+lint-workflows:
+    actionlint .github/workflows/*.yml
+
+# Offline tests for scripts/publish-release.sh (fake gh; create vs --clobber).
+test-release-scripts:
+    bash scripts/test-release-scripts.sh
+
+# Build a distributable archive for the host target into dist/ (no tag, no
+# publish). CI builds the full platform matrix; see docs/release.md.
+release-package:
+    bash scripts/package-release.sh --outdir dist
+
+# Verify a release archive or unpacked directory: layout, SHA256SUMS, and — when
+# it targets this machine — --version plus a real CLI round-trip.
+release-check ARCHIVE:
+    bash scripts/verify-package.sh "{{ ARCHIVE }}"
 
 # Cross-process contention checks: CLI-only, then the REST adapter variant
 # (several servers, concurrent HTTP claims, mixed HTTP/CLI writers).
