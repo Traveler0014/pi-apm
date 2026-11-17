@@ -110,16 +110,25 @@ native_path() {
 
 build_windows_zip() {
   local archive="$1" native
+  # `archive` is absolute (OUT_DIR is resolved below), so the native path is a
+  # full drive-letter path; a relative one would be re-resolved against $STAGE.
   native="$(native_path "$archive")"
+  ZIP_TOOL="none"
+  ZIP_NATIVE_PATH="$native"
   if command -v 7z >/dev/null; then
+    ZIP_TOOL="7z"
     (cd "$STAGE" && 7z a -tzip "$native" "$PKG" >/dev/null)
   elif [[ -x "/c/Program Files/7-Zip/7z.exe" ]]; then
+    ZIP_TOOL="7z (default install)"
     (cd "$STAGE" && "/c/Program Files/7-Zip/7z.exe" a -tzip "$native" "$PKG" >/dev/null)
   elif command -v bsdtar >/dev/null; then
+    ZIP_TOOL="bsdtar"
     (cd "$STAGE" && bsdtar -a -c -f "$native" "$PKG")
   elif command -v tar >/dev/null && tar --version 2>/dev/null | head -1 | grep -qi bsdtar; then
+    ZIP_TOOL="tar (bsdtar)"
     (cd "$STAGE" && tar -a -c -f "$native" "$PKG")
   elif command -v python3 >/dev/null; then
+    ZIP_TOOL="python3 zipfile"
     (cd "$STAGE" && python3 - "$native" "$PKG" <<'PY'
 import os, sys, zipfile
 archive, package = sys.argv[1], sys.argv[2]
@@ -131,6 +140,7 @@ with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
 PY
     )
   elif command -v python >/dev/null; then
+    ZIP_TOOL="python zipfile"
     (cd "$STAGE" && python - "$native" "$PKG" <<'PY'
 import os, sys, zipfile
 archive, package = sys.argv[1], sys.argv[2]
@@ -142,6 +152,9 @@ with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
 PY
     )
   elif command -v zip >/dev/null; then
+    # MSYS zip is a POSIX tool: it needs the POSIX absolute path, not the
+    # Windows form the native tools above receive.
+    ZIP_TOOL="zip (MSYS)"
     (cd "$STAGE" && zip -qr "$archive" "$PKG")
   else
     echo "package-release: cannot build the Windows zip: install 7-Zip, or provide bsdtar, Python 3 or zip on PATH" >&2
@@ -158,16 +171,28 @@ PY
 )
 
 mkdir -p "$OUT_DIR"
+# Native Windows tools resolve relative paths against their own cwd, and the
+# packager cd's into $STAGE; resolve the output directory once, up front.
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 ARCHIVE=""
 case "$TARGET" in
   *windows*)
     ARCHIVE="$OUT_DIR/$PKG.zip"
     rm -f "$ARCHIVE"
     build_windows_zip "$ARCHIVE"
+    if [[ ! -f "$ARCHIVE" ]]; then
+      echo "package-release: ${ZIP_TOOL:-the zip tool} exited without creating ${ARCHIVE} (native path: ${ZIP_NATIVE_PATH:-unknown})" >&2
+      echo "package-release: staging directory contains: $(ls -1 "$STAGE" | tr '\n' ' ')" >&2
+      exit 1
+    fi
     ;;
   *)
     ARCHIVE="$OUT_DIR/$PKG.tar.gz"
     tar -czf "$ARCHIVE" -C "$STAGE" "$PKG"
+    if [[ ! -f "$ARCHIVE" ]]; then
+      echo "package-release: tar exited without creating $ARCHIVE" >&2
+      exit 1
+    fi
     ;;
 esac
 

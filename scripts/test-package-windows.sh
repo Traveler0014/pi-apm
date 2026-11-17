@@ -39,6 +39,7 @@ FAKE
 cat > "$WORK/fake/7z" <<'FAKE'
 #!/usr/bin/env bash
 echo "7z $*" >> "${FAKE_LOG:?}"
+[[ "${NOOP:-0}" == "1" ]] && exit 0
 archive="$3"
 package="$4"
 native="${archive#Z:}"
@@ -46,6 +47,9 @@ native="${native//\\//}"
 python3 - "$native" "$package" <<'PY'
 import os, sys, zipfile
 archive, package = sys.argv[1], sys.argv[2]
+parent = os.path.dirname(archive)
+if parent:
+    os.makedirs(parent, exist_ok=True)
 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
     for directory, _, files in os.walk(package):
         for name in sorted(files):
@@ -98,6 +102,55 @@ PY
   else
     cat "$WORK/verify.log" >&2
     fail "verify-package rejected the Windows zip"
+  fi
+fi
+
+# --- relative --outdir: the real workflow passes `--outdir dist` ----------
+# A relative archive path is resolved by the native tool against its own cwd
+# (the staging directory), which is how the zip silently landed nowhere. The
+# fake 7z has real semantics: it resolves the path it is given, from its cwd.
+mkdir -p "$WORK/cwd"
+: > "$FAKE_LOG"
+(
+  cd "$WORK/cwd"
+  PATH="$WORK/fake:$PATH" bash "$ROOT/scripts/package-release.sh" \
+    --target "$TARGET" --version "$VERSION" \
+    --bin-dir "$WORK/bin" --outdir dist > "$WORK/relative.log" 2>&1
+) || {
+  cat "$WORK/relative.log" >&2
+  fail "relative --outdir failed"
+}
+RELATIVE_ARCHIVE="$WORK/cwd/dist/$PKG.zip"
+if [[ -f "$RELATIVE_ARCHIVE" ]]; then
+  echo "PASS relative --outdir writes $PKG.zip into that directory"
+else
+  fail "relative --outdir produced no archive (7z: $(grep '7z a' "$FAKE_LOG" || true))"
+fi
+if grep -q '7z a -tzip Z:.*cwd.*dist' "$FAKE_LOG"; then
+  echo "PASS relative --outdir was made absolute before cygpath"
+else
+  fail "relative --outdir was not resolved to an absolute native path: $(cat "$FAKE_LOG")"
+fi
+if [[ -f "$RELATIVE_ARCHIVE" ]]; then
+  count="$(python3 -c 'import sys, zipfile; print(len(zipfile.ZipFile(sys.argv[1]).namelist()))' "$RELATIVE_ARCHIVE")"
+  [[ "$count" == "6" ]] || fail "relative archive has $count files, expected 6"
+  echo "PASS relative archive still holds the six files"
+fi
+
+# --- a tool that exits 0 but writes nothing: name the archive, not sha256sum --
+: > "$FAKE_LOG"
+if NOOP=1 PATH="$WORK/fake:$PATH" bash "$ROOT/scripts/package-release.sh" \
+  --target "$TARGET" --version "$VERSION" \
+  --bin-dir "$WORK/bin" --outdir "$WORK/out-noop" > "$WORK/noop.log" 2>&1; then
+  fail "a tool that creates no archive must fail the step"
+else
+  if grep -q "without creating" "$WORK/noop.log" && grep -q ".zip" "$WORK/noop.log"; then
+    echo "PASS silent tool failure names the missing archive"
+  else
+    fail "silent tool failure is unclear: $(cat "$WORK/noop.log")"
+  fi
+  if grep -qi "sha256sum" "$WORK/noop.log"; then
+    fail "silent tool failure fell through to sha256sum"
   fi
 fi
 
