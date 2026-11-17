@@ -764,3 +764,514 @@ pre.field-value {
 		width: 100%;
 	}
 }
+
+/* --- view toggle ------------------------------------------------------ */
+
+.views {
+	display: inline-flex;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	overflow: hidden;
+	align-self: end;
+}
+
+.views .view {
+	border: none;
+	background: var(--surface);
+	color: var(--muted);
+	font: inherit;
+	font-size: 13px;
+	padding: 6px 12px;
+	cursor: pointer;
+}
+
+.views .view[aria-pressed="true"] {
+	background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+	color: var(--text);
+	font-weight: 600;
+}
+
+.views .view:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px;
+}
+
+/* --- stage bar -------------------------------------------------------- */
+
+.stage-bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px 10px;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.stage-summary {
+	font-family: var(--mono);
+	color: var(--text);
+	white-space: nowrap;
+}
+
+.stages {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.stage {
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	padding: 0 7px;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	white-space: nowrap;
+}
+
+.stage[data-state="current"] {
+	border-color: var(--accent);
+	color: var(--text);
+	font-weight: 600;
+	background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+}
+
+.stage[data-state="next"] {
+	border-style: dashed;
+	border-color: var(--accent);
+	color: var(--text);
+}
+
+.stage[data-category="closed"] .stage-symbol,
+.stage[data-state="terminal"] {
+	color: var(--muted);
+}
+
+.stage-symbol {
+	font-family: var(--mono);
+}
+
+.stage[data-category="closed"] .stage-symbol {
+	color: var(--ok);
+}
+
+.stage-missing {
+	color: var(--warn);
+	font-family: var(--mono);
+}
+
+.stage-warn {
+	color: var(--danger);
+}
+
+/* --- acceptance progress --------------------------------------------- */
+
+.acceptance-line {
+	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.acceptance-bar {
+	display: inline-block;
+	width: 84px;
+	height: 6px;
+	border-radius: 999px;
+	background: var(--surface-2);
+	border: 1px solid var(--border);
+	overflow: hidden;
+}
+
+.acceptance-fill {
+	display: block;
+	height: 100%;
+	background: var(--ok);
+}
+
+/* --- topology view ---------------------------------------------------- */
+
+.topology-view[hidden],
+.list-view[hidden] {
+	display: none;
+}
+
+.topology-view {
+	display: grid;
+	grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr);
+	gap: 16px;
+	align-items: start;
+}
+
+.topology-view > .selection-summary {
+	grid-column: 2;
+	grid-row: 1;
+}
+
+.dag-panel {
+	grid-column: 1;
+	grid-row: 2;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--surface);
+	padding: 10px 12px;
+}
+
+.topology-groups {
+	grid-column: 1;
+	grid-row: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+@media (max-width: 860px) {
+	.topology-view > .selection-summary,
+	.dag-panel,
+	.topology-groups {
+		grid-column: 1;
+		grid-row: auto;
+	}
+}
+
+.topo-group {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--surface-2);
+	padding: 10px 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.topo-title {
+	margin: 0;
+	font-size: 13px;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	color: var(--muted);
+}
+
+.topo-group[data-group="ready"] .topo-title {
+	color: var(--ok);
+}
+
+.topo-group[data-group="waiting"] .topo-title {
+	color: var(--warn);
+}
+
+.topo-group[data-group="cycles"] .topo-title {
+	color: var(--danger);
+}
+
+.topo-card {
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-left: 3px solid var(--border);
+	border-radius: var(--radius);
+	padding: 8px 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	cursor: pointer;
+}
+
+.topo-card[data-health="stale"] {
+	border-left-color: var(--warn);
+}
+
+.topo-card[data-selected="true"] {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.topo-card:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+.topo-card-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 8px;
+}
+
+.topo-card-body {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.topo-blockers,
+.topo-facts {
+	margin: 0;
+	font-size: 12px;
+	color: var(--muted);
+	overflow-wrap: anywhere;
+}
+
+.topo-blockers .field-label {
+	margin-right: 4px;
+}
+
+.selection-summary {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--surface);
+	padding: 10px 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	position: sticky;
+	top: 12px;
+}
+
+.summary-head {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.summary-head .open-detail {
+	margin-left: auto;
+}
+
+.summary-goal {
+	margin: 0;
+	font-size: 13px;
+	overflow-wrap: anywhere;
+}
+
+.branches {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.branch-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+}
+
+.branch {
+	display: flex;
+	justify-content: space-between;
+	gap: 8px;
+	font-size: 12px;
+	border-bottom: 1px dashed var(--border);
+	padding-bottom: 2px;
+}
+
+.branch-mark {
+	font-family: var(--mono);
+	color: var(--text);
+}
+
+.branch-guards {
+	color: var(--muted);
+	text-align: right;
+}
+
+@media (max-width: 860px) {
+	.topology-view {
+		grid-template-columns: 1fr;
+	}
+
+	.selection-summary {
+		position: static;
+	}
+}
+
+/* --- local dependency graph ------------------------------------------- */
+
+.dag-section {
+	border-top: 1px solid var(--border);
+	padding-top: 8px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.dag-title {
+	margin: 0;
+	font-size: 12px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--muted);
+}
+
+.dag-scopes {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+
+.dag-scope {
+	font-size: 12px;
+	padding: 3px 8px;
+}
+
+.dag-scope[aria-pressed="true"] {
+	border-color: var(--accent);
+	color: var(--text);
+	background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+}
+
+/* Narrow screens scroll the picture instead of squeezing the boxes; the text
+   view below is always available and needs no horizontal scrolling. */
+.dag {
+	position: relative;
+	width: var(--dag-width, 100%);
+	height: var(--dag-height, 120px);
+	max-width: 100%;
+	overflow-x: auto;
+	overflow-y: hidden;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--surface-2);
+}
+
+.dag[data-empty="true"] {
+	height: auto;
+	padding: 10px;
+}
+
+.dag-edges {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+}
+
+.dag-edge {
+	fill: none;
+	stroke-width: 1.6;
+}
+
+.dag-edge-dependency {
+	stroke: var(--accent);
+}
+
+.dag-edge-parent {
+	stroke: var(--muted);
+	stroke-dasharray: 5 4;
+}
+
+.dag-arrow-head {
+	fill: var(--accent);
+}
+
+.dag-node {
+	position: absolute;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	align-items: flex-start;
+	justify-content: center;
+	padding: 6px 8px;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	color: var(--text);
+	font: inherit;
+	font-size: 11px;
+	cursor: pointer;
+	text-align: left;
+	overflow: hidden;
+}
+
+.dag-node[data-role="parent"],
+.dag-node[data-role="child"] {
+	border-style: dashed;
+}
+
+.dag-node[data-status="closed"] {
+	opacity: 0.75;
+}
+
+.dag-node[data-selected="true"] {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.dag-node:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+.dag-node-id {
+	font-family: var(--mono);
+	color: var(--muted);
+}
+
+.dag-node-title {
+	font-weight: 600;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.dag-node-meta {
+	color: var(--muted);
+}
+
+.dag-legend {
+	margin: 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+	font-size: 11px;
+	color: var(--muted);
+}
+
+.dag-legend .solid {
+	color: var(--accent);
+}
+
+.dag-legend .dashed {
+	color: var(--muted);
+}
+
+.dag-text-wrap summary {
+	cursor: pointer;
+	font-size: 12px;
+	color: var(--muted);
+}
+
+.dag-text {
+	margin: 4px 0 0;
+	padding-left: 16px;
+	font-size: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	overflow-wrap: anywhere;
+}
+
+.dag-text-select {
+	font-size: 11px;
+	padding: 1px 6px;
+}
+
+@media (max-width: 720px) {
+	/* Phone layout: the graph scrolls horizontally and the text view is the
+	   primary way to read relations. */
+	.dag {
+		height: auto;
+		min-height: var(--dag-height, 120px);
+	}
+}

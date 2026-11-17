@@ -193,6 +193,57 @@ export interface HealthResponse {
 	version?: string;
 }
 
+export interface WorkflowStateDef {
+	key: string;
+	label: string;
+	category: string;
+	terminal: boolean;
+	cancel?: boolean;
+}
+
+export interface WorkflowTransitionDef {
+	from: string;
+	to: string;
+	requires?: string[];
+}
+
+export interface WorkflowDef {
+	id: string;
+	version: number;
+	name?: string;
+	initial: string;
+	states: WorkflowStateDef[];
+	transitions: WorkflowTransitionDef[];
+}
+
+export interface WorkflowDefinitionResponse {
+	ok: true;
+	workflow: WorkflowDef;
+}
+
+export interface ItemWorkflowResponse {
+	ok: true;
+	identifier: string;
+	workflow_id: string;
+	workflow_version: number;
+	workflow: WorkflowDef;
+}
+
+export interface WorkflowSummary {
+	id: string;
+	version: number;
+	name: string;
+	initial: string;
+	states: number;
+	is_project_default: boolean;
+}
+
+export interface WorkflowListResponse {
+	ok: true;
+	count: number;
+	workflows: WorkflowSummary[];
+}
+
 export interface ApiErrorBody {
 	ok: false;
 	error: {

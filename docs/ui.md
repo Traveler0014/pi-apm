@@ -132,6 +132,64 @@ polling (no 401 storm); reload the freshly printed URL to continue.
 `Ctrl-C` stops the server. Nothing is left running: no pid file, no daemon, no
 state outside the existing `.apm/apm.db`.
 
+## Visualisation: topology, stages and the local graph
+
+The dashboard has two views, switched from the segmented control in the
+controls bar; the choice is kept in the URL (`#view=topology`) exactly like the
+filters and the selection.
+
+**List view** — one row per item, with the item's own workflow stage bar, its
+acceptance progress (`acceptance 1/2 done · 1 open`), queue badges (an item can
+carry several: `▲ lost lease` + `● in progress` + `✋ holder`), priority, health
+and last update. Rows are deduplicated by item id: an item that appears in
+several dashboard buckets is one row with several badges, never two rows.
+
+**Topology view** — the decision view:
+
+| Group | Meaning |
+|---|---|
+| **Ready to start** | open items with no open blocker; each card shows `unlocks N` (how many transitive dependents it would free) |
+| **Waiting on upstream** | open items with at least one open blocker; the card lists the direct blockers (`waiting on BRW-1 (doing)`) plus the transitive count and the unlock count |
+| **Dependency cycles** | items that block each other; they are never "ready" and the card says to break the loop with `apm dep remove` |
+
+Blockers are resolved from the item snapshot (`/api/items?all=true`), so closed
+work stops blocking immediately, and an item inside a cycle is never counted as
+"unlocked" by closing one node.
+
+**Stage bars** come from the item's *workflow snapshot* (`workflow_id` +
+`workflow_version`), fetched read-only from `GET /api/items/{id}/workflow`:
+
+```bash
+curl -H "Authorization: Bearer $(cat .apm/rest-token)" \
+  http://127.0.0.1:7717/api/items/APM-15/workflow
+```
+
+* the current state is marked (`aria-current="step"`), one-step neighbours are
+  dashed, and closed states are marked with ✓;
+* the item's **branches** (allowed transitions) are listed with their guards
+  (`needs evidence or acceptance`, `needs reason`) in the selection summary;
+* a missing definition renders `◇ no workflow definition (<id>@<version>)`, and a
+  state the workflow does not declare renders an explicit unknown-stage warning —
+  the UI never guesses the default six states.
+
+**Local dependency graph** (below the groups, for the selected item): only the
+neighbourhood is drawn (two hops), with dependency edges solid + arrowed and
+parent/child edges dashed without an arrow, plus a legend. Scope buttons switch
+between **All**, **Blocking chain**, **Upstream** and **Downstream**; the scope
+is reflected in the URL (`#scope=upstream`). Every node is a real `<button>`
+(`aria-label` carries identifier, title, status and health; `aria-current` marks
+the selection), and the **Text view** disclosure below the graph lists the same
+relations in reading order (`← blocks`, `↑ parent`, `● selected`,
+`↓ child`, `→ unblocks`) with *Select* buttons that drive the same selection —
+that list is the keyboard and screen-reader equivalent of the picture.
+
+**Closed items are first-class.** The `Closed items` fold contains every closed
+category — `done`, `cancelled`, `aborted` and any custom closed state — not just
+the dashboard's "recently done" window. Any of them opens the full detail drawer
+from the fold, from a search hit, or from a deep link (`#item=APM-19`, also while
+the page is already open). Deep links never carry the ticket: it is stripped on
+load and the remaining fragment keys are kept.
+
 ## Automated verification
 
 ```bash
@@ -139,8 +197,11 @@ just ui-check      # frontend typecheck + vitest (ui/**)
 just ui-browser    # real Chromium via playwright-core, throwaway ledger:
                    # ticket exchange, first paint vs `apm dashboard --json`,
                    # dedup, filters/search/sort, drawer + events + focus + copy,
-                   # 5 s auto refresh, manual refresh, offline cache + recovery,
-                   # XSS escaping, 390 px overflow, storage/HTML/console hygiene
+                   # topology groups + blockers/unlocks + stage bars (custom
+                   # workflow) + local graph (both edge kinds, scopes, text view)
+                   # + closed-category drawer, 5 s auto refresh, manual refresh,
+                   # offline cache + recovery, XSS escaping, 390 px overflow,
+                   # storage/HTML/CSP/console hygiene
 ```
 
 `just ui-browser` needs a Chromium binary; it looks at `APM_CHROME` /

@@ -57,13 +57,27 @@ describe("bootstrap ticket delivery via URL fragment", () => {
 		expect(JSON.parse(calls[0]!.body!)).toEqual({ ticket: "apm_boot_abc" });
 	});
 
-	it("accepts ticket= anywhere in the fragment", async () => {
+	it("accepts ticket= anywhere in the fragment and keeps the other keys", async () => {
 		setToken(null);
 		const replaced: string[] = [];
 		const fetcher: Fetcher = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(okToken) });
 		expect(
-			await bootstrapTokenFromFragment(fakeLocation("#view=queue&ticket=apm_boot_xyz"), { replaceState: (_s, _t, url) => replaced.push(String(url)) }, { fetcher }),
+			await bootstrapTokenFromFragment(
+				fakeLocation("#view=topology&item=APM-15&ticket=apm_boot_xyz"),
+				{ replaceState: (_s, _t, url) => replaced.push(String(url)) },
+				{ fetcher },
+			),
 		).toBe(true);
+		// The ticket is gone; the view/item deep link survives so the page can use it.
+		expect(replaced[0]).toBe("/ui/?mock=0#view=topology&item=APM-15");
+		expect(replaced[0]).not.toContain("ticket");
+	});
+
+	it("leaves no fragment at all when the ticket was the only key", async () => {
+		setToken(null);
+		const replaced: string[] = [];
+		const fetcher: Fetcher = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(okToken) });
+		await bootstrapTokenFromFragment(fakeLocation("#ticket=apm_boot_xyz"), { replaceState: (_s, _t, url) => replaced.push(String(url)) }, { fetcher });
 		expect(replaced[0]).toBe("/ui/?mock=0");
 	});
 

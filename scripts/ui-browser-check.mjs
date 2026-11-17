@@ -1,10 +1,17 @@
 #!/usr/bin/env node
-// Real-browser verification for `apm ui` (APM-17).
+// Real-browser verification for `apm ui` (APM-22).
 //
 // Spawns the release binary against a throwaway SQLite ledger, drives Chromium
 // via playwright-core, and asserts the dashboard behaves like the docs promise:
 // ticket exchange, live data, filters, detail drawer, auto/manual refresh,
 // offline cache, XSS safety, no token in storage/HTML and a clean console.
+//
+// Coverage added for the visualisation work (APM-20/21): the topology view
+// (ready vs waiting, direct/transitive blockers, unlock counts), stage bars from
+// each item's *snapshot* workflow (including a custom four-state flow and its
+// acceptance progress), the local dependency graph (dependency vs parent edges,
+// scope switches, text equivalent) and closed-category reachability (done /
+// cancelled items open the full drawer from the fold and from a deep link).
 //
 // Requirements: a Chromium/Chrome binary. Set APM_CHROME or CHROME_PATH, or let
 // the script find one under ~/.cache/ms-playwright (Playwright's cache) or PATH.
@@ -149,6 +156,56 @@ async function main() {
 	);
 	run(BIN, ["status", done, "--session", "browser", "--to", "done", "--note", "released", "--json"], env);
 
+	// Visualisation fixtures: a custom workflow with its own states, a spike that
+	// uses it, a story for the parent edge and a cancelled item (every closed
+	// category must be reachable, not just "done").
+	const workflowFile = path.join(tmp, "review-flow.json");
+	fs.writeFileSync(
+		workflowFile,
+		JSON.stringify({
+			id: "review-flow",
+			version: 1,
+			name: "Review flow",
+			initial: "triage",
+			states: [
+				{ key: "triage", label: "Triage", category: "open", terminal: false },
+				{ key: "reviewing", label: "Reviewing", category: "review", terminal: false },
+				{ key: "shipped", label: "Shipped", category: "closed", terminal: true },
+				{ key: "dropped", label: "Dropped", category: "closed", terminal: true, cancel: true },
+			],
+			transitions: [
+				{ from: "triage", to: "reviewing" },
+				{ from: "reviewing", to: "shipped", requires: ["evidence_or_acceptance", "progress_or_note"] },
+				{ from: "reviewing", to: "dropped", requires: ["reason"] },
+			],
+			guards: {
+				reason: { kind: "reason", description: "needs a reason" },
+				evidence_or_acceptance: { kind: "evidence_or_acceptance", description: "needs evidence" },
+				progress_or_note: { kind: "progress_or_note", description: "needs progress" },
+			},
+		}),
+	);
+	run(BIN, ["workflow", "set", "--file", workflowFile, "--bind", "spike", "--json"], env);
+	const spike = identifier([
+		"create", "--title", "Spike with a custom flow", "--goal", "verify the UI",
+		"--current-state", "fixture ready", "--type", "spike",
+	]);
+	run(BIN, ["claim", spike, "--session", "browser", "--json"], env);
+	run(BIN, ["status", spike, "--session", "browser", "--to", "reviewing", "--json"], env);
+	run(BIN, ["accept", "add", spike, "--session", "browser", "--text", "custom stage renders", "--json"], env);
+	run(BIN, ["accept", "add", spike, "--session", "browser", "--text", "guards are shown", "--json"], env);
+	run(BIN, ["accept", "set", spike, "--session", "browser", "--seq", "1", "--status", "met", "--json"], env);
+
+	const epic = identifier([
+		"create", "--title", "UI epic", "--goal", "verify the UI", "--current-state", "fixture ready", "--type", "story",
+	]);
+	run(BIN, ["--human", "update", dependent, "--parent", epic, "--json"], env);
+
+	const cancelled = identifier([
+		"create", "--title", "Abandoned idea", "--goal", "verify the UI", "--current-state", "fixture ready",
+	]);
+	run(BIN, ["--human", "status", cancelled, "--to", "cancelled", "--reason", "duplicate", "--json"], env);
+
 	const dashboard = apmJson(["dashboard"], env);
 
 	const server = spawn(BIN, ["ui", "--db", db, "--no-open", "--port", "0"], {
@@ -239,14 +296,14 @@ async function main() {
 
 	// 3. Deduplication: one row per item, multiple badges on one row.
 	const rows = await page.evaluate(() =>
-		[...document.querySelectorAll('[aria-label*=": "]')]
+		[...document.querySelectorAll('.list-view [aria-label*=": "]')]
 			.map((el) => el.getAttribute("aria-label"))
 			.filter((label) => /^BRW-\d+: /.test(label)),
 	);
 	const identifiers = rows.map((label) => label.split(":")[0]);
 	assert(new Set(identifiers).size === identifiers.length, "each item appears exactly once (no duplicate rows)");
 	const multiBadge = await page.evaluate(() => {
-		const article = [...document.querySelectorAll("article")].find((el) =>
+		const article = [...document.querySelectorAll(".list-view article")].find((el) =>
 			/BRW-\d+/.test(el.getAttribute("aria-label") || ""),
 		);
 		return article ? [...article.querySelectorAll(".badge, [class*=badge]")].length : 0;
@@ -273,7 +330,7 @@ async function main() {
 	await page.selectOption('select[aria-label="Sort work items"]', "priority");
 	await page.waitForTimeout(150);
 	const firstRow = await page.evaluate(() =>
-		document.querySelector('[aria-label*=": "]')?.getAttribute("aria-label"),
+		document.querySelector('.list-view [aria-label*=": "]')?.getAttribute("aria-label"),
 	);
 	assert(firstRow?.startsWith(blocked), `priority sort puts ${blocked} (highest) first`);
 
@@ -287,6 +344,141 @@ async function main() {
 		foldText.includes(done),
 		`expanding recently done reveals ${done} (fold: ${JSON.stringify(foldText.slice(0, 200))})`,
 	);
+
+	// 5b. Topology view (APM-20): ready vs waiting, blockers, stages, graph.
+	await page.click('[data-view="topology"]');
+	await page.waitForSelector('[data-group="ready"]');
+	const topo = await page.evaluate(() => ({
+		ready: [...document.querySelectorAll('[data-group="ready"] [data-item-id]')].map(
+			(node) => node.querySelector(".identifier")?.textContent,
+		),
+		waiting: [...document.querySelectorAll('[data-group="waiting"] [data-item-id]')].map((node) => ({
+			id: node.querySelector(".identifier")?.textContent,
+			facts: node.querySelector(".topo-facts")?.textContent ?? "",
+			blockers: node.querySelector(".topo-blockers")?.textContent ?? "",
+		})),
+		hash: location.hash,
+	}));
+	assert(topo.ready.includes(ready), `topology lists unblocked items under Ready to start (${topo.ready.join(",")})`);
+	const dependentCard = topo.waiting.find((entry) => entry.id === dependent);
+	assert(
+		Boolean(dependentCard) && dependentCard.blockers.includes(blocked),
+		`${dependent} is listed as waiting on ${blocked}`,
+	);
+	assert(/\d+ upstream blocker/.test(dependentCard?.facts ?? ""), `waiting card shows the transitive blocker count (${dependentCard?.facts})`);
+	const unlockCard = await page.evaluate((id) => {
+		const card = [...document.querySelectorAll('.topology-view [data-item-id]')].find(
+			(node) => node.querySelector(".identifier")?.textContent === id,
+		);
+		return card?.querySelector(".topo-facts")?.textContent ?? "";
+	}, blocked);
+	assert(/unlocks [1-9]\d*/.test(unlockCard), `a blocker shows how many items it would unlock (${unlockCard})`);
+	assert(topo.hash.includes("view=topology"), "view mode is reflected in the URL");
+
+	// Stage bar from the item's own workflow snapshot, plus acceptance progress.
+	// Acceptance comes from the item detail, which the UI loads for the selected
+	// item only, so select it first.
+	await page.evaluate((id) => {
+		[...document.querySelectorAll('.topology-view [data-item-id]')]
+			.find((node) => node.querySelector(".identifier")?.textContent === id)
+			?.click();
+	}, spike);
+	await page.waitForFunction(
+		(id) => {
+			const card = [...document.querySelectorAll('.topology-view [data-item-id]')].find(
+				(node) => node.querySelector(".identifier")?.textContent === id,
+			);
+			return /acceptance \d+\/\d+/.test(card?.querySelector(".topo-facts")?.textContent ?? "");
+		},
+		spike,
+		{ timeout: 5000 },
+	);
+	const stageInfo = await page.evaluate((id) => {
+		const card = [...document.querySelectorAll('.topology-view [data-item-id]')].find(
+			(node) => node.querySelector(".identifier")?.textContent === id,
+		);
+		return {
+			workflow: card?.querySelector(".stage-bar")?.getAttribute("data-workflow") ?? "",
+			labels: [...(card?.querySelectorAll(".stage-label") ?? [])].map((node) => node.textContent),
+			current: card?.querySelector('.stage[data-state="current"]')?.textContent ?? "",
+			facts: card?.querySelector(".topo-facts")?.textContent ?? "",
+		};
+	}, spike);
+	assert(
+		stageInfo.workflow === "review-flow@1" && stageInfo.labels.join(",") === "Triage,Reviewing,Shipped,Dropped",
+		`custom workflow stages come from the item snapshot (${stageInfo.workflow}: ${stageInfo.labels.join(",")})`,
+	);
+	assert(stageInfo.current.includes("Reviewing"), "the current custom stage is marked");
+	assert(/acceptance 1\/2 done/.test(stageInfo.facts), `acceptance progress is shown (${stageInfo.facts})`);
+	const branches = await page.evaluate(() =>
+		[...document.querySelectorAll(".selection-summary .branch")].map((node) => node.textContent ?? ""),
+	);
+	assert(
+		branches.some((line) => line.includes("Shipped") && line.includes("needs evidence")) &&
+			branches.some((line) => line.includes("Dropped") && line.includes("needs reason")),
+		`custom workflow branches show their guards (${branches.join(" | ")})`,
+	);
+
+	// Local dependency graph (APM-21): roles, both edge kinds, text view, scopes.
+	await page.evaluate((id) => {
+		[...document.querySelectorAll('.topology-view [data-item-id]')]
+			.find((node) => node.querySelector(".identifier")?.textContent === id)
+			?.click();
+	}, dependent);
+	await page.waitForSelector(".dag .dag-node");
+	const graph = await page.evaluate(() => {
+		const dag = document.querySelector(".dag");
+		return {
+			roles: [...dag.querySelectorAll(".dag-node")].map((node) => node.dataset.role),
+			kinds: [...new Set([...dag.querySelectorAll(".dag-edge")].map((edge) => edge.dataset.kind))],
+			arrow: [...dag.querySelectorAll(".dag-edge-dependency")].every((edge) => edge.getAttribute("marker-end")),
+			dashed: [...dag.querySelectorAll(".dag-edge-parent")].every((edge) => !edge.getAttribute("marker-end")),
+			text: document.querySelector(".dag-text")?.textContent ?? "",
+			hash: location.hash,
+		};
+	});
+	assert(
+		["upstream", "parent", "selected"].every((role) => graph.roles.includes(role)),
+		`local graph roles: ${graph.roles.join(",")}`,
+	);
+	assert(
+		graph.kinds.includes("dependency") && graph.kinds.includes("parent") && graph.arrow && graph.dashed,
+		"dependency edges are solid+arrowed, parent edges dashed without an arrow",
+	);
+	assert(
+		/blocks/.test(graph.text) && /parent/.test(graph.text) && /selected/.test(graph.text),
+		"the text view mirrors the graph relations",
+	);
+	assert(graph.hash.includes(`item=${dependent}`), "selection is reflected in the URL");
+	await page.click('[data-scope="blocking"]');
+	await page.waitForTimeout(250);
+	const blocking = await page.evaluate(() => ({
+		parentEdges: document.querySelectorAll(".dag-edge-parent").length,
+		hash: location.hash,
+	}));
+	assert(blocking.parentEdges === 0, "the blocking-chain scope hides hierarchy edges");
+	assert(blocking.hash.includes("scope=blocking"), "graph scope is reflected in the URL");
+	await page.click('[data-scope="all"]');
+
+	// Every closed category opens the full drawer — here via an in-session deep
+	// link to a cancelled item (the fold check above already covered "done").
+	await page.evaluate((id) => {
+		location.hash = `#view=topology&item=${id}`;
+	}, cancelled);
+	await page.waitForSelector('aside[role="dialog"]:visible');
+	const closedDrawer = await page.evaluate(() => ({
+		title: document.querySelector('aside[role="dialog"] .drawer-title')?.textContent ?? "",
+		subtitle: document.querySelector('aside[role="dialog"] .drawer-subtitle')?.textContent ?? "",
+		sections: [...document.querySelectorAll('aside[role="dialog"] .detail-heading')].map((node) => node.textContent),
+	}));
+	assert(closedDrawer.subtitle.includes("cancelled"), `a cancelled item opens from a deep link (${closedDrawer.subtitle})`);
+	assert(closedDrawer.sections.length >= 8, "the closed item shows the full drawer, not a reduced view");
+	await page.keyboard.press("Escape");
+	await page.waitForTimeout(200);
+
+	// Back to the list view for the remaining checks.
+	await page.click('[data-view="list"]');
+	await page.waitForTimeout(200);
 
 	// 6. Detail drawer: sections, events, copy feedback, Esc, focus return.
 	await page.click(`button[aria-label="Open details for ${dependent}"]`);
@@ -356,7 +548,7 @@ async function main() {
 	await page.waitForFunction(() => /offline · cached/i.test(document.body.innerText), { timeout: 9000 });
 	const offline = await page.evaluate(() => ({
 		text: document.body.innerText,
-		rows: [...document.querySelectorAll('[aria-label*=": "]')].filter((el) =>
+		rows: [...document.querySelectorAll('.list-view [aria-label*=": "]')].filter((el) =>
 			/^BRW-\d+: /.test(el.getAttribute("aria-label") || ""),
 		).length,
 		sort: document.querySelector('select[aria-label="Sort work items"]')?.value,

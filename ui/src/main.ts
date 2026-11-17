@@ -1,10 +1,14 @@
 /**
  * Dashboard bootstrap: token → api → state → poller → render.
  *
- * The UI is read-only. Two independent feeds are refreshed together — the
- * dashboard (buckets, totals, generated_at) and the flat item list (for filters
- * the buckets do not expose) — and both must succeed for a render to count as
- * "live"; a failed refresh keeps the previous snapshot on screen.
+ * The UI is read-only. Two feeds are refreshed together — the dashboard (buckets,
+ * totals, generated_at) and the flat item list (every item, open or closed) — and
+ * workflow definitions / acceptance counts are fetched lazily and cached, so a
+ * 4-second refresh never re-requests them.
+ *
+ * User state that must survive a refresh lives here and nowhere else: the view
+ * mode (list/topology), the filters, the search text, the done fold and the
+ * selected item (dropped only when the item really disappears).
  */
 
 import "./style.css";
@@ -26,8 +30,16 @@ import {
 	updateHeader,
 	updateMetrics,
 	updateProject,
+	updateDagPanel,
 	updateQueue,
+	updateSelectionSummary,
+	updateTopology,
+	updateViews,
+	type RenderContext,
+	type ViewMode,
 } from "./render";
+import { cacheIsFresh, findByReference, pruneCache, reconcileSelection } from "./selection";
+import { type DagScope, buildGraph, topologySummary } from "./topology";
 import {
 	type ConnectionView,
 	type ViewState,
@@ -36,7 +48,8 @@ import {
 	defaultViewState,
 	summarize,
 } from "./transform";
-import type { Dashboard, WorkItem } from "./types";
+import type { Dashboard, ItemDetail, WorkItem, WorkflowDef } from "./types";
+import { acceptanceProgress, stageModel, workflowKey } from "./workflow";
 
 interface Snapshot {
 	dashboard: Dashboard;
@@ -49,77 +62,104 @@ if (!root) throw new Error("#app is missing from index.html");
 
 const params = new URLSearchParams(window.location.search);
 const useMock = params.get("mock") === "1";
-const api: Api = useMock
-	? createApi({ fetcher: createMockFetcher({ latencyMs: 90 }) })
-	: createApi();
+const api: Api = useMock ? createApi({ fetcher: createMockFetcher({ latencyMs: 90 }) }) : createApi();
 
 const shell = createShell(root);
 const state: ViewState = defaultViewState();
+let view: ViewMode = "list";
+let selectedId: string | null = null;
+let dagScope: DagScope = "all";
 let snapshot: Snapshot | null = null;
 let connection: ConnectionView = connectionView({ lastSuccessAt: null, lastError: null, refreshing: false, now: Date.now() });
 
-/**
- * `#item=APM-15` opens that item's drawer once the first snapshot arrives, so a
- * link from a terminal or a session log lands on the right detail view.
- */
-async function openDeepLink(): Promise<void> {
-	const raw = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
-	if (!raw) return;
-	const wanted = new URLSearchParams(raw).get("item");
-	if (!wanted) return;
-	const match = snapshot?.items.find((row) => row.identifier === wanted || row.id === wanted);
-	if (match) await drawer.open(match.id);
+// --- caches --------------------------------------------------------------
+/** workflow definition cache: `id@version` → definition, "missing", or pending. */
+const workflows = new Map<string, WorkflowDef | "missing" | "pending">();
+/** detail cache: item id → detail + the item version it was fetched at. */
+const details = new Map<string, { detail: ItemDetail; version: number }>();
+const detailRequests = new Set<string>();
+
+function stageOf(item: WorkItem): ReturnType<typeof stageModel> {
+	return stageModel(item, (id, version) => {
+		const key = workflowKey(id, version);
+		const cached = workflows.get(key);
+		if (cached === "missing") return null;
+		if (cached && cached !== "pending") return cached;
+		if (cached === "pending") return undefined;
+		workflows.set(key, "pending");
+		api
+			.getItemWorkflow(item.id)
+			.then((response) => {
+				workflows.set(key, response.workflow);
+				// The response can carry a different key if the item moved; store both.
+				workflows.set(workflowKey(response.workflow_id, response.workflow_version), response.workflow);
+			})
+			.catch(() => workflows.set(key, "missing"))
+			.finally(() => render());
+		return undefined;
+	});
 }
 
-/** Remember what had focus so a data refresh cannot steal it from the keyboard user. */
-function captureFocus(): { itemId?: string; action?: string; bucket?: string } | null {
-	const active = document.activeElement as HTMLElement | null;
-	if (!active) return null;
-	const row = active.closest<HTMLElement>("[data-item-id]");
-	return {
-		itemId: row?.dataset.itemId,
-		action: active.dataset.action,
-		bucket: active.dataset.bucket,
-	};
+function acceptanceOf(item: WorkItem): ReturnType<typeof acceptanceProgress> {
+	const cached = details.get(item.id);
+	const fresh = cacheIsFresh(cached, item);
+	// Only the selected item is loaded eagerly; everything else shows nothing
+	// rather than a misleading "0/0". A stale entry is refetched and, until the
+	// new data lands, not shown at all (an old ratio would be a lie).
+	if (selectedId === item.id && !fresh && !detailRequests.has(item.id)) {
+		detailRequests.add(item.id);
+		api
+			.getItem(item.id)
+			.then((response) => {
+				details.set(item.id, { detail: response.item, version: response.item.item.version });
+			})
+			.catch(() => undefined)
+			.finally(() => {
+				detailRequests.delete(item.id);
+				render();
+			});
+	}
+	return fresh ? acceptanceProgress(cached!.detail.acceptance) : undefined;
 }
 
-function restoreFocus(saved: ReturnType<typeof captureFocus>): void {
-	if (!saved) return;
-	const selector = saved.bucket
-		? `[data-bucket="${saved.bucket}"]`
-		: saved.itemId
-			? `[data-item-id="${saved.itemId}"]${saved.action ? ` [data-action="${saved.action}"]` : ""}`
-			: null;
-	if (!selector) return;
-	document.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
+function context(): RenderContext {
+	return { state, view, selectedId, stageOf, acceptanceOf, now: Date.now() };
 }
+
+// --- rendering -----------------------------------------------------------
 
 function render(): void {
 	const focus = captureFocus();
-	const now = Date.now();
+	const ctx = context();
 	const dashboard = snapshot?.dashboard ?? null;
 	updateProject(shell, dashboard?.project ?? (useMock ? "pi-apm (mock)" : "…"));
 	updateMetrics(shell, dashboard ? summarize(dashboard) : []);
 	updateHeader(shell, {
 		connection,
 		generatedAt: dashboard?.generated_at ?? null,
-		now,
+		now: ctx.now,
 		refreshing: connection.state === "refreshing",
 	});
 	updateBanner(shell, connection);
+	updateViews(shell, view, selectedId);
 	updateFilters(shell, state, dashboard);
-	if (dashboard) {
-		updateQueue(shell, buildQueue(dashboard, state), state, now);
-	} else {
-		updateQueue(shell, { items: [], total: 0, filtered: 0, recentlyDone: [], recentlyDoneTotal: 0 }, state, now);
-	}
+
+	const queue = buildQueue(dashboard, snapshot?.items ?? null, state);
+	updateQueue(shell, queue, ctx);
+
+	const graph = buildGraph(snapshot?.items ?? []);
+	updateTopology(shell, topologySummary(graph), ctx);
+	const selected = selectedId ? (snapshot?.items.find((item) => item.id === selectedId) ?? null) : null;
+	updateSelectionSummary(shell, ctx, selected, selected ? details.get(selected.id)?.detail : undefined);
+	updateDagPanel(shell, ctx, selected, graph, dagScope, (id) => {
+		selectedId = id;
+		updateHash();
+		render();
+	});
+
 	restoreFocus(focus);
 }
 
-/**
- * Header-only update for the 1-second clock tick: relative ages stay honest
- * without rebuilding rows (which would drop focus and scroll position).
- */
 function renderClock(): void {
 	if (!snapshot) return;
 	connection = connectionView({
@@ -128,18 +168,54 @@ function renderClock(): void {
 		refreshing: poller.isRefreshing(),
 		now: Date.now(),
 	});
-	updateHeader(shell, {
-		connection,
-		generatedAt: snapshot.dashboard.generated_at,
-		now: Date.now(),
-		refreshing: poller.isRefreshing(),
-	});
+	updateHeader(shell, { connection, generatedAt: snapshot.dashboard.generated_at, now: Date.now(), refreshing: poller.isRefreshing() });
 	updateBanner(shell, connection);
 }
 
+/** Remember what had focus so a data refresh cannot steal it from the keyboard user. */
+function captureFocus(): { itemId?: string; action?: string; bucket?: string; view?: string } | null {
+	const active = document.activeElement as HTMLElement | null;
+	if (!active) return null;
+	const row = active.closest<HTMLElement>("[data-item-id]");
+	return { itemId: row?.dataset.itemId, action: active.dataset.action, bucket: active.dataset.bucket, view: active.dataset.view };
+}
+
+function restoreFocus(saved: ReturnType<typeof captureFocus>): void {
+	if (!saved) return;
+	const selector = saved.bucket
+		? `[data-bucket="${saved.bucket}"]`
+		: saved.view
+			? `[data-view="${saved.view}"]`
+			: saved.itemId
+				? `[data-item-id="${saved.itemId}"]${saved.action ? ` [data-action="${saved.action}"]` : ""}`
+				: null;
+	if (!selector) return;
+	document.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
+}
+
+// --- data ----------------------------------------------------------------
+
 async function load(signal: AbortSignal): Promise<Snapshot> {
-	const [dashboard, items] = await Promise.all([api.getDashboard(signal), api.getItems({ all: true, limit: 500 }, signal)]);
+	const [dashboard, items] = await Promise.all([
+		api.getDashboard(signal),
+		api.getItems({ all: true, limit: 500 }, signal),
+	]);
 	return { dashboard: dashboard.dashboard, items: items.items, fetchedAt: Date.now() };
+}
+
+/** Drop a selection only when the item is really gone from the ledger. */
+function reconcileSelectionWith(items: WorkItem[]): void {
+	const next = reconcileSelection(selectedId, items);
+	selectedId = next.selectedId;
+	const pruned = pruneCache(details, items);
+	for (const id of pruned) detailRequests.delete(id);
+	if (next.dropped) notice("The selected item is no longer in the ledger.");
+}
+
+function notice(message: string): void {
+	shell.banner.hidden = false;
+	shell.banner.dataset.state = "stale";
+	shell.banner.textContent = message;
 }
 
 const poller = createPoller<Snapshot>({
@@ -148,7 +224,7 @@ const poller = createPoller<Snapshot>({
 	onData(next) {
 		const first = snapshot === null;
 		snapshot = next;
-		// Failure state is owned by connectionView(); a successful refresh clears it.
+		reconcileSelectionWith(next.items);
 		connection = connectionView({ lastSuccessAt: poller.lastSuccessAt(), lastError: null, refreshing: false, now: Date.now() });
 		render();
 		if (first) void openDeepLink();
@@ -196,6 +272,24 @@ shell.onStateChange((patch) => {
 	render();
 });
 
+shell.onDagScope((scope) => {
+	dagScope = scope;
+	updateHash();
+	render();
+});
+
+shell.onViewChange((next) => {
+	view = next;
+	updateHash();
+	render();
+});
+
+shell.onSelect((id) => {
+	selectedId = id;
+	updateHash();
+	render();
+});
+
 // Filter chips are delegated: they are re-created on every render.
 shell.filters.addEventListener("click", (event) => {
 	const chip = (event.target as HTMLElement).closest<HTMLElement>("[data-bucket]");
@@ -208,30 +302,65 @@ shell.filters.addEventListener("click", (event) => {
 	render();
 });
 
-// The done fold is user state, not fetch state: keep it across refreshes.
 shell.doneFold.addEventListener("toggle", () => {
 	state.showRecentlyDone = shell.doneFold.open;
 	if (shell.doneFold.open) render();
 });
 
-// The detail drawer is read-only and independent from the poller: it loads on
-// open (and on its own Refresh button) so a background refresh can never yank
-// focus away from a copy button the user is aiming at.
 const drawer = createDrawer({
 	api,
 	onOpenChange(identifier) {
-		// replaceState (not `location.hash = ""`) so closing does not leave a bare
-		// "#" behind in the address bar.
-		const url = identifier
-			? `${window.location.pathname}${window.location.search}#item=${encodeURIComponent(identifier)}`
-			: `${window.location.pathname}${window.location.search}`;
-		window.history.replaceState(null, "", url);
+		updateHash({ item: identifier });
 	},
 });
 
 shell.onOpenItem((id) => {
 	void drawer.open(id);
 });
+
+/** `#view=topology&item=APM-15` — shareable, and the ticket is never in the hash. */
+function updateHash(extra: { item?: string | null } = {}): void {
+	const hash = new URLSearchParams();
+	if (view !== "list") hash.set("view", view);
+	if (dagScope !== "all") hash.set("scope", dagScope);
+	const item = extra.item !== undefined ? extra.item : selectedId ? identifierOf(selectedId) : null;
+	if (item) hash.set("item", item);
+	const suffix = hash.toString();
+	window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${suffix ? `#${suffix}` : ""}`);
+}
+
+function identifierOf(id: string): string | null {
+	return snapshot?.items.find((item) => item.id === id)?.identifier ?? null;
+}
+
+let lastDeepLink: string | null = null;
+
+async function openDeepLink(): Promise<void> {
+	const raw = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+	if (!raw) {
+		lastDeepLink = null;
+		return;
+	}
+	if (raw === lastDeepLink) return;
+	lastDeepLink = raw;
+	const hash = new URLSearchParams(raw);
+	const wantedView = hash.get("view");
+	if (wantedView === "topology" || wantedView === "list") view = wantedView;
+	const wantedScope = hash.get("scope");
+	if (wantedScope === "all" || wantedScope === "blocking" || wantedScope === "upstream" || wantedScope === "downstream") dagScope = wantedScope;
+	const wanted = hash.get("item");
+	if (wanted) {
+		const match = findByReference(snapshot?.items ?? [], wanted);
+		if (match) {
+			selectedId = match.id;
+			updateViews(shell, view, selectedId);
+			render();
+			if (!drawer.isOpen() || drawer.currentIdentifier() !== match.identifier) await drawer.open(match.id);
+			return;
+		}
+	}
+	render();
+}
 
 /** Blocking "session expired" state: no polling, no 401 storm, clear instruction. */
 function renderSessionError(message: string): void {
@@ -244,8 +373,11 @@ function renderSessionError(message: string): void {
 }
 
 async function init(): Promise<void> {
-	// The ticket arrives once, in the fragment, and is stripped + exchanged
-	// immediately; without it there is nothing to authenticate with.
+	window.addEventListener("hashchange", () => {
+		// In-session deep links (`#item=APM-15`, `#view=topology`) work without a
+		// reload; the ticket never appears here because it is stripped on load.
+		void openDeepLink();
+	});
 	if (!useMock) {
 		try {
 			await bootstrapTokenFromFragment(window.location, window.history);
@@ -262,7 +394,6 @@ async function init(): Promise<void> {
 	}
 	render();
 	poller.start();
-	// Relative timestamps and freshness labels stay honest between fetches.
 	setInterval(renderClock, 1_000);
 }
 

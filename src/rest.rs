@@ -815,6 +815,9 @@ fn route(request: &Request, state: &State) -> Response {
         ["dashboard"] | ["items"] | ["claims"] => &["GET"],
         ["items", _] => &["GET"],
         ["items", _, "events"] => &["GET"],
+        ["items", _, "workflow"] => &["GET"],
+        ["workflows"] => &["GET"],
+        ["workflows", _] => &["GET"],
         ["items", _, "claim" | "release" | "progress" | "status"] => &["POST"],
         _ => {
             return Response::error(
@@ -842,6 +845,12 @@ fn route(request: &Request, state: &State) -> Response {
         ("GET", ["items"]) => list_items(request, state),
         ("GET", ["items", id]) => get_item(id, state),
         ("GET", ["items", id, "events"]) => item_events(id, request, state),
+        // Read-only workflow definitions: the UI renders a stage bar and the
+        // available branches of an item's *snapshot* workflow, so it asks by
+        // id+version instead of assuming the project default.
+        ("GET", ["items", id, "workflow"]) => item_workflow(id, state),
+        ("GET", ["workflows"]) => workflow_list(request, state),
+        ("GET", ["workflows", id]) => workflow_definition(id, request, state),
         ("GET", ["claims"]) => claims(request, state, &session),
         ("POST", ["items", id, "claim"]) => claim(id, request, state, &session),
         ("POST", ["items", id, "release"]) => release(id, request, state, &session),
@@ -1154,6 +1163,61 @@ fn item_events(id: &str, request: &Request, state: &State) -> Result<Response> {
         "count": events.len(),
         "events": events,
     })))
+}
+
+/// The workflow *snapshot* of one item: what its stage bar and branches are
+/// drawn from. Registered definitions are content-addressed, so a version never
+/// changes meaning; an item without a snapshot (legacy row) is a 404 and the UI
+/// degrades to a "no workflow" badge instead of guessing the default.
+fn item_workflow(id: &str, state: &State) -> Result<Response> {
+    let at = state.now();
+    let item = with_store(state, |store| store.get_item(id, at))?.item;
+    let workflow = with_store(state, |store| {
+        store.workflow_by_id(
+            Some(&item.project_id),
+            &item.workflow_id,
+            item.workflow_version,
+        )
+    })?;
+    Ok(Response::ok(json!({
+        "ok": true,
+        "identifier": item.identifier,
+        "workflow_id": item.workflow_id,
+        "workflow_version": item.workflow_version,
+        "workflow": workflow,
+    })))
+}
+
+/// All registered workflow versions for the project (read-only catalogue).
+fn workflow_list(request: &Request, state: &State) -> Result<Response> {
+    let project = request
+        .query
+        .get("project")
+        .cloned()
+        .or_else(|| state.config.project.clone());
+    let workflows = with_store(state, |store| store.list_workflows(project.as_deref()))?;
+    Ok(Response::ok(json!({
+        "ok": true,
+        "count": workflows.len(),
+        "workflows": workflows,
+    })))
+}
+
+/// One registered workflow definition by id + version (the version is required:
+/// "the latest" would be a moving target for a read-only view).
+fn workflow_definition(id: &str, request: &Request, state: &State) -> Result<Response> {
+    let version = int_param(&request.query, "version")?.ok_or_else(|| {
+        Error::invalid("`version` is required (workflow definitions are versioned)")
+    })?;
+    let project = request
+        .query
+        .get("project")
+        .cloned()
+        .or_else(|| state.config.project.clone());
+    let workflow = with_store(state, |store| {
+        store.workflow_by_id(project.as_deref(), id, version)
+    })?;
+    Ok(Response::ok(json!({ "ok": true, "workflow": workflow })))
 }
 
 fn claims(request: &Request, state: &State, default_session: &str) -> Result<Response> {

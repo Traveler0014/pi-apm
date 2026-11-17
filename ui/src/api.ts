@@ -16,7 +16,9 @@ import type {
 	Fetcher,
 	HealthResponse,
 	ItemDetailResponse,
+	ItemWorkflowResponse,
 	ItemsResponse,
+	WorkflowDefinitionResponse,
 } from "./types";
 
 export interface ApiOptions {
@@ -140,8 +142,12 @@ export async function bootstrapTokenFromFragment(
 	const params = new URLSearchParams(raw);
 	const ticket = params.get("ticket");
 	if (!ticket) return false;
-	// Erase first: even a failed exchange must not leave the ticket in the URL bar.
-	history.replaceState(null, "", `${location.pathname}${location.search}`);
+	// Erase the ticket first: even a failed exchange must not leave it in the URL
+	// bar (it is a bearer secret for one request). Other fragment keys — the UI
+	// view and the selected item — are kept so a merged launch URL still deep-links.
+	params.delete("ticket");
+	const rest = params.toString();
+	history.replaceState(null, "", `${location.pathname}${location.search}${rest ? `#${rest}` : ""}`);
 	await exchangeTicket(ticket, options.fetcher, options.basePath);
 	return true;
 }
@@ -178,6 +184,9 @@ export interface Api {
 	getItems(query?: Record<string, string | number | boolean | undefined>, signal?: AbortSignal): Promise<ItemsResponse>;
 	getItem(id: string, signal?: AbortSignal): Promise<ItemDetailResponse>;
 	getEvents(id: string, limit?: number, signal?: AbortSignal): Promise<EventsResponse>;
+	/** The item's snapshot workflow definition (404 when it has none). */
+	getItemWorkflow(id: string, signal?: AbortSignal): Promise<ItemWorkflowResponse>;
+	getWorkflow(id: string, version: number, signal?: AbortSignal): Promise<WorkflowDefinitionResponse>;
 	getHealth(signal?: AbortSignal): Promise<HealthResponse>;
 	hasToken(): boolean;
 }
@@ -228,6 +237,10 @@ export function createApi(options: ApiOptions = {}): Api {
 		getItem: (id, signal) => request<ItemDetailResponse>(`/items/${encodeURIComponent(id)}`, undefined, signal),
 		getEvents: (id, limit = 20, signal) =>
 			request<EventsResponse>(`/items/${encodeURIComponent(id)}/events`, { limit }, signal),
+		getItemWorkflow: (id, signal) =>
+			request<ItemWorkflowResponse>(`/items/${encodeURIComponent(id)}/workflow`, undefined, signal),
+		getWorkflow: (id, version, signal) =>
+			request<WorkflowDefinitionResponse>(`/workflows/${encodeURIComponent(id)}`, { version }, signal),
 		getHealth: (signal) => request<HealthResponse>("/health", undefined, signal),
 		hasToken,
 	};

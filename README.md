@@ -830,6 +830,17 @@ temporary disconnects. When a poll fails, the header switches to
 poll clears it. A restarted server mints a new token, so the page shows a
 "session expired — rerun `apm ui`" state instead of retrying forever.
 
+Two views share the same data: a **list** (deduplicated rows with the item's own
+workflow stage bar and acceptance progress) and a **topology** view grouping
+*Ready to start* vs *Waiting on upstream*, with direct blockers, transitive
+blocker counts and how many items each one would unlock. Selecting an item draws
+its local dependency graph — dependency edges solid and arrowed, parent/child
+edges dashed — with scope switches (blocking chain / upstream / downstream) and a
+text view that carries the same relations for keyboard and screen-reader users.
+Closed work is first-class too: the `Closed items` fold holds `done`,
+`cancelled`, `aborted` and any custom closed state, and each opens the full
+detail drawer from the fold, a search hit or a `#item=` deep link.
+
 Troubleshooting and the full protocol live in [`docs/ui.md`](docs/ui.md)
 (ticket lifecycle, error codes, CSP, embedded assets, route table). Verify the
 whole path with:
@@ -1011,9 +1022,9 @@ ms|RFC3339>` is a hidden clock override used by tests and demos.
 just verify                # everything below that runs without a model
 just stress                # scripts/stress.sh 10
 
-cargo test                 # 136 tests: 48 lib unit + 17 CLI + 32 core invariants
-                           #   + 9 workflow-CLI + 4 MCP + 7 REST + 9 REST
-                           #   concurrency + 10 UI (real apm ui process over TCP)
+cargo test                 # 139 tests: 49 lib unit + 17 CLI + 32 core invariants
+                           #   + 9 workflow-CLI + 4 MCP + 8 REST + 9 REST
+                           #   concurrency + 11 UI (real apm ui process over TCP)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 bash scripts/stress.sh 10  # cross-process claim/write race (10 real CLI processes)
@@ -1022,8 +1033,9 @@ bash scripts/stress-rest.sh 10  # same race over HTTP + mixed HTTP/CLI writers
 npm install
 npx tsc -p tsconfig.json   # plugin type check
 npm run ui:typecheck       # dashboard (ui/) type check
-npx vitest run             # 138 tests across 12 files: extension unit/schema/
-                           #   MCP/e2e plus the ui/ renderer, api and poller suites
+npx vitest run             # 188 tests across 16 files: extension unit/schema/
+                           #   MCP/e2e plus the ui/ renderer, api, poller,
+                           #   topology, dag, workflow and selection suites
 npm run ui:browser         # real Chromium against a throwaway ledger (needs
                            #   Chromium; prints SKIP when none is installed)
 
@@ -1156,6 +1168,7 @@ Justfile          build / install / verify / stress recipes
 scripts/
   stress.sh       CLI cross-process claim/write race
   stress-rest.sh  REST variant: servers, HTTP racers, mixed HTTP/CLI writers
+  ui-browser-check.mjs  real Chromium run over a throwaway ledger
 tests/
   core.rs         invariants (claims, versions, context, sync, completion, ...)
   cli.rs          exit codes, JSON contract, session-token reuse, guards
@@ -1173,6 +1186,12 @@ pi-apm/
   mcp-client.test.ts     real MCP client (@modelcontextprotocol/sdk) → apm-mcp
   side-run.e2e.test.ts   hook → child process → SQLite, with a fake `pi`
 docs/agent-protocol.md   copy-paste AGENTS.md contract for repos using apm
+ui/
+  index.html, vite.config.ts, tsconfig.json
+  src/            vanilla-TS dashboard: api, poller, transform, render, detail,
+                  topology, dag, workflow, selection + happy-dom tests
+  dist/           committed build output, embedded by build.rs (no Node needed)
+docs/ui.md               dashboard guide: ticket, CSP, views, graph, triage
 docs/mcp.md              MCP client guide: config, tools, errors, tokens
 docs/rest.md             REST guide: routes, protections, error mapping
 docs/rest-ops.md         REST operations: limits, multi-instance, backup, triage

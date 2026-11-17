@@ -10,6 +10,7 @@ import type {
 	ItemDetail,
 	Settings,
 	WorkItem,
+	WorkflowDef,
 } from "./types";
 
 const SETTINGS: Settings = {
@@ -67,6 +68,8 @@ export const MOCK_ITEMS: WorkItem[] = [
 		title: "Implement the read-only dashboard",
 		status: "doing",
 		priority: "high",
+		parent_id: "i-13",
+		parent_identifier: "APM-13",
 		labels: ["frontend", "ui"],
 		progress_summary: "Header, metrics and the queue render from /api/dashboard",
 		next_action: "Wire the poller and stale-response guard",
@@ -92,6 +95,8 @@ export const MOCK_ITEMS: WorkItem[] = [
 		status_category: "open",
 		priority: "high",
 		health: "unclaimed",
+		parent_id: "i-13",
+		parent_identifier: "APM-13",
 		labels: ["frontend"],
 		seconds_since_progress: null,
 		last_progress_at: null,
@@ -127,6 +132,8 @@ export const MOCK_ITEMS: WorkItem[] = [
 		status_category: "waiting",
 		priority: "normal",
 		health: "released",
+		parent_id: "i-13",
+		parent_identifier: "APM-13",
 		blocked_by: [{ id: "i-16", identifier: "APM-16", title: "Detail drawer", status: "ready" }],
 		progress_summary: "Waiting for the drawer to land",
 		seconds_since_progress: 600,
@@ -164,6 +171,32 @@ export const MOCK_DONE: WorkItem[] = [
 		health: "ended",
 		done_at: "2026-11-16T12:37:00.000Z",
 		updated_at: "2026-11-16T12:37:00.000Z",
+	}),
+];
+
+/** Every closed *category* a project can produce, not just "done". */
+export const MOCK_CLOSED_EXTRA: WorkItem[] = [
+	item({
+		id: "i-19",
+		identifier: "APM-19",
+		title: "Abandoned experiment",
+		status: "cancelled",
+		status_category: "closed",
+		health: "ended",
+		cancelled_at: "2026-11-16T10:00:00.000Z",
+		done_at: "2026-11-16T10:00:00.000Z",
+		updated_at: "2026-11-16T10:00:00.000Z",
+	}),
+	item({
+		id: "i-18",
+		identifier: "APM-18",
+		title: "Superseded by APM-20",
+		status: "aborted",
+		status_category: "closed",
+		health: "ended",
+		cancelled_at: "2026-11-16T09:00:00.000Z",
+		done_at: "2026-11-16T09:00:00.000Z",
+		updated_at: "2026-11-16T09:00:00.000Z",
 	}),
 ];
 
@@ -258,6 +291,49 @@ export function mockEvents(id: string): EventView[] {
 	}));
 }
 
+export const MOCK_WORKFLOWS: Record<string, WorkflowDef> = {
+	"apm-default@1": {
+		id: "apm-default",
+		version: 1,
+		name: "Default workflow",
+		initial: "ready",
+		states: [
+			{ key: "ready", label: "Ready", category: "open", terminal: false },
+			{ key: "doing", label: "Doing", category: "active", terminal: false },
+			{ key: "blocked", label: "Blocked", category: "waiting", terminal: false },
+			{ key: "review", label: "Review", category: "review", terminal: false },
+			{ key: "done", label: "Done", category: "closed", terminal: true },
+			{ key: "cancelled", label: "Cancelled", category: "closed", terminal: true, cancel: true },
+		],
+		transitions: [
+			{ from: "ready", to: "doing" },
+			{ from: "ready", to: "blocked", requires: ["reason"] },
+			{ from: "doing", to: "review" },
+			{ from: "doing", to: "done", requires: ["evidence_or_acceptance", "progress_or_note"] },
+			{ from: "blocked", to: "doing", requires: ["reason"] },
+			{ from: "review", to: "done", requires: ["evidence_or_acceptance", "progress_or_note"] },
+			{ from: "done", to: "doing", requires: ["reason"] },
+		],
+	},
+	"review-flow@1": {
+		id: "review-flow",
+		version: 1,
+		name: "Review flow",
+		initial: "triage",
+		states: [
+			{ key: "triage", label: "Triage", category: "open", terminal: false },
+			{ key: "reviewing", label: "Reviewing", category: "review", terminal: false },
+			{ key: "shipped", label: "Shipped", category: "closed", terminal: true },
+			{ key: "dropped", label: "Dropped", category: "closed", terminal: true, cancel: true },
+		],
+		transitions: [
+			{ from: "triage", to: "reviewing" },
+			{ from: "reviewing", to: "shipped", requires: ["evidence_or_acceptance", "progress_or_note"] },
+			{ from: "reviewing", to: "dropped", requires: ["reason"] },
+		],
+	},
+};
+
 /** A `fetch` stand-in that serves the fixtures with optional artificial latency. */
 export function createMockFetcher(options: { latencyMs?: number } = {}): Fetcher {
 	const latency = options.latencyMs ?? 120;
@@ -268,7 +344,44 @@ export function createMockFetcher(options: { latencyMs?: number } = {}): Fetcher
 		const body = (() => {
 			if (path === "/health") return { ok: true, service: "apm-rest", version: "mock" };
 			if (path === "/dashboard") return { ok: true, dashboard: mockDashboard() };
-			if (path === "/items") return { ok: true, count: MOCK_ITEMS.length, items: MOCK_ITEMS };
+			if (path === "/items") {
+				const all = [...MOCK_ITEMS, ...MOCK_DONE, ...MOCK_CLOSED_EXTRA];
+				return { ok: true, count: all.length, items: all };
+			}
+			if (path === "/workflows") {
+				const workflows = Object.values(MOCK_WORKFLOWS).map((wf) => ({
+					id: wf.id,
+					version: wf.version,
+					name: wf.name ?? wf.id,
+					initial: wf.initial,
+					states: wf.states.length,
+					is_project_default: wf.id === "apm-default",
+				}));
+				return { ok: true, count: workflows.length, workflows };
+			}
+			const wf = path.match(/^\/workflows\/([^/]+)$/);
+			if (wf) {
+				const id = decodeURIComponent(wf[1]!);
+				const version = Number(parsed.searchParams.get("version") ?? 0);
+				const definition = MOCK_WORKFLOWS[`${id}@${version}`];
+				return definition
+					? { ok: true, workflow: definition }
+					: { ok: false, error: { code: "not_found", message: `workflow ${id}@${version}` } };
+			}
+			const itemWf = path.match(/^\/items\/([^/]+)\/workflow$/);
+			if (itemWf) {
+				const detail = mockDetail(decodeURIComponent(itemWf[1]!)).item;
+				const definition = MOCK_WORKFLOWS[`${detail.workflow_id}@${detail.workflow_version}`];
+				return definition
+					? {
+							ok: true,
+							identifier: detail.identifier,
+							workflow_id: detail.workflow_id,
+							workflow_version: detail.workflow_version,
+							workflow: definition,
+						}
+					: { ok: false, error: { code: "not_found", message: "no workflow" } };
+			}
 			const detail = path.match(/^\/items\/([^/]+)$/);
 			if (detail) return { ok: true, item: mockDetail(decodeURIComponent(detail[1]!)) };
 			const events = path.match(/^\/items\/([^/]+)\/events$/);

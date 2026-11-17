@@ -24,6 +24,15 @@ function dashboard(): Dashboard {
 	return mockDashboard(new Date(NOW).toISOString());
 }
 
+/** Everything the server would return for `?all=true`, open first. */
+function allItems(): typeof MOCK_ITEMS {
+	return [...MOCK_ITEMS, ...MOCK_DONE];
+}
+
+function queue(patch: Partial<ReturnType<typeof defaultViewState>> = {}, items: typeof MOCK_ITEMS | null = allItems()) {
+	return buildQueue(dashboard(), items, state(patch));
+}
+
 describe("bucket metadata", () => {
 	it("names every bucket with a label and a non-colour symbol", () => {
 		expect(BUCKETS).toHaveLength(8);
@@ -37,7 +46,7 @@ describe("bucket metadata", () => {
 
 describe("buildQueue: dedupe and multi-badges", () => {
 	it("collapses an item that appears in several buckets into one row with every badge", () => {
-		const model = buildQueue(dashboard(), state());
+		const model = queue();
 		const apm14 = model.items.filter((row) => row.item.identifier === "APM-14");
 		expect(apm14).toHaveLength(1);
 		const keys = apm14[0]!.badges.map((badge) => badge.key);
@@ -47,30 +56,30 @@ describe("buildQueue: dedupe and multi-badges", () => {
 	});
 
 	it("keeps the recently done bucket out of the main queue and counts it separately", () => {
-		const model = buildQueue(dashboard(), state());
+		const model = queue();
 		expect(model.items.some((row) => row.item.identifier === "APM-11")).toBe(false);
-		expect(model.recentlyDoneTotal).toBe(MOCK_DONE.length);
-		expect(model.recentlyDone.map((row) => row.item.identifier)).toEqual(["APM-12", "APM-11"]);
+		expect(model.closedTotal).toBe(MOCK_DONE.length);
+		expect(model.closed.map((row) => row.item.identifier)).toEqual(["APM-12", "APM-11"]);
 		expect(model.total).toBe(MOCK_ITEMS.length);
 	});
 
 	it("does not mutate the dashboard payload", () => {
 		const input = dashboard();
 		const before = JSON.stringify(input);
-		buildQueue(input, state({ search: "apm", buckets: ["in_progress"] }));
+		buildQueue(input, allItems(), state({ search: "apm", buckets: ["in_progress"] }));
 		expect(JSON.stringify(input)).toBe(before);
 	});
 });
 
 describe("buildQueue: filters and search", () => {
 	it("filters by bucket chip", () => {
-		const model = buildQueue(dashboard(), state({ buckets: ["waiting_dependencies"] }));
+		const model = queue({ buckets: ["waiting_dependencies"] });
 		expect(model.items.map((row) => row.item.identifier)).toEqual(["APM-17"]);
 		expect(model.filtered).toBeGreaterThan(0);
 	});
 
 	it("filters by priority", () => {
-		const model = buildQueue(dashboard(), state({ priorities: ["highest"] }));
+		const model = queue({ priorities: ["highest"] });
 		expect(model.items.map((row) => row.item.identifier)).toEqual(["APM-13"]);
 	});
 
@@ -83,7 +92,7 @@ describe("buildQueue: filters and search", () => {
 			["apm-worker", ["APM-14"]],
 			["apm-1", ["APM-15", "APM-16", "APM-14", "APM-17", "APM-13"]],
 		] as Array<[string, string[]]>) {
-			const model = buildQueue(dashboard(), state({ search: query }));
+			const model = queue({ search: query });
 			expect(model.items.map((row) => row.item.identifier).sort()).toEqual([...expected].sort());
 		}
 	});
@@ -94,13 +103,13 @@ describe("buildQueue: filters and search", () => {
 	});
 
 	it("combines bucket, priority and search filters", () => {
-		const model = buildQueue(dashboard(), state({ buckets: ["in_progress"], priorities: ["high"], search: "ui" }));
+		const model = queue({ buckets: ["in_progress"], priorities: ["high"], search: "ui" });
 		expect(model.items.map((row) => row.item.identifier)).toEqual(["APM-14", "APM-15"]);
 	});
 });
 
 describe("sortQueue", () => {
-	const rows = buildQueue(dashboard(), state()).items;
+	const rows = queue().items;
 
 	it("queue order puts the most urgent badge first", () => {
 		const ranked = sortQueue(

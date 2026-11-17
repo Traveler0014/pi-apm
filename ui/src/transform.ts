@@ -51,19 +51,6 @@ export function defaultViewState(): ViewState {
 	return { search: "", buckets: [], priorities: [], sort: "queue", showRecentlyDone: false };
 }
 
-export interface QueuedItem {
-	item: WorkItem;
-	badges: BucketMeta[];
-}
-
-export interface QueueModel {
-	items: QueuedItem[];
-	total: number;
-	filtered: number;
-	recentlyDone: QueuedItem[];
-	recentlyDoneTotal: number;
-}
-
 const PRIORITY_RANK: Record<string, number> = {
 	highest: 0,
 	high: 1,
@@ -72,59 +59,106 @@ const PRIORITY_RANK: Record<string, number> = {
 	lowest: 4,
 };
 
-function priorityRank(priority: string): number {
+export function priorityRank(priority: string): number {
 	return PRIORITY_RANK[priority] ?? 9;
 }
 
-/**
- * Flatten the dashboard buckets into one queue keyed by `item.id`.
- *
- * An item legitimately appears in several buckets ("in progress" *and* "waiting
- * human"), so the queue keeps one row per id and collects every badge. The
- * recently-done bucket is separated: it shares ids with nothing but is folded by
- * default and can hold hundreds of rows.
- */
-export function buildQueue(dashboard: Dashboard, state: ViewState): QueueModel {
-	const rows = new Map<string, { item: WorkItem; keys: BucketKey[] }>();
-	const bucketOrder = new Map(ACTIVE_BUCKETS.map((bucket, index) => [bucket.key, index]));
+export interface QueuedItem {
+	item: WorkItem;
+	badges: BucketMeta[];
+}
 
-	for (const bucket of ACTIVE_BUCKETS) {
+export interface QueueModel {
+	/** Open items (any non-closed category), filtered and sorted. */
+	items: QueuedItem[];
+	/** How many open items exist before filtering. */
+	total: number;
+	/** How many open items the current filters hide. */
+	filtered: number;
+	/**
+	 * Every closed item — done, cancelled, aborted and any custom closed state —
+	 * not just the dashboard's `recently_done` bucket (which deliberately excludes
+	 * cancelled work). This is what makes every terminal item reachable.
+	 */
+	closed: QueuedItem[];
+	closedTotal: number;
+}
+
+function isClosed(item: Pick<WorkItem, "status_category">): boolean {
+	return item.status_category === "closed";
+}
+
+/**
+ * Bucket membership per item id (an item can be in several), so a row keeps the
+ * dashboard's health semantics (lost lease, stalled, waiting human, blocked…).
+ */
+export function bucketMembership(dashboard: Dashboard | null): Map<string, BucketKey[]> {
+	const membership = new Map<string, BucketKey[]>();
+	if (!dashboard) return membership;
+	for (const bucket of BUCKETS) {
 		for (const item of dashboard.buckets[bucket.key] ?? []) {
-			const row = rows.get(item.id);
-			if (row) {
-				if (!row.keys.includes(bucket.key)) row.keys.push(bucket.key);
-			} else {
-				rows.set(item.id, { item, keys: [bucket.key] });
-			}
+			const keys = membership.get(item.id) ?? [];
+			if (!keys.includes(bucket.key)) keys.push(bucket.key);
+			membership.set(item.id, keys);
 		}
 	}
+	return membership;
+}
 
-	const all: QueuedItem[] = [...rows.values()].map(({ item, keys }) => ({
+/** Fallback badge when the dashboard has no bucket for an item (custom states). */
+function derivedBadge(item: WorkItem): BucketMeta {
+	const byCategory: Record<string, BucketKey> = {
+		open: "ready_unclaimed",
+		active: "in_progress",
+		waiting: "waiting_dependencies",
+		review: "in_progress",
+	};
+	return bucketMeta(byCategory[item.status_category] ?? "ready_unclaimed");
+}
+
+function badgesFor(item: WorkItem, keys: BucketKey[] | undefined): BucketMeta[] {
+	const ordered = BUCKETS.filter((bucket) => keys?.includes(bucket.key));
+	if (ordered.length > 0) return ordered;
+	return [derivedBadge(item)];
+}
+
+/**
+ * Flatten the current snapshot into the dashboard queue.
+ *
+ * The item list (`/api/items?all=true`) is the source of truth — the dashboard
+ * buckets only annotate it — because buckets are *views*: an item in a custom
+ * state may appear in none, and `recently_done` excludes cancelled work by
+ * design. Building from the snapshot guarantees every item is reachable.
+ */
+export function buildQueue(dashboard: Dashboard | null, items: WorkItem[] | null, state: ViewState): QueueModel {
+	const openItems = (items ?? []).filter((item) => !isClosed(item));
+	const closedItems = (items ?? []).filter(isClosed);
+	const membership = bucketMembership(dashboard);
+
+	const openRows: QueuedItem[] = openItems.map((item) => ({
 		item,
-		badges: [...keys]
-			.sort((a, b) => (bucketOrder.get(a) ?? 99) - (bucketOrder.get(b) ?? 99))
-			.map(bucketMeta),
+		badges: badgesFor(item, membership.get(item.id)),
 	}));
+	const queued = applyFilters(openRows, state);
 
-	const doneRows = new Map<string, QueuedItem>();
-	for (const item of dashboard.buckets.recently_done ?? []) {
-		if (doneRows.has(item.id)) continue;
-		doneRows.set(item.id, { item, badges: [bucketMeta("recently_done")] });
-	}
-
-	const queued = applyFilters(all, state);
-	const done = applyFilters([...doneRows.values()], { ...state, buckets: [], priorities: state.priorities });
+	// The fold ignores bucket chips (they describe the open queue) but honours the
+	// search box and the priority filter, so "show me every closed APM-1x" works.
+	const closedRows: QueuedItem[] = closedItems.map((item) => ({
+		item,
+		badges: [{ key: "recently_done", label: item.status, symbol: "✓", tone: "muted" }],
+	}));
+	const closedFiltered = applyFilters(closedRows, { ...state, buckets: [] });
 
 	return {
 		items: sortQueue(queued, state.sort),
-		total: all.length,
-		filtered: all.length - queued.length,
-		recentlyDone: sortQueue(done, state.sort === "queue" ? "updated" : state.sort),
-		recentlyDoneTotal: doneRows.size,
+		total: openItems.length,
+		filtered: openItems.length - queued.length,
+		closed: sortQueue(closedFiltered, state.sort === "queue" ? "updated" : state.sort),
+		closedTotal: closedItems.length,
 	};
 }
 
-/** Filter + search, shared by the active queue and the done fold. */
+/** Filter + search, shared by the open queue and the closed fold. */
 export function applyFilters(rows: QueuedItem[], state: ViewState): QueuedItem[] {
 	const wanted = new Set(state.buckets);
 	const priorities = new Set(state.priorities);

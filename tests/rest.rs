@@ -513,6 +513,163 @@ fn list_filters_and_dashboard_query_parameters_are_honoured() {
 }
 
 #[test]
+fn workflow_definitions_are_read_only_and_versioned() {
+    let ledger = Ledger::new();
+    // A custom workflow bound to one item type, on top of the default project
+    // workflow: the UI needs both the catalogue and an item's snapshot.
+    let custom = ledger.dir().join("review-flow.json");
+    std::fs::write(
+        &custom,
+        r#"{"id":"review-flow","version":1,"name":"Review flow","initial":"triage",
+            "states":[{"key":"triage","label":"Triage","category":"open","terminal":false},
+                      {"key":"reviewing","label":"Reviewing","category":"review","terminal":false},
+                      {"key":"shipped","label":"Shipped","category":"closed","terminal":true},
+                      {"key":"dropped","label":"Dropped","category":"closed","terminal":true,"cancel":true}],
+            "transitions":[{"from":"triage","to":"reviewing"},
+                           {"from":"reviewing","to":"shipped","requires":["evidence_or_acceptance","progress_or_note"]},
+                           {"from":"reviewing","to":"dropped","requires":["reason"]},
+                           {"from":"dropped","to":"triage","requires":["reason"]}],
+            "guards":{"reason":{"kind":"reason","description":"r"},
+                      "evidence_or_acceptance":{"kind":"evidence_or_acceptance","description":"e"},
+                      "progress_or_note":{"kind":"progress_or_note","description":"p"}}}"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_apm"))
+        .args([
+            "workflow",
+            "set",
+            "--file",
+            custom.to_str().unwrap(),
+            "--bind",
+            "spike",
+            "--json",
+        ])
+        .env("APM_DB", &ledger.db)
+        .output()
+        .expect("spawn apm");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let default_item = ledger.create("default workflow item");
+    let spike_item = ledger.apm(&[
+        "create",
+        "--title",
+        "custom workflow item",
+        "--goal",
+        "g",
+        "--current-state",
+        "s",
+        "--type",
+        "spike",
+        "--json",
+    ])["item"]["identifier"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let server = Server::start(&ledger, &[]);
+
+    // 1. Catalogue: both versions, with the project default marked.
+    let list = request(&server.addr, "GET", "/api/workflows", None, &[]);
+    assert_eq!(list.status, 200, "{}", list.body);
+    assert_eq!(list.body["count"], json!(2));
+    let ids: Vec<&str> = list.body["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"apm-default"));
+    assert!(ids.contains(&"review-flow"));
+    let default_row = list.body["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == json!("apm-default"))
+        .unwrap();
+    assert_eq!(default_row["is_project_default"], json!(true));
+
+    // 2. Definition by id + version: states/transitions are the workflow's own,
+    //    including a custom closed state that is not "done"/"cancelled".
+    let definition = request(
+        &server.addr,
+        "GET",
+        "/api/workflows/review-flow?version=1",
+        None,
+        &[],
+    );
+    assert_eq!(definition.status, 200, "{}", definition.body);
+    let workflow = &definition.body["workflow"];
+    assert_eq!(workflow["initial"], json!("triage"));
+    let states: Vec<&str> = workflow["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|state| state["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["triage", "reviewing", "shipped", "dropped"]);
+    let dropped = workflow["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["key"] == json!("dropped"))
+        .unwrap();
+    assert_eq!(dropped["category"], json!("closed"));
+    assert_eq!(dropped["cancel"], json!(true));
+
+    // 3. Per-item snapshot: the custom item resolves to its own workflow, the
+    //    other one to the default — no hardcoded six states anywhere.
+    let spike_snapshot = request(
+        &server.addr,
+        "GET",
+        &format!("/api/items/{spike_item}/workflow"),
+        None,
+        &[],
+    );
+    assert_eq!(spike_snapshot.status, 200, "{}", spike_snapshot.body);
+    assert_eq!(spike_snapshot.body["workflow_id"], json!("review-flow"));
+    assert_eq!(spike_snapshot.body["workflow_version"], json!(1));
+    assert_eq!(spike_snapshot.body["workflow"]["initial"], json!("triage"));
+
+    let default_snapshot = request(
+        &server.addr,
+        "GET",
+        &format!("/api/items/{default_item}/workflow"),
+        None,
+        &[],
+    );
+    assert_eq!(default_snapshot.body["workflow_id"], json!("apm-default"));
+
+    // 4. Errors: version is mandatory, unknown ids/versions are 404, and the
+    //    surface is read-only + authenticated.
+    let missing_version = request(&server.addr, "GET", "/api/workflows/apm-default", None, &[]);
+    assert_eq!(missing_version.status, 400);
+    assert_eq!(missing_version.error_code(), "invalid_input");
+    let unknown = request(
+        &server.addr,
+        "GET",
+        "/api/workflows/nope?version=1",
+        None,
+        &[],
+    );
+    assert_eq!(unknown.status, 404);
+    let unknown_version = request(
+        &server.addr,
+        "GET",
+        "/api/workflows/review-flow?version=9",
+        None,
+        &[],
+    );
+    assert_eq!(unknown_version.status, 404);
+    let post = request(&server.addr, "POST", "/api/workflows", None, &[]);
+    assert_eq!(post.status, 405, "workflow definitions are read-only");
+    let unauthenticated = cookie_free(&server.addr, "GET", "/api/workflows");
+    assert_eq!(unauthenticated.status, 401);
+}
+
+#[test]
 fn remote_binding_needs_an_explicit_flag() {
     let ledger = Ledger::new();
     let refused = Command::new(env!("CARGO_BIN_EXE_apm-serve"))
