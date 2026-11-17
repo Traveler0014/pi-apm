@@ -71,17 +71,30 @@ gh run watch
 |---|---|---|
 | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | native |
 | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | native arm64 hosted runner |
-| `macos-14` | `aarch64-apple-darwin` | native |
-| `macos-14` | `x86_64-apple-darwin` | cross-compile on arm64: `rustup target add` only |
+| `macos-13` | `x86_64-apple-darwin` | native |
+| `macos-13` | `aarch64-apple-darwin` | cross-compile on x64: `rustup target add` only |
 | `windows-2022` | `x86_64-pc-windows-msvc` | native MSVC |
 
 Cross-compilation notes:
 
-- **macOS x86_64** is the only cross build. `dtolnay/rust-toolchain` installs the
-  `x86_64-apple-darwin` standard library, and Apple's SDK is universal, so the
-  same `macos-14` runner links both architectures. No Docker, Zig or SDK
-  download is involved. The x86_64 binary is not executed in CI (no Rosetta
-  guarantee); it is smoke-tested by `scripts/verify-package.sh` on an Intel Mac.
+- **macOS runs on an Intel runner.** This account (a personal, public-repo
+  owner) has no arm64 macOS runner: jobs on `macos-14` fail with
+  `The configuration 'macos-14-arm64-us-default' is not supported`, and
+  `macos-latest` resolves to arm64 as well. The matrix therefore uses
+  `macos-13` (the last x64 image): `x86_64-apple-darwin` is built natively and
+  executed for the smoke test, while `aarch64-apple-darwin` is cross-compiled on
+  the same runner. `macos-15-intel` is not a real label (actionlint rejects it),
+  and `macos-14`/`macos-15`/`macos-latest` resolve to arm64 on this account.
+  Apple's SDK is universal, so `rustup target add aarch64-apple-darwin` plus
+  `cargo build --target` is enough — no Docker, Zig or extra SDK. The arm64
+  binary cannot run on the Intel host, so its smoke flag is `false`; verify it
+  on an Apple Silicon machine (or through `scripts/verify-package.sh`).
+- **Label fallback:** if `macos-13` is retired, first check the
+  `macos-13-large`/`macos-13-xlarge` x64 tiers; otherwise use any new
+  `macos-*-intel` label GitHub publishes (verify it in the runner-label list and
+  with actionlint). Never use `macos-14`/`macos-15`/`macos-latest` here: they
+  resolve to arm64 and fail with
+  `The configuration 'macos-14-arm64-us-default' is not supported`.
 - **Linux arm64** uses GitHub's arm64 hosted runner. If that label disappears,
   replace that matrix entry with a `cross` build on `ubuntu-24.04`
   (`cargo install cross`, `cross build --target aarch64-unknown-linux-gnu`);

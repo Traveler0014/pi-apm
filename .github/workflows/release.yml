@@ -13,11 +13,13 @@
 # and Windows x64. Each archive carries README.md, LICENSE and SHA256SUMS; the
 # release also publishes an aggregate SHA256SUMS.txt.
 #
-# Runner strategy: native runners where GitHub provides them (ubuntu-24.04-arm,
-# macos-14 arm64, windows-2022). macOS x86_64 is cross-compiled on the arm64
-# runner: the macOS SDK is universal, so `rustup target add x86_64-apple-darwin`
-# plus `cargo build --target` is enough — no extra toolchain or Docker. See
-# docs/release.md for fallbacks if a runner label is unavailable.
+# Runner strategy: native runners where this account provides them
+# (ubuntu-24.04-arm, windows-2022, macos-13). The arm64 macOS runner is not
+# available here, so macOS x86_64 is built natively on the last Intel image and
+# aarch64-apple-darwin is cross-compiled on the same runner: the macOS SDK is
+# universal, so `rustup target add aarch64-apple-darwin` plus `cargo build
+# --target` is enough — no extra toolchain or Docker. See docs/release.md for
+# label fallbacks.
 name: release
 
 on:
@@ -78,13 +80,16 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             smoke: true
-          - os: macos-14
-            target: aarch64-apple-darwin
-            smoke: true
-          # Cross-compiled on the arm64 runner; the binary cannot be executed
-          # here without Rosetta, so only its presence/size is checked.
-          - os: macos-14
+          # An x64 image is used because this account has no arm64 macOS
+          # runner. macos-13 is the last Intel image: `macos-15-intel` is not a
+          # real runner label (actionlint's list rejects it) and macos-14/15/
+          # latest resolve to arm64 here. x86_64 is native; aarch64 is
+          # cross-built on the same universal SDK.
+          - os: macos-13
             target: x86_64-apple-darwin
+            smoke: true
+          - os: macos-13
+            target: aarch64-apple-darwin
             smoke: false
           - os: windows-2022
             target: x86_64-pc-windows-msvc
