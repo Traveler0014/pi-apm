@@ -349,8 +349,19 @@ impl RestServer {
                 }
             };
             let state = Arc::clone(&self.state);
-            std::thread::spawn(move || {
-                if let Err(err) = handle_connection(stream, &state) {
+            std::thread::spawn(move || match handle_connection(stream, &state) {
+                Ok(()) => {}
+                // Normal client behaviour (tab closed, refresh, navigation):
+                // stay quiet unless explicitly asked for connection-level debug
+                // output. `APM_REST_DEBUG=1` keeps the diagnostic available.
+                Err(ConnectionError::ClientGone(err)) => {
+                    if std::env::var("APM_REST_DEBUG")
+                        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                    {
+                        eprintln!("apm-serve: client disconnected: {err}");
+                    }
+                }
+                Err(ConnectionError::Internal(err)) => {
                     eprintln!("apm-serve: connection error: {err}");
                 }
             });
@@ -483,7 +494,48 @@ pub fn status_for(err: &Error) -> u16 {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, state: &State) -> Result<()> {
+/// Why a connection ended. A browser that navigates away, closes a tab or
+/// aborts a request is *normal*: it resets the socket while the server may still
+/// be writing. That must not be reported as an internal error, or every refresh
+/// fills the terminal with noise. Everything else keeps a diagnostic.
+enum ConnectionError {
+    /// The peer went away (BrokenPipe / ConnectionReset / ConnectionAborted …).
+    ClientGone(std::io::Error),
+    /// A real failure worth investigating.
+    Internal(Error),
+}
+
+impl ConnectionError {
+    fn from_io(context: &str, err: std::io::Error) -> ConnectionError {
+        if is_client_disconnect(&err) {
+            ConnectionError::ClientGone(err)
+        } else {
+            ConnectionError::Internal(Error::Internal(format!("{context}: {err}")))
+        }
+    }
+}
+
+/// Socket errors that mean "the client left", not "the server is broken".
+fn is_client_disconnect(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    // NotConnected/NotADirectory etc. are not used here; the list is deliberately
+    // narrow so a genuine write failure (disk, permission, protocol bug) is
+    // still reported. TimedOut is *not* included: a slow client is a bug on the
+    // client side but a visible diagnostic here.
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected
+    )
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    state: &State,
+) -> std::result::Result<(), ConnectionError> {
     stream
         .set_read_timeout(Some(state.config.read_timeout))
         .ok();
@@ -495,10 +547,11 @@ fn handle_connection(mut stream: TcpStream, state: &State) -> Result<()> {
         Ok(request) => route(&request, state),
         Err(RouteError::Http(response)) => response,
         Err(RouteError::Io(err)) => {
-            return Err(Error::Internal(format!("cannot read the request: {err}")));
+            return Err(ConnectionError::from_io("cannot read the request", err));
         }
     };
     write_response(&mut stream, response)
+        .map_err(|err| ConnectionError::from_io("cannot write the response", err))
 }
 
 enum RouteError {
@@ -596,7 +649,10 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, RouteErr
     })
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    response: Response,
+) -> std::result::Result<(), std::io::Error> {
     let reason = reason_phrase(response.status);
     let mut head = format!("HTTP/1.1 {} {reason}\r\n", response.status);
     for (name, value) in &response.headers {
@@ -610,7 +666,6 @@ fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
         .write_all(head.as_bytes())
         .and_then(|()| stream.write_all(&response.body))
         .and_then(|()| stream.flush())
-        .map_err(|e| Error::Internal(format!("cannot write the response: {e}")))
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -1455,6 +1510,38 @@ mod tests {
         assert!(host_names_loopback("[::1]:7717"));
         assert!(!host_names_loopback("evil.example.com"));
         assert!(!host_names_loopback("192.168.1.5:7717"));
+    }
+
+    #[test]
+    fn client_disconnects_are_classified_and_real_errors_are_not() {
+        use std::io::{Error as IoError, ErrorKind};
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(is_client_disconnect(&IoError::from(kind)), "{kind:?}");
+            assert!(matches!(
+                ConnectionError::from_io("write", IoError::from(kind)),
+                ConnectionError::ClientGone(_)
+            ));
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert!(!is_client_disconnect(&IoError::from(kind)), "{kind:?}");
+            match ConnectionError::from_io("cannot write the response", IoError::from(kind)) {
+                ConnectionError::Internal(err) => {
+                    assert!(err.to_string().contains("cannot write the response"));
+                }
+                ConnectionError::ClientGone(_) => panic!("{kind:?} must stay visible"),
+            }
+        }
     }
 
     #[test]

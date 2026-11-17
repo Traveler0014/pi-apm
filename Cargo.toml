@@ -36,5 +36,7 @@ thiserror = "2.0.21"
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
 
 [dev-dependencies]
+# Used by tests/ui.rs to force a TCP RST (SO_LINGER 0), i.e. a real client aborts.
+libc = "0.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 tempfile = "3.27.0"

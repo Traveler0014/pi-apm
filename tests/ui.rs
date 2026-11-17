@@ -94,11 +94,14 @@ impl Ui {
         let stderr_pipe = child.stderr.take().expect("stderr");
         let stderr_sink = Arc::clone(&stderr);
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr_pipe);
-            let mut buffer = String::new();
-            let _ = reader.read_to_string(&mut buffer);
-            if let Ok(mut sink) = stderr_sink.lock() {
-                sink.push_str(&buffer);
+            // Stream lines as they arrive: disconnect tests inspect the log while
+            // the server is still running.
+            let reader = BufReader::new(stderr_pipe);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(mut sink) = stderr_sink.lock() {
+                    sink.push_str(&line);
+                    sink.push('\n');
+                }
             }
         });
 
@@ -696,6 +699,114 @@ fn ui_origin_must_match_scheme_and_authority_exactly() {
         None,
     );
     assert_eq!(api_cross.status, 403);
+}
+
+#[cfg(unix)]
+fn abort_with_reset(addr: &str, payload: &[u8]) {
+    use std::os::unix::io::AsRawFd;
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.write_all(payload).expect("write request");
+    stream.flush().ok();
+    // SO_LINGER(0): close() sends RST instead of FIN, which is what a browser
+    // does when a tab is closed or a request is aborted mid-flight.
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt SO_LINGER failed");
+    drop(stream);
+}
+
+#[cfg(unix)]
+fn wait_for_log(ui: &Ui, needle: &str, millis: u64) -> String {
+    let deadline = Instant::now() + Duration::from_millis(millis);
+    loop {
+        let log = ui.stderr.lock().unwrap().clone();
+        if log.contains(needle) || Instant::now() >= deadline {
+            return log;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn abrupt_client_disconnects_are_quiet_but_visible_in_debug() {
+    let ledger = Ledger::new();
+    // A larger response gives the server something to write after the client
+    // reset, exercising the write path as well as the read path.
+    for index in 0..25 {
+        ledger.apm(&[
+            "create",
+            "--title",
+            &format!("bulk item {index}"),
+            "--goal",
+            "grow the listing",
+            "--current-state",
+            "created",
+            "--json",
+        ]);
+    }
+
+    // Debug mode: the disconnect is classified and logged as such, never as an
+    // internal connection error.
+    let debug = Ui::spawn(&ledger, &[], &[("APM_REST_DEBUG", "1")], true);
+    let addr = debug.addr.clone();
+    for _ in 0..4 {
+        abort_with_reset(
+            &addr,
+            format!(
+                "GET /api/items?all=true&limit=500 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        abort_with_reset(
+            &addr,
+            format!(
+                "POST /api/items/UIT-1/progress HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100\r\n\r\npartial"
+            )
+            .as_bytes(),
+        );
+    }
+    let log = wait_for_log(&debug, "client disconnected", 5000);
+    assert!(
+        log.contains("client disconnected"),
+        "expected a classified disconnect, got: {log}"
+    );
+    assert!(
+        !log.contains("internal error") && !log.contains("cannot write the response"),
+        "client aborts must not be reported as internal errors: {log}"
+    );
+    // The server is still healthy after being reset repeatedly.
+    assert_eq!(debug.get("/health").status, 200);
+    drop(debug);
+
+    // Default mode: completely quiet.
+    let quiet = Ui::spawn(&ledger, &[], &[], true);
+    abort_with_reset(
+        &quiet.addr,
+        format!(
+            "POST /api/items/UIT-1/progress HTTP/1.1\r\nHost: {}\r\nContent-Length: 100\r\n\r\npartial",
+            quiet.addr
+        )
+        .as_bytes(),
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    let quiet_log = quiet.stderr.lock().unwrap().clone();
+    assert!(
+        !quiet_log.contains("internal error") && !quiet_log.contains("connection error"),
+        "default mode must stay silent about client aborts: {quiet_log}"
+    );
+    assert_eq!(quiet.get("/health").status, 200);
 }
 
 #[test]
