@@ -49,6 +49,7 @@ import {
 	summarizeSideRunOutput,
 	truncate,
 } from "./lib.ts";
+import { renderRunSyncEntry } from "./render.ts";
 
 const ENTRY_TYPE = "apm-run-sync";
 
@@ -581,6 +582,14 @@ async function reconcileRun(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Durable run-sync reports are rendered as a compact entry; expanded shows
+	// reconciliation details, output and the run/session identifiers.
+	// Guarded so older Pi builds (and test doubles) without entry renderers still
+	// load; the reports are persisted either way.
+	if (typeof pi.registerEntryRenderer === "function") {
+		pi.registerEntryRenderer(ENTRY_TYPE, renderRunSyncEntry);
+	}
+
 	pi.registerFlag("apm-disabled", {
 		description: "Disable the pi-apm run-end side-run (tools still work)",
 		type: "boolean",
@@ -1132,11 +1141,14 @@ function metaArgs(
 		name: "apm_status",
 		label: "APM Status",
 		description:
-			"Move a claimed work item through the workflow (ready/doing/blocked/review/done/cancelled). Done requires every acceptance criterion to be met or waived (or, when the item defines none, verification evidence) plus a progress summary or completion note.",
+			"Move a claimed work item through its workflow. The legal target states belong to the item's workflow, not to this tool: the default workflow offers ready/doing/blocked/review/done/cancelled, and a project may bind a custom workflow with extra states (e.g. qa) to an item type. Done requires every acceptance criterion to be met or waived (or, when the item defines none, verification evidence) plus a progress summary or completion note.",
 		promptSnippet: "Change the status of a claimed APM work item",
 		parameters: Type.Object({
 			item: Type.String(),
-			to: StringEnum(["ready", "doing", "blocked", "review", "done", "cancelled"] as const),
+			to: Type.String({
+				description:
+					"Target state key from the item's workflow (default workflow: ready/doing/blocked/review/done/cancelled; custom workflows may add states). An illegal key or transition fails with workflow_violation.",
+			}),
 			reason: Type.Optional(Type.String({ description: "Required for blocked/reopen/cancel" })),
 			note: Type.Optional(Type.String({ description: "Completion note or context" })),
 			expect_version: Type.Optional(

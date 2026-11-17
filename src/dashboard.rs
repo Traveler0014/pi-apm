@@ -53,7 +53,7 @@ impl Store {
         }
 
         let mut stmt = self.conn.prepare(&format!(
-            "{ITEM_SELECT} WHERE i.project_id = ?1 AND (i.status NOT IN ('done','cancelled')
+            "{ITEM_SELECT} WHERE i.project_id = ?1 AND (i.state_category != 'closed'
                 OR (i.done_at IS NOT NULL AND i.done_at >= ?2))
              ORDER BY i.number"
         ))?;
@@ -72,7 +72,7 @@ impl Store {
         let mut open_count = 0usize;
 
         for item in items {
-            if item.status.is_open() {
+            if item.is_open() {
                 open_count += 1;
             }
             *totals
@@ -91,7 +91,7 @@ impl Store {
             if item.health.is_at_risk() {
                 buckets.lost_lease.push(item.clone());
             }
-            if item.status.is_open() {
+            if item.is_open() {
                 let last_progress = item
                     .last_progress_at
                     .as_deref()
@@ -101,24 +101,23 @@ impl Store {
                 if at - reference >= settings.no_progress_after_ms() {
                     buckets.stalled_no_progress.push(item.clone());
                 }
-                if !item.blocked_by.is_empty() && item.blocked_by.iter().any(|d| d.status.is_open())
-                {
+                if !item.blocked_by.is_empty() && item.blocked_by.iter().any(|d| d.is_open()) {
                     buckets.waiting_dependencies.push(item.clone());
                 }
                 // "In progress" means work is actually being held right now:
                 // either the workflow says so, or a live lease is attached.
-                if matches!(item.status, Status::Doing | Status::Review)
+                if matches!(item.status_category.as_str(), "active" | "review")
                     || matches!(item.health, Health::Active | Health::Stale)
                 {
                     buckets.in_progress.push(item.clone());
                 }
                 // Ready and not actually held: the queue of work anyone may pick up.
-                if item.status == Status::Ready
+                if item.status_category == "open"
                     && !matches!(item.health, Health::Active | Health::Stale)
                 {
                     buckets.ready_unclaimed.push(item.clone());
                 }
-            } else if item.status == Status::Done {
+            } else if item.status_category == "closed" && item.cancelled_at.is_none() {
                 buckets.recently_done.push(item.clone());
             }
         }
@@ -146,7 +145,7 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
         let open_items: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM work_items WHERE project_id = ?1 AND status NOT IN ('done','cancelled')",
+            "SELECT COUNT(*) FROM work_items WHERE project_id = ?1 AND state_category != 'closed'",
             params![project_row.id],
             |r| r.get(0),
         )?;
@@ -184,10 +183,12 @@ impl Store {
         let pending_diagnostics = self.pending_diagnostics(&project_row.id)?;
         let recent_events = self.project_events(&project_row.id, 20)?;
 
-        let workflow_valid = match &project_row.workflow_json {
-            Some(json) => crate::workflow::Workflow::from_json(json).is_ok(),
-            None => true,
-        };
+        // Validate every stored workflow version (migration imports legacy
+        // documents, so a broken row is a doctor problem, not a silent fallback).
+        let workflow_valid = self
+            .list_workflows(Some(&project_row.id))
+            .map(|list| !list.is_empty())
+            .unwrap_or(false);
 
         let mut warnings = Vec::new();
         if !expired.is_empty() {

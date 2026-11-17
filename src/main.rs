@@ -125,8 +125,14 @@ enum Cmd {
     Dashboard(DashboardArgs),
     /// Audit trail (per item, or the whole project).
     Events(EventsArgs),
-    /// Print the declarative workflow document.
-    Workflow,
+    /// Inspect, validate, register, bind and upgrade declarative workflows.
+    ///
+    /// `apm workflow` prints the project default document (legacy behaviour);
+    /// use the subcommands for configuration and upgrades.
+    Workflow {
+        #[command(subcommand)]
+        cmd: Option<WorkflowCmd>,
+    },
     /// Mark expired claims as expired (safe to run repeatedly).
     Expire,
     /// Health check of the database, claims, workflow and side-run diagnostics.
@@ -544,6 +550,91 @@ struct AttentionRequestArgs {
     idempotency_key: Option<String>,
 }
 
+#[derive(Subcommand, Debug)]
+enum WorkflowCmd {
+    /// Show a workflow document (default: the project default workflow).
+    Show(WorkflowShowArgs),
+    /// List registered workflow versions.
+    List,
+    /// List item-type bindings and the project default.
+    Types,
+    /// Validate a workflow document without touching the database.
+    Validate(WorkflowDefArgs),
+    /// Validate and register a versioned workflow, optionally binding types.
+    Set(WorkflowSetArgs),
+    /// Bind an item type to an existing workflow version.
+    Bind(WorkflowBindArgs),
+    /// Move an item type (and optionally its open items) to a newer version.
+    Upgrade(WorkflowUpgradeArgs),
+}
+
+#[derive(Args, Debug)]
+struct WorkflowShowArgs {
+    /// Show the workflow bound to this item type (falls back to the default).
+    #[arg(long = "type")]
+    item_type: Option<String>,
+    /// Workflow id (requires --version).
+    #[arg(long)]
+    id: Option<String>,
+    /// Workflow version (requires --id).
+    #[arg(long)]
+    version: Option<i64>,
+}
+
+#[derive(Args, Debug)]
+struct WorkflowDefArgs {
+    /// Path to a workflow JSON document.
+    #[arg(long, conflicts_with = "definition_json")]
+    file: Option<PathBuf>,
+    /// Workflow JSON document as a string.
+    #[arg(long = "definition-json", conflicts_with = "file")]
+    definition_json: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct WorkflowSetArgs {
+    #[command(flatten)]
+    def: WorkflowDefArgs,
+    /// Bind these comma-separated item types to the new version.
+    #[arg(long = "bind", value_delimiter = ',')]
+    bind: Vec<String>,
+    /// Also make this version the project default workflow.
+    #[arg(long)]
+    default: bool,
+    /// Validate and show what would change without writing.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+struct WorkflowBindArgs {
+    #[arg(long = "type")]
+    item_type: String,
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    version: i64,
+}
+
+#[derive(Args, Debug)]
+struct WorkflowUpgradeArgs {
+    #[arg(long = "type")]
+    item_type: String,
+    /// Target workflow id (defaults to the type's current binding).
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long = "to-version")]
+    to_version: i64,
+    /// Re-snapshot existing open items onto the target version.
+    #[arg(long = "migrate-items")]
+    migrate_items: bool,
+    /// State mapping for items whose state is not declared by the target, e.g. --map done=shipped.
+    #[arg(long = "map", value_delimiter = ',')]
+    maps: Vec<String>,
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+}
+
 #[derive(Args, Debug)]
 struct DashboardArgs {
     #[arg(long = "no-progress-after")]
@@ -596,6 +687,13 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // `workflow validate` is pure: it must work in CI without a project database.
+    if let Cmd::Workflow {
+        cmd: Some(WorkflowCmd::Validate(args)),
+    } = &cli.cmd
+    {
+        return cmd_workflow_validate(args, cli.g.json);
+    }
     let at = match &cli.g.now {
         Some(raw) => parse_now(raw)?,
         None => now_ms(),
@@ -654,6 +752,11 @@ impl App {
         if let Some(token) = explicit {
             return Ok(Some(token.to_string()));
         }
+        // A human acting without an explicit token uses the claim-free human path;
+        // a stale session token would otherwise be picked up and rejected.
+        if self.globals.human {
+            return Ok(None);
+        }
         let Some(session) = &self.globals.session else {
             return Ok(None);
         };
@@ -704,7 +807,7 @@ fn dispatch(app: App, cmd: Cmd) -> Result<()> {
         Cmd::Attention { cmd } => cmd_attention(app, cmd),
         Cmd::Dashboard(args) => cmd_dashboard(app, args),
         Cmd::Events(args) => cmd_events(app, args),
-        Cmd::Workflow => cmd_workflow(app),
+        Cmd::Workflow { cmd } => cmd_workflow(app, cmd),
         Cmd::Expire => cmd_expire(app),
         Cmd::Doctor => cmd_doctor(app),
         Cmd::Diag(args) => cmd_diag(app, args),
@@ -1701,10 +1804,268 @@ fn cmd_events(app: App, args: EventsArgs) -> Result<()> {
     app.out_ok(json!({ "events": events }), text)
 }
 
-fn cmd_workflow(app: App) -> Result<()> {
-    let wf = app.store.workflow(app.globals.project.as_deref())?;
-    let text = wf.to_json()?;
-    app.out_ok(wf, text)
+fn cmd_workflow(mut app: App, cmd: Option<WorkflowCmd>) -> Result<()> {
+    match cmd {
+        None => {
+            let wf = app.store.workflow(app.globals.project.as_deref())?;
+            let text = wf.to_json()?;
+            app.out_ok(wf, text)
+        }
+        Some(WorkflowCmd::Show(args)) => {
+            let wf = if let (Some(id), Some(version)) = (&args.id, args.version) {
+                app.store
+                    .workflow_by_id(app.globals.project.as_deref(), id, version)?
+            } else if args.id.is_some() || args.version.is_some() {
+                return Err(Error::invalid("--id and --version must be used together"));
+            } else {
+                app.store
+                    .resolve_workflow(app.globals.project.as_deref(), args.item_type.as_deref())?
+            };
+            let text = wf.to_json()?;
+            app.out_ok(wf, text)
+        }
+        Some(WorkflowCmd::List) => {
+            let list = app.store.list_workflows(app.globals.project.as_deref())?;
+            let text = list
+                .iter()
+                .map(|w| {
+                    format!(
+                        "{:<20} v{:<4} {:<24} initial={:<12} states={}{}",
+                        w.id,
+                        w.version,
+                        w.name,
+                        w.initial,
+                        w.states,
+                        if w.is_project_default {
+                            "  [default]"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.out_ok(json!({ "workflows": list }), text)
+        }
+        Some(WorkflowCmd::Types) => {
+            let bindings = app.store.type_workflows(app.globals.project.as_deref())?;
+            let default = app.store.workflow(app.globals.project.as_deref())?;
+            let text = bindings
+                .iter()
+                .map(|b| {
+                    format!(
+                        "{:<12} {} v{}",
+                        b.item_type, b.workflow_id, b.workflow_version
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = if text.is_empty() {
+                format!(
+                    "no explicit bindings; default is {} v{}",
+                    default.id, default.version
+                )
+            } else {
+                format!("{text}\ndefault: {} v{}", default.id, default.version)
+            };
+            app.out_ok(
+                json!({
+                    "bindings": bindings,
+                    "default": { "workflow_id": default.id, "workflow_version": default.version },
+                }),
+                text,
+            )
+        }
+        Some(WorkflowCmd::Validate(_args)) => {
+            // Validate is pure: no project or database is required.
+            unreachable!("validate is handled before the store is opened")
+        }
+        Some(WorkflowCmd::Set(args)) => {
+            let (raw, source) = read_workflow_definition(&args.def)?;
+            let workflow = Workflow::from_json(&raw)?;
+            let outcome = app.store.apply_workflow_config(
+                app.globals.project.as_deref(),
+                workflow,
+                &args.bind,
+                args.default,
+                args.dry_run,
+                &app.actor(),
+                app.at,
+            )?;
+            let text = if outcome.dry_run {
+                format!(
+                    "valid {} v{} ({} states, initial {}); would {} and bind {} type(s){}",
+                    outcome.workflow.id,
+                    outcome.workflow.version,
+                    outcome.workflow.states.len(),
+                    outcome.workflow.initial,
+                    if outcome.created { "register" } else { "reuse" },
+                    outcome.bound.len(),
+                    if args.default {
+                        " and make default"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                format!(
+                    "{} {} v{} ({} states, initial {}){}{}",
+                    if outcome.created {
+                        "registered"
+                    } else {
+                        "reused"
+                    },
+                    outcome.workflow.id,
+                    outcome.workflow.version,
+                    outcome.workflow.states.len(),
+                    outcome.workflow.initial,
+                    if outcome.bound.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; bound {}",
+                            outcome
+                                .bound
+                                .iter()
+                                .map(|b| b.item_type.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                    if outcome.made_default {
+                        "; project default"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            app.out_ok(
+                json!({
+                    "workflow": outcome.workflow,
+                    "created": outcome.created,
+                    "bound": outcome.bound,
+                    "made_default": outcome.made_default,
+                    "dry_run": outcome.dry_run,
+                    "source": source,
+                }),
+                text,
+            )
+        }
+        Some(WorkflowCmd::Bind(args)) => {
+            let binding = app.store.bind_type_workflow(
+                app.globals.project.as_deref(),
+                &args.item_type,
+                &args.id,
+                args.version,
+                &app.actor(),
+                app.at,
+            )?;
+            let text = format!(
+                "{} -> {} v{}",
+                binding.item_type, binding.workflow_id, binding.workflow_version
+            );
+            app.out_ok(json!({ "binding": binding }), text)
+        }
+        Some(WorkflowCmd::Upgrade(args)) => {
+            let target_id = match args.id {
+                Some(id) => id,
+                None => {
+                    let current = app
+                        .store
+                        .resolve_workflow(app.globals.project.as_deref(), Some(&args.item_type))?;
+                    current.id
+                }
+            };
+            let mut mappings = std::collections::BTreeMap::new();
+            for raw in &args.maps {
+                let Some((from, to)) = raw.split_once('=') else {
+                    return Err(Error::invalid(format!(
+                        "invalid --map '{raw}': expected old=new"
+                    )));
+                };
+                let from = StateKey::parse(from)?.into_string();
+                let to = StateKey::parse(to)?.into_string();
+                mappings.insert(from, to);
+            }
+            let report = app.store.upgrade_type_workflow(
+                app.globals.project.as_deref(),
+                &args.item_type,
+                &target_id,
+                args.to_version,
+                &mappings,
+                args.migrate_items,
+                args.dry_run,
+                &app.actor(),
+                app.at,
+            )?;
+            let mut lines = vec![format!(
+                "{} -> {} v{}{}  migrated={} skipped={} blocked={}",
+                report.item_type,
+                report.target.workflow_id,
+                report.target.workflow_version,
+                if report.dry_run { " (dry run)" } else { "" },
+                report.migrated,
+                report.skipped,
+                report.blocked
+            )];
+            for item in &report.items {
+                lines.push(format!(
+                    "  {:<10} {:<12} -> {:<12} {}",
+                    item.identifier,
+                    item.from_state,
+                    item.to_state.clone().unwrap_or_else(|| "-".into()),
+                    item.action
+                ));
+            }
+            app.out_ok(report, lines.join("\n"))
+        }
+    }
+}
+
+fn read_workflow_definition(def: &WorkflowDefArgs) -> Result<(String, String)> {
+    match (&def.file, &def.definition_json) {
+        (Some(path), None) => {
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                Error::invalid(format!("cannot read workflow file {}: {e}", path.display()))
+            })?;
+            Ok((raw, path.display().to_string()))
+        }
+        (None, Some(json)) => Ok((json.clone(), "--definition-json".to_string())),
+        (None, None) => Err(Error::invalid(
+            "provide the workflow document with --file <path> or --definition-json <json>",
+        )),
+        (Some(_), Some(_)) => Err(Error::invalid(
+            "--file and --definition-json are mutually exclusive",
+        )),
+    }
+}
+
+/// Pure validation: no store, no project, safe to run in CI or a pre-commit hook.
+fn cmd_workflow_validate(args: &WorkflowDefArgs, json_mode: bool) -> Result<()> {
+    let (raw, source) = read_workflow_definition(args)?;
+    let workflow = Workflow::from_json(&raw)?;
+    let payload = json!({
+        "valid": true,
+        "source": source,
+        "workflow": workflow,
+        "states": workflow.states.len(),
+        "transitions": workflow.transitions.len(),
+        "guards": workflow.guards.keys().cloned().collect::<Vec<_>>(),
+    });
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "valid: {} v{} ({} states, {} transitions, {} guards, initial {})",
+            workflow.id,
+            workflow.version,
+            workflow.states.len(),
+            workflow.transitions.len(),
+            workflow.guards.len(),
+            workflow.initial
+        );
+    }
+    Ok(())
 }
 
 fn cmd_expire(mut app: App) -> Result<()> {

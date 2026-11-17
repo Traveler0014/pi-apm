@@ -107,12 +107,14 @@ impl Store {
         let mut issued_token: Option<String> = None;
         let replay = self.idempotent(idem, |tx| {
             let raw = require_raw_item(tx, selector)?;
-            if !raw.status.is_open() {
+            if !raw.is_open() {
                 return Err(Error::ClaimInvalid {
                     reason: format!(
-                        "work item {} is {} and cannot be claimed (reopen it first)",
+                        "work item {} is {} and cannot be claimed by an agent; a human can reopen \
+                         it with `apm --human status {} --to <state> --reason ...`",
                         raw.identifier,
-                        raw.status.as_str()
+                        raw.status.as_str(),
+                        raw.identifier
                     ),
                 });
             }

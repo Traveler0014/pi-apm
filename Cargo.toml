@@ -16,6 +16,14 @@ path = "src/lib.rs"
 name = "apm"
 path = "src/main.rs"
 
+[[bin]]
+name = "apm-mcp"
+path = "src/bin/apm-mcp.rs"
+
+[[bin]]
+name = "apm-serve"
+path = "src/bin/apm-serve.rs"
+
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }

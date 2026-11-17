@@ -720,3 +720,177 @@ export function sessionTokenFilePath(projectDir: string, _sessionId: string): st
 export function platformTempDir(): string {
 	return os.tmpdir();
 }
+
+// ---------------------------------------------------------------------------
+// Run-sync report formatting (TUI)
+// ---------------------------------------------------------------------------
+
+export type Tone = "plain" | "muted" | "accent" | "success" | "warning" | "error";
+
+export interface StyledLine {
+	text: string;
+	tone: Tone;
+}
+
+export interface ReconciledEntry {
+	identifier: string;
+	action: string;
+	ok: boolean;
+	code?: string | null;
+}
+
+/// Shape of the `apm-run-sync` session entry written by the settle hook.
+export interface RunSyncReportData {
+	ran: boolean;
+	mode: "side-run" | "abort-sync" | "skip";
+	reason: string;
+	runId?: string | null;
+	sessionId?: string | null;
+	items?: string[];
+	calls?: number;
+	childEvents?: number;
+	reconciled?: ReconciledEntry[];
+	output?: string;
+	errors?: string[];
+	durationMs?: number;
+	at?: string;
+}
+
+function shortId(value: string | null | undefined): string {
+	if (!value) return "-";
+	return value.length > 18 ? `${value.slice(0, 18)}…` : value;
+}
+
+function duration(ms: number | undefined): string {
+	if (!ms || ms < 0) return "";
+	return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+function compactItems(items: string[] | undefined, limit = 6): string {
+	const list = items ?? [];
+	if (list.length === 0) return "";
+	const shown = list.slice(0, limit).join(", ");
+	return list.length > limit ? `${shown} +${list.length - limit} more` : shown;
+}
+
+function outputLines(output: string | undefined, max: number, width: number): string[] {
+	if (!output) return [];
+	return output
+		.split("\n")
+		.map((line) => redactSecrets(line).trim())
+		.filter(Boolean)
+		.slice(0, max)
+		.map((line) => truncate(line, width));
+}
+
+/**
+ * Turn a run-sync report into display lines with semantic tones.
+ *
+ * Pure on purpose: the TUI renderer only applies theme colours, so this can be
+ * tested without a terminal. Output and errors are redacted and truncated;
+ * nothing here changes what the side-run wrote to the ledger.
+ */
+export function formatRunSyncReport(
+	report: Partial<RunSyncReportData>,
+	options: { expanded?: boolean } = {},
+): StyledLine[] {
+	if (!report.mode && report.ran === undefined) {
+		return [{ text: "[apm] no run-sync data", tone: "muted" }];
+	}
+	const expanded = options.expanded === true;
+	const errors = (report.errors ?? []).map((e) => redactSecrets(e));
+	const items = report.items ?? [];
+	const reconciled = report.reconciled ?? [];
+	const lines: StyledLine[] = [];
+
+	const label = (() => {
+		if (report.mode === "skip") return "skipped";
+		if (report.mode === "abort-sync") return "aborted run · liveness only";
+		// A run that did not sync must never claim it did, even when the reason is
+		// an error (a timed-out side-run used to render as "run synced with 1
+		// issue(s)", which reads like success).
+		if (report.ran === false) {
+			return errors.length > 0 ? `run not synced with ${errors.length} issue(s)` : "run not synced";
+		}
+		if ((report.errors?.length ?? 0) > 0) {
+			return `run synced with ${errors.length} issue(s)`;
+		}
+		return "run synced";
+	})();
+	const tone: Tone =
+		report.mode === "skip"
+			? "muted"
+			: report.mode === "abort-sync"
+				? "warning"
+				: errors.length > 0 || report.ran === false
+					? "warning"
+					: "success";
+	const meta = [duration(report.durationMs), items.length > 0 ? `${items.length} item(s)` : ""]
+		.filter(Boolean)
+		.join(" · ");
+	lines.push({
+		text: `[apm] ${label}${meta ? ` (${meta})` : ""}${report.runId ? ` · run ${shortId(report.runId)}` : ""}`,
+		tone,
+	});
+
+	if (report.mode === "skip" || report.mode === "abort-sync") {
+		if (report.reason) lines.push({ text: `  ${truncate(report.reason, 180)}`, tone: "muted" });
+	}
+
+	const itemText = compactItems(items);
+	if (itemText && (expanded || report.mode !== "skip")) {
+		lines.push({ text: `  items: ${itemText}`, tone: "muted" });
+	}
+
+	if (reconciled.length > 0 && report.mode !== "skip") {
+		const shown = reconciled.slice(0, expanded ? 12 : 4);
+		for (const entry of shown) {
+			const icon = entry.ok ? (entry.action === "skip" ? "·" : "✓") : "✗";
+			const suffix = entry.ok
+				? entry.action === "skip"
+					? "already recorded"
+					: entry.action
+				: `failed${entry.code ? ` (${entry.code})` : ""}`;
+			lines.push({
+				text: truncate(`  ${icon} ${entry.identifier} ${suffix}`, 160),
+				tone: entry.ok ? (entry.action === "skip" ? "muted" : "success") : "error",
+			});
+		}
+		if (reconciled.length > shown.length) {
+			lines.push({
+				text: `  +${reconciled.length - shown.length} more item(s)`,
+				tone: "muted",
+			});
+		}
+	}
+
+	const shownErrors = errors.slice(0, expanded ? 6 : 1);
+	for (const error of shownErrors) {
+		lines.push({ text: truncate(`  ! ${error}`, 200), tone: "error" });
+	}
+	if (errors.length > shownErrors.length) {
+		lines.push({ text: `  ! +${errors.length - shownErrors.length} more error(s)`, tone: "muted" });
+	}
+
+	const output = outputLines(report.output, expanded ? 6 : 1, 200);
+	if (output.length > 0) {
+		if (!expanded) {
+			lines.push({ text: `  ${output[0]}`, tone: "muted" });
+		} else {
+			for (const line of output) lines.push({ text: `  ${line}`, tone: "muted" });
+		}
+	}
+
+	if (expanded) {
+		const metaLine = [
+			report.at ? `at ${report.at}` : "",
+			report.sessionId ? `session ${shortId(report.sessionId)}` : "",
+			`run ${shortId(report.runId)}`,
+		]
+			.filter(Boolean)
+			.join(" · ");
+		lines.push({ text: `  ${metaLine}`, tone: "muted" });
+	}
+
+	return lines.length > 0 ? lines : [{ text: "[apm] no run-sync data", tone: "muted" }];
+}

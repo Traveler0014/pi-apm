@@ -47,6 +47,14 @@ apm progress <id> --expect-version V \
 
 * Every write needs a live claim: pass `--session` and the CLI reuses the 0600
   session token file (never paste a token into a field).
+* **States come from the item's workflow, not from a fixed list.** Discover them
+  with `apm workflow show --type <type> --json` (or the item's `workflow_id` +
+  `workflow_version` from `apm get`). Custom states are legal keys; an unknown
+  key or an illegal transition fails with `workflow_violation`, and completion
+  still requires the workflow's evidence/progress guards.
+* Do not edit an item type's workflow binding yourself: `apm workflow
+  set/upgrade` is an operator action. Re-binding never changes the snapshot of
+  an existing item.
 * Expired leases reject writes, even with the right token.
 * Versions are optimistic: lost races fail loudly.
 * `done` cannot be a bare status flip.

@@ -11,9 +11,12 @@ use serde_json::json;
 
 use super::*;
 use crate::store::claims::require_write_claim;
-use crate::workflow::{self, GuardContext};
+use crate::workflow::GuardContext;
 
 pub const PRIORITIES: [&str; 5] = ["lowest", "low", "normal", "high", "highest"];
+/// Default work-item types. Types are now validated as slugs, so a project can
+/// bind additional types to their own workflows; this list documents the ones
+/// the default workflow covers out of the box.
 pub const ITEM_TYPES: [&str; 6] = ["task", "bug", "story", "chore", "spike", "question"];
 
 pub struct NewItem {
@@ -139,11 +142,8 @@ impl Store {
             return Err(Error::invalid("title must be non-empty"));
         }
         new.context.validate()?;
-        let item_type = normalise_choice(
-            new.item_type.as_deref().unwrap_or("task"),
-            &ITEM_TYPES,
-            "item type",
-        )?;
+        let item_type =
+            super::workflows::item_type_key(new.item_type.as_deref().unwrap_or("task"))?;
         let priority = normalise_choice(
             new.priority.as_deref().unwrap_or("normal"),
             &PRIORITIES,
@@ -155,11 +155,18 @@ impl Store {
             return Err(Error::invalid("parent selector must be non-empty"));
         }
         let project_row = self.require_project(project)?;
+        // Snapshot the workflow for this item type now: later re-binding must not
+        // reinterpret an existing item's state machine.
+        let workflow = self.workflow_for_type(&project_row.id, &item_type)?;
+        let initial_state = workflow.initial_state().clone();
+        let initial_category = initial_state.category.as_str().to_string();
         let actor = new.actor.clone();
         let idem = Idem::new("item.create", idempotency_key).request(json!({
             "title": title,
             "context_hash": new.context.hash(),
             "item_type": item_type,
+            "workflow_id": workflow.id,
+            "workflow_version": workflow.version,
             "priority": priority,
             "parent": new.parent,
             "depends_on": new.depends_on,
@@ -178,7 +185,7 @@ impl Store {
                     if parent.project_id != project_row.id {
                         return Err(Error::invalid("parent belongs to another project"));
                     }
-                    if parent.status == Status::Cancelled {
+                    if parent.state_category == Category::Closed.as_str() {
                         return Err(Error::invalid("cannot nest under a cancelled item"));
                     }
                     Some(parent.id)
@@ -197,11 +204,13 @@ impl Store {
 
             tx.execute(
                 "INSERT INTO work_items
-                 (id, project_id, number, identifier, title, item_type, status, priority, parent_id,
+                 (id, project_id, number, identifier, title, item_type, status, state_category,
+                  workflow_id, workflow_version, priority, parent_id,
                   version, context_version, progress_summary, next_action, blocker,
                   waiting_on_human, waiting_reason, completion_note, created_by, created_at,
                   updated_at, last_heartbeat_at, last_progress_at, last_run_sync_at, done_at, cancelled_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', ?7, ?8, 1, 1, NULL, NULL, NULL, 0, NULL, NULL, ?9, ?10, ?10, NULL, NULL, NULL, NULL, NULL)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         1, 1, NULL, NULL, NULL, 0, NULL, NULL, ?13, ?14, ?14, NULL, NULL, NULL, NULL, NULL)",
                 params![
                     id,
                     project_row.id,
@@ -209,6 +218,10 @@ impl Store {
                     identifier,
                     title,
                     item_type,
+                    initial_state.key,
+                    initial_category,
+                    workflow.id,
+                    workflow.version,
                     priority,
                     parent,
                     actor.name,
@@ -347,7 +360,8 @@ impl Store {
                 args.push(Value::Text(s.as_str().to_string()));
             }
         } else if !filter.include_closed {
-            sql.push_str(" AND i.status NOT IN ('done', 'cancelled')");
+            // Closed is a workflow category, not a hard-coded pair of keys.
+            sql.push_str(" AND i.state_category != 'closed'");
         }
         if let Some(parent) = &filter.parent {
             let parent = require_raw_item(&self.conn, parent)?;
@@ -445,7 +459,11 @@ impl Store {
                 raw.title = title.to_string();
             }
             if let Some(item_type) = &patch.item_type {
-                raw.item_type = normalise_choice(item_type, &ITEM_TYPES, "item type")?;
+                // Same slug rules as create. Changing the type does *not* migrate
+                // the item to another workflow: the snapshot it was created with
+                // stays authoritative (documented in README and covered by
+                // `item_type_changes_do_not_reinterpret_the_workflow_snapshot`).
+                raw.item_type = super::workflows::item_type_key(item_type)?;
             }
             if let Some(priority) = &patch.priority {
                 raw.priority = normalise_choice(priority, &PRIORITIES, "priority")?;
@@ -521,9 +539,14 @@ impl Store {
         at: i64,
         idempotency_key: Option<&str>,
     ) -> Result<WorkItemView> {
-        let (project_row, item_id) = {
+        let (project_row, item_id, item_workflow) = {
             let raw = require_raw_item(&self.conn, selector)?;
-            (self.require_project(Some(&raw.project_id))?, raw.id.clone())
+            let workflow = self.workflow_for_item(&raw)?;
+            (
+                self.require_project(Some(&raw.project_id))?,
+                raw.id.clone(),
+                workflow,
+            )
         };
         let idem = Idem::new("item.status", idempotency_key)
             .item(Some(&item_id))
@@ -546,9 +569,12 @@ impl Store {
                 )));
             }
 
-            let workflow = match &project_row.workflow_json {
-                Some(json) => workflow::Workflow::from_json(json)?,
-                None => workflow::Workflow::default_v1(),
+            let workflow = &item_workflow;
+            let Some(target) = workflow.state(to.as_str()) else {
+                return Err(Error::WorkflowViolation(format!(
+                    "state '{}' is not part of this item's workflow {} v{}",
+                    to, workflow.id, workflow.version
+                )));
             };
             let met_acceptance: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM acceptance_criteria WHERE work_item_id = ?1 AND status IN ('met', 'waived')",
@@ -561,8 +587,8 @@ impl Store {
                 |r| r.get(0),
             )?;
             let guard_ctx = GuardContext {
-                from: raw.status,
-                to,
+                from: raw.status.clone(),
+                to: to.clone(),
                 reason,
                 note,
                 progress_summary: raw.progress_summary.as_deref(),
@@ -573,27 +599,28 @@ impl Store {
             };
             workflow.check_transition(&guard_ctx)?;
 
-            let before_status = raw.status;
+            let before_status = raw.status.clone();
+            let before_category = raw.state_category.clone();
             let before_version = raw.version;
-            raw.status = to;
+            raw.status = to.clone();
+            raw.state_category = target.category.as_str().to_string();
             raw.version += 1;
             raw.updated_at = at;
-            match to {
-                Status::Done => {
-                    raw.done_at = Some(at);
-                    raw.cancelled_at = None;
-                    raw.completion_note = note.map(str::to_string).or(raw.completion_note.clone());
-                    raw.waiting_on_human = false;
-                }
-                Status::Cancelled => {
+            if target.category.is_closed() {
+                if target.cancel {
                     raw.cancelled_at = Some(at);
                     raw.done_at = None;
-                    raw.waiting_on_human = false;
-                }
-                _ => {
-                    raw.done_at = None;
+                } else {
+                    raw.done_at = Some(at);
                     raw.cancelled_at = None;
                 }
+                raw.waiting_on_human = false;
+                if raw.completion_note.is_none() {
+                    raw.completion_note = note.map(str::to_string);
+                }
+            } else {
+                raw.done_at = None;
+                raw.cancelled_at = None;
             }
             write_item(tx, &raw, at)?;
 
@@ -611,6 +638,11 @@ impl Store {
                     payload: json!({
                         "from": before_status.as_str(),
                         "to": to.as_str(),
+                        "from_category": before_category,
+                        "to_category": target.category.as_str(),
+                        "workflow_id": workflow.id,
+                        "workflow_version": workflow.version,
+                        "terminal": target.terminal,
                         "reason": reason,
                         "note": note,
                         "met_acceptance": met_acceptance,
@@ -621,7 +653,7 @@ impl Store {
 
             // Closing an item releases the claim so finished work cannot keep a
             // zombie lease alive. Reopening requires a fresh claim, by design.
-            if !to.is_open()
+            if target.category.is_closed()
                 && let Some(claim) = active_claim(tx, &raw.id)?
             {
                 {
@@ -974,8 +1006,9 @@ fn write_item(tx: &Transaction<'_>, raw: &RawItem, at: i64) -> Result<()> {
         "UPDATE work_items SET title = ?1, item_type = ?2, priority = ?3, parent_id = ?4,
             version = ?5, progress_summary = ?6, next_action = ?7, blocker = ?8,
             waiting_on_human = ?9, waiting_reason = ?10, completion_note = ?11,
-            updated_at = ?12, done_at = ?13, cancelled_at = ?14, status = ?15
-         WHERE id = ?16",
+            updated_at = ?12, done_at = ?13, cancelled_at = ?14, status = ?15,
+            state_category = ?16, workflow_id = ?17, workflow_version = ?18
+         WHERE id = ?19",
         params![
             raw.title,
             raw.item_type,
@@ -992,6 +1025,9 @@ fn write_item(tx: &Transaction<'_>, raw: &RawItem, at: i64) -> Result<()> {
             raw.done_at,
             raw.cancelled_at,
             raw.status.as_str(),
+            raw.state_category,
+            raw.workflow_id,
+            raw.workflow_version,
             raw.id
         ],
     )?;

@@ -8,6 +8,7 @@ pub mod events;
 pub mod items;
 pub mod misc;
 pub mod project;
+pub mod workflows;
 
 use std::path::{Path, PathBuf};
 
@@ -34,15 +35,15 @@ impl Store {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Internal(format!("cannot create {}: {e}", parent.display())))?;
         }
-        let conn = Connection::open(&path)?;
-        db::migrate(&conn)?;
+        let mut conn = Connection::open(&path)?;
+        db::migrate(&mut conn)?;
         Ok(Store { conn, path })
     }
 
     /// In-memory store for tests. Not durable, obviously.
     pub fn open_in_memory() -> Result<Store> {
-        let conn = Connection::open_in_memory()?;
-        db::migrate(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        db::migrate(&mut conn)?;
         Ok(Store {
             conn,
             path: PathBuf::from(":memory:"),
@@ -222,7 +223,10 @@ pub(crate) struct RawItem {
     pub identifier: String,
     pub title: String,
     pub item_type: String,
-    pub status: Status,
+    pub status: StateKey,
+    pub state_category: String,
+    pub workflow_id: String,
+    pub workflow_version: i64,
     pub priority: String,
     pub parent_id: Option<String>,
     pub parent_identifier: Option<String>,
@@ -246,7 +250,8 @@ pub(crate) struct RawItem {
 
 pub(crate) const ITEM_SELECT: &str = "
 SELECT i.id, i.project_id, p.name, i.number, i.identifier, i.title, i.item_type,
-       i.status, i.priority, i.parent_id, par.identifier,
+       i.status, i.state_category, i.workflow_id, i.workflow_version, i.priority,
+       i.parent_id, par.identifier,
        i.version, i.context_version, i.progress_summary, i.next_action, i.blocker,
        i.waiting_on_human, i.waiting_reason, i.completion_note, i.created_by,
        i.created_at, i.updated_at, i.last_heartbeat_at, i.last_progress_at,
@@ -267,27 +272,36 @@ impl RawItem {
             identifier: row.get(4)?,
             title: row.get(5)?,
             item_type: row.get(6)?,
-            status: Status::parse(&status).unwrap_or(Status::Ready),
-            priority: row.get(8)?,
-            parent_id: row.get(9)?,
-            parent_identifier: row.get(10)?,
-            version: row.get(11)?,
-            context_version: row.get(12)?,
-            progress_summary: row.get(13)?,
-            next_action: row.get(14)?,
-            blocker: row.get(15)?,
-            waiting_on_human: row.get::<_, i64>(16)? != 0,
-            waiting_reason: row.get(17)?,
-            completion_note: row.get(18)?,
-            created_by: row.get(19)?,
-            created_at: row.get(20)?,
-            updated_at: row.get(21)?,
-            last_heartbeat_at: row.get(22)?,
-            last_progress_at: row.get(23)?,
-            last_run_sync_at: row.get(24)?,
-            done_at: row.get(25)?,
-            cancelled_at: row.get(26)?,
+            status: StateKey::parse(&status).unwrap_or_else(|_| StateKey::ready()),
+            state_category: row.get(8)?,
+            workflow_id: row.get(9)?,
+            workflow_version: row.get(10)?,
+            priority: row.get(11)?,
+            parent_id: row.get(12)?,
+            parent_identifier: row.get(13)?,
+            version: row.get(14)?,
+            context_version: row.get(15)?,
+            progress_summary: row.get(16)?,
+            next_action: row.get(17)?,
+            blocker: row.get(18)?,
+            waiting_on_human: row.get::<_, i64>(19)? != 0,
+            waiting_reason: row.get(20)?,
+            completion_note: row.get(21)?,
+            created_by: row.get(22)?,
+            created_at: row.get(23)?,
+            updated_at: row.get(24)?,
+            last_heartbeat_at: row.get(25)?,
+            last_progress_at: row.get(26)?,
+            last_run_sync_at: row.get(27)?,
+            done_at: row.get(28)?,
+            cancelled_at: row.get(29)?,
         })
+    }
+
+    /// Open means "not in a closed category", which is workflow-defined rather
+    /// than a hard-coded state list.
+    pub(crate) fn is_open(&self) -> bool {
+        self.state_category != Category::Closed.as_str()
     }
 }
 
@@ -511,7 +525,7 @@ pub(crate) fn health_for(
     now: i64,
     settings: &Settings,
 ) -> Health {
-    if !item.status.is_open() {
+    if !item.is_open() {
         return Health::Ended;
     }
     let Some(claim) = claim else {
@@ -589,8 +603,10 @@ pub(crate) fn hydrate_item(
         identifier: row.identifier.clone(),
         title: row.title.clone(),
         item_type: row.item_type.clone(),
-        status: row.status,
-        status_category: row.status.category().to_string(),
+        status: row.status.clone(),
+        status_category: row.state_category.clone(),
+        workflow_id: row.workflow_id.clone(),
+        workflow_version: row.workflow_version,
         priority: row.priority.clone(),
         parent_id: row.parent_id.clone(),
         parent_identifier: row.parent_identifier.clone(),
@@ -634,7 +650,7 @@ pub(crate) fn labels_of(conn: &Connection, item_id: &str) -> Result<Vec<String>>
 
 pub(crate) fn dependencies_of(conn: &Connection, item_id: &str) -> Result<Vec<DependencyRef>> {
     let mut stmt = conn.prepare(
-        "SELECT i.id, i.identifier, i.title, i.status FROM dependencies d
+        "SELECT i.id, i.identifier, i.title, i.status, i.state_category FROM dependencies d
          JOIN work_items i ON i.id = d.depends_on_id
          WHERE d.work_item_id = ?1 ORDER BY i.number",
     )?;
@@ -645,7 +661,8 @@ pub(crate) fn dependencies_of(conn: &Connection, item_id: &str) -> Result<Vec<De
                 id: r.get(0)?,
                 identifier: r.get(1)?,
                 title: r.get(2)?,
-                status: Status::parse(&status).unwrap_or(Status::Ready),
+                status: StateKey::parse(&status).unwrap_or_else(|_| StateKey::ready()),
+                status_category: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -654,7 +671,7 @@ pub(crate) fn dependencies_of(conn: &Connection, item_id: &str) -> Result<Vec<De
 
 pub(crate) fn dependents_of(conn: &Connection, item_id: &str) -> Result<Vec<DependencyRef>> {
     let mut stmt = conn.prepare(
-        "SELECT i.id, i.identifier, i.title, i.status FROM dependencies d
+        "SELECT i.id, i.identifier, i.title, i.status, i.state_category FROM dependencies d
          JOIN work_items i ON i.id = d.work_item_id
          WHERE d.depends_on_id = ?1 ORDER BY i.number",
     )?;
@@ -665,7 +682,8 @@ pub(crate) fn dependents_of(conn: &Connection, item_id: &str) -> Result<Vec<Depe
                 id: r.get(0)?,
                 identifier: r.get(1)?,
                 title: r.get(2)?,
-                status: Status::parse(&status).unwrap_or(Status::Ready),
+                status: StateKey::parse(&status).unwrap_or_else(|_| StateKey::ready()),
+                status_category: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -727,6 +745,8 @@ pub struct ProjectRow {
     pub created_at: i64,
     pub settings: Settings,
     pub workflow_json: Option<String>,
+    pub default_workflow_id: Option<String>,
+    pub default_workflow_version: Option<i64>,
 }
 
 impl ProjectRow {
@@ -753,11 +773,13 @@ pub(crate) fn project_from_row(row: &Row<'_>) -> rusqlite::Result<ProjectRow> {
         created_at: row.get(4)?,
         settings: serde_json::from_str(&settings).unwrap_or_default(),
         workflow_json: row.get(6)?,
+        default_workflow_id: row.get(7)?,
+        default_workflow_version: row.get(8)?,
     })
 }
 
-pub(crate) const PROJECT_SELECT: &str =
-    "SELECT id, name, prefix, root_path, created_at, settings_json, workflow_json FROM projects";
+pub(crate) const PROJECT_SELECT: &str = "SELECT id, name, prefix, root_path, created_at,
+    settings_json, workflow_json, default_workflow_id, default_workflow_version FROM projects";
 
 impl Store {
     pub(crate) fn project_by_name(&self, name: &str) -> Result<Option<ProjectRow>> {

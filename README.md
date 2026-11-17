@@ -40,17 +40,21 @@ the run, even if the child model does nothing or fails.
 
 ### Rust CLI
 
+Three binaries come out of the same crate: `apm` (the CLI), `apm-mcp` (the MCP
+stdio server) and `apm-serve` (the optional loopback REST adapter) — see §8.
+
 With [`just`](https://github.com/casey/just):
 
 ```bash
-just build                       # cargo build --release → target/release/apm
-just install                     # → $HOME/.local/bin/apm
+just build                       # cargo build --release → target/release/{apm,apm-mcp,apm-serve}
+just install                     # → $HOME/.local/bin/{apm,apm-mcp,apm-serve}
 BINDIR=/usr/local/bin just install   # or any directory on PATH
-apm --version
+apm --version && apm-mcp --version && apm-serve --version
 ```
 
-`just install` builds first and installs with mode `0755`; `BINDIR` defaults to
-`$HOME/.local/bin`. If that directory is not on your `PATH`, add it:
+`just install` builds first and installs **all three** binaries with mode `0755`;
+`BINDIR` defaults to `$HOME/.local/bin`. If that directory is not on your `PATH`,
+add it:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -62,7 +66,9 @@ The manual equivalent, without `just`:
 cargo build --release
 mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/apm "$HOME/.local/bin/apm"
-apm --version
+install -m 0755 target/release/apm-mcp "$HOME/.local/bin/apm-mcp"
+install -m 0755 target/release/apm-serve "$HOME/.local/bin/apm-serve"
+apm --version && apm-mcp --version && apm-serve --version
 ```
 
 Requires Rust 1.85+ (edition 2024). SQLite is bundled; there is no system
@@ -81,7 +87,8 @@ pi -e ./pi-apm/index.ts
 
 The extension is TypeScript loaded through Pi's jiti runtime. The modules Pi
 supplies to extensions (`@earendil-works/pi-coding-agent`,
-`@earendil-works/pi-ai`, `typebox`) are declared as `peerDependencies` with a
+`@earendil-works/pi-ai`, `@earendil-works/pi-tui`, `typebox`) are declared as
+`peerDependencies` with a
 `"*"` range — the host-provided contract — so Pi maps them to its own copies and
 a physical install cannot create duplicate runtime modules. Pinned versions for
 local development live in `devDependencies` only; the package has no runtime
@@ -323,18 +330,95 @@ The default state machine (v1) is data, not `match` arms:
    the item defines **no** criteria, at least one evidence record is required;
 2. `progress_or_note` — a non-empty progress summary or completion note.
 
-Closing an item auto-releases its claim (no zombie leases on finished work);
-reopening requires a fresh claim.
+Closing an item auto-releases its claim (no zombie leases on finished work).
+Agents cannot claim a closed item, so reopening is a human action:
+`apm --human status <id> --to <state> --reason "..."`; the item then behaves
+normally again (keeping its workflow snapshot).
 
-**Boundary (v1):** the six status keys are fixed by the domain enum, so custom
-*states* are rejected on load. What is declarative today is the transition table
-and the three guards (`reason`, `evidence_or_acceptance`, `progress_or_note`).
-A project can store its own workflow JSON on the project row
-(`projects.workflow_json`); the engine parses and validates it on every
-transition. An invalid document **fails loudly** (`invalid_input`, exit 2) rather
-than silently falling back — `apm doctor` reports `workflow_valid: false` so the
-breakage is visible, and `apm workflow` refuses to print a bogus table. A fully custom state
-machine (new states, per-transition side effects) is explicitly *not* in v1.
+**Workflow schema (v2).** States, transitions and guards are a versioned
+document, stored per project as `(id, version)`:
+
+```json
+{
+  "id": "qa-flow", "version": 1, "name": "QA flow", "initial": "ready",
+  "states": [
+    { "key": "ready", "label": "Ready", "category": "open",   "terminal": false },
+    { "key": "qa",    "label": "QA",    "category": "review", "terminal": false },
+    { "key": "done",  "label": "Done",  "category": "closed", "terminal": true },
+    { "key": "cancelled", "label": "Cancelled", "category": "closed", "terminal": true, "cancel": true }
+  ],
+  "transitions": [
+    { "from": "ready", "to": "qa", "requires": [] },
+    { "from": "qa", "to": "done", "requires": ["progress_or_note", "evidence_or_acceptance"] },
+    { "from": "qa", "to": "cancelled", "requires": ["reason"] }
+  ],
+  "guards": {
+    "reason": { "kind": "reason" },
+    "evidence_or_acceptance": { "kind": "evidence_or_acceptance" },
+    "progress_or_note": { "kind": "progress_or_note" }
+  }
+}
+```
+
+- **Categories** (`open`/`active`/`waiting`/`review`/`closed`) are the contract
+  shared with the dashboard, health and claim logic; custom state keys never leak
+  into those decisions.
+- **`terminal`** must agree with `category: closed`; **`cancel`** marks a closed
+  cancel outcome (a `reason`-kind guard is mandatory on transitions into it).
+- Guards are a **named library**: a transition references names, and validation
+  works on the guard *kind*, so `completion_evidence` (kind
+  `evidence_or_acceptance`) is equivalent to the built-in name.
+- Validation rejects: duplicate/invalid keys, an initial state that is missing or
+  closed, unreachable states, non-closed dead ends, unknown guard references,
+  unknown guard kinds, same `(id, version)` with different content, and any
+  attempt to weaken completion — transitions into a completion state must
+  require an evidence-kind **and** a progress-kind guard.
+- Items **snapshot** `workflow id + version` at creation. Transitions are always
+  validated against that snapshot, so re-binding a type never reinterprets
+  existing items. The default `apm-default` v1 workflow reproduces the original
+  six-state machine exactly (same transitions and completion rules).
+
+### CLI configuration and upgrades
+
+```bash
+apm workflow                       # project default document (legacy alias of `show`)
+apm workflow show [--type TYPE] [--id ID --version V]
+apm workflow list                  # registered versions, marks the project default
+apm workflow types                 # item-type bindings + project default
+apm workflow validate --file wf.json          # pure: no DB/project needed (CI-friendly)
+apm workflow set --file wf.json --bind spike,bug [--default] [--dry-run]
+apm workflow bind --type spike --id qa-flow --version 2
+apm workflow upgrade --type spike --to-version 2 --migrate-items \
+                     [--map qa=reviewing] [--dry-run]
+```
+
+`set` is **atomic and idempotent**: the document, every `--bind` and `--default`
+are validated first and applied in one transaction, so an invalid second type
+leaves nothing behind (no row, no binding, no event); replaying the same content
+writes nothing and adds no events. `upgrade` plans before it writes: an open item
+whose state is not declared by the target and has no `--map` blocks the whole
+upgrade (`workflow_violation`, exit 6). `--migrate-items` re-snapshots open items,
+records a `workflow_migrated` event carrying previous/new workflow, state and
+item version, and bumps the item version. Closed items **never** migrate — they
+keep their historical snapshot even when the target declares the same state
+(reported as `skipped_closed`); reopen one through the human path
+(`apm --human status ...`) before upgrading it.
+
+Mappings that would land an open item in a **closed** state are refused: that
+would close the item without running the completion guards, so upgrade to a
+non-closed state and finish it with `apm status`. Mapping targets are validated
+against the target workflow, so a typo is reported as such. Applying a plan is a
+compare-and-swap on each item's `(version, state)`: if another process changed an
+item in between, the whole transaction rolls back with `version_conflict`
+(exit 4) and nothing is half-migrated. Re-running a completed upgrade is a no-op.
+`--dry-run` prints the plan without writing.
+
+**Upgrade playbook:** `validate` the new document → `set` it (no binding) →
+`upgrade --dry-run --migrate-items [--map ...]` → apply → `apm dashboard` and
+`apm doctor` to confirm. An invalid document always fails loudly
+(`invalid_input`, exit 2); `apm doctor` reports `workflow_valid: false` if a
+stored document cannot be parsed. Legacy `projects.workflow_json` documents are
+imported into the versioned workflow table by the v2→v3 migration.
 
 ---
 
@@ -387,6 +471,7 @@ apm expire          # sweep expired leases into status=expired (idempotent)
 | command | `/apm-status` | print the board into the session |
 | command | `/apm-doctor` | db/claims/diagnostics summary |
 | hook | `agent_settled` | run the end-of-run side-run |
+| entry renderer | `apm-run-sync` | compact TUI card for each settled run (see §7.6) |
 
 Tokens are never placed in the model's tool results: the CLI persists them to the
 session file, and the tools just add `--session`.
@@ -475,8 +560,11 @@ broken plugin cannot break the main reply.
   already made remain (they are idempotent, not transactional across CLI calls).
 - The main agent's tools do not retry `version_conflict` automatically; they
   return the structured conflict so the model can re-read and retry.
-- `apm_run-sync` entries are not rendered in the TUI (they are persisted in the
-  session and visible via `/apm-doctor`); a custom renderer is future work.
+- `apm-run-sync` entries are rendered as a compact TUI card (mode, items,
+  reconciliation, errors, duration); expanded entries add the run/session ids and
+  up to six output lines. Output is truncated and claim tokens are redacted. In
+  non-interactive (`-p`, JSON, RPC) runs the entry is still persisted but no
+  component is drawn.
 - There is no "run the side-run now" command: recovery of a missed run is manual
   (`apm claim --recover-only` plus normal agent work), and `/apm-doctor` shows
   what is stale.
@@ -495,17 +583,230 @@ broken plugin cannot break the main reply.
   local files; it only closes the accidental "command output lands in the ledger"
   channel described above.
 
+
+### 7.6 Reading and triaging side-run reports
+
+Every settled run appends an `apm-run-sync` entry. In an interactive session the
+extension renders it as a card; in `-p`/JSON/RPC runs the entry is still
+persisted, it is simply not drawn (and nothing else changes).
+
+**Collapsed** — one line of state, then the facts that usually matter:
+
+```
+[apm] run synced (20.8s · 1 item(s)) · run 2026-11-16T12:37:2…
+  items: TUI-2
+· TUI-2 already recorded
+  Ledger synchronised. The run's claim and progress were already
+  persisted via the agent's tool calls, …
+```
+
+**Expanded** (the same key that expands tool output, `ctrl+o`) adds up to twelve
+reconciled items, six errors, six output lines and the metadata line:
+
+```
+  at 2026-11-16T12:37:29.997Z · session 01a1e45c-26fe-7506… · run 2026-11-16T12:37:2…
+```
+
+| element | meaning |
+|---|---|
+| `[apm] run synced` | the side-run ran and reconciled the session's claims |
+| `[apm] run synced with N issue(s)` | it ran, but the child reported N errors (see `!` lines) |
+| `[apm] run not synced` / `… with N issue(s)` | it did **not** sync: ran=false, e.g. a timeout. Never reads as success |
+| `[apm] skipped (…)` + reason | nothing was claimed, recursion guard, or the side-run is disabled |
+| `aborted run · liveness only` | the run was aborted; only a liveness sync was recorded, never progress |
+| `duration · N item(s) · run …` | wall time, how many claims were in play, short run id |
+| `items: …` | the item identifiers this run touched (`+N more` beyond six) |
+| `✓ APM-7 sync` | a write landed for that item |
+| `· APM-7 already recorded` | the item was already covered by this run (idempotent replay) |
+| `✗ APM-7 failed (claim_invalid)` | the write for that item failed; the code is the CLI code |
+| `! …` | errors reported by the child, redacted and truncated |
+| indented plain lines | the child's summary of what it did, truncated |
+
+Claim tokens never appear: output and errors are scrubbed with the same
+`apm_[0-9a-f]{32,}` redaction the rest of the plugin uses.
+
+**Where to look when something is off**
+
+| symptom | diagnosis |
+|---|---|
+| no card at all | side-run disabled (`--apm-disabled`, `APM_SIDE_RUN_DISABLED=1`), the session holds no claim, or a non-interactive run. The entry is persisted either way — check `apm events --limit 20` for `run_synced`/`run_aborted` |
+| `[apm] skipped … session holds no claim` | the agent never claimed anything, so there is nothing to reconcile: claim before working |
+| `✗ … failed (claim_invalid)` | the lease expired mid-run: `apm claim <item> --takeover --reason "…"` |
+| `✗ … failed (version_conflict)` | another writer won the race: re-read the item and retry once |
+| `✗ … failed (claim_required)` | a completion write was attempted after the claim was released |
+| `… timed out after Nms` | raise `--apm-side-run-timeout`, or set a faster `--apm-side-run-model`; reconciliation still records the run |
+| `side_run_failed` diagnostic | `apm doctor --json` lists pending diagnostics, `/apm-doctor` prints the summary |
+| card says issues but the ledger looks right | the card is a view: trust `apm get <item> --json`, `apm events`, and `apm doctor` |
+
+Tests behind the card: `pi-apm/render.test.ts` (text formatting),
+`pi-apm/render.snapshot.test.ts` (component structure, width behaviour, timeout
+and partial-reconciliation cases, expanded snapshot, token redaction), and
+`pi-apm/side-run.e2e.test.ts` (hook → child process → SQLite).
+
 ---
 
-## 8. Data model
+## 8. Programmatic access
+
+Two optional adapters sit on top of the same ledger and the same `Store` rules:
+`apm-mcp` (MCP over stdio, §8.1–§8.4) and `apm-serve` (loopback REST, §8.5).
+Neither is required: the CLI works with both stopped.
+
+### 8.1 MCP over stdio
+
+`apm-mcp` exposes the ledger to any [Model Context Protocol](https://modelcontextprotocol.io)
+client over stdio. It is a thin adapter: each tool is one `Store` call, so claims,
+optimistic versions, workflow guards and idempotency behave exactly as in the CLI.
+There is no daemon, no socket, and no second source of truth.
+
+```bash
+cargo build --release          # → target/release/apm and target/release/apm-mcp
+apm init --name my-project     # a ledger must exist; apm-mcp never creates one
+```
+
+### 8.2 Client configuration
+
+Copy-paste for clients that load JSON configuration:
+
+```json
+{
+  "mcpServers": {
+    "apm": {
+      "command": "/absolute/path/to/target/release/apm-mcp",
+      "args": ["--db", "/absolute/path/to/repo/.apm/apm.db", "--agent", "my-agent"]
+    }
+  }
+}
+```
+
+Pi has first-class MCP support, so a repository can register the server without
+editing JSON by hand:
+
+```bash
+# from the repository, with apm-mcp on PATH (or use absolute paths)
+pi mcp add -l apm -- apm-mcp --db "$PWD/.apm/apm.db" --agent pi
+pi mcp list
+# apm: connected, 8 tools (codemode, project)
+#   tools: apm_dashboard, apm_get, apm_claim, apm_progress, apm_status,
+#          apm_context, apm_release, apm_sync
+```
+
+`-l` writes the project file `.pi/mcp.json`, which Pi only loads in a **trusted**
+project (`--approve`, or `/trust` inside the project). Without trust,
+`pi mcp list` says "No MCP servers configured" and ignores the file.
+
+Flags (all also available as environment variables): `--db` (`APM_DB`),
+`--project` (`APM_PROJECT`), `--agent` (`APM_AGENT`), `--session`
+(`APM_SESSION_ID`, default `mcp-<uuid>`), `--run` (`APM_RUN_ID`). Without `--db`
+the server walks up from its working directory looking for `.apm/apm.db`.
+
+### 8.3 Tools
+
+| tool | does |
+|---|---|
+| `apm_dashboard` | the board: waiting-human, in progress, stalled, lost lease, blocked, recently done, ready/unclaimed |
+| `apm_get` | handover context, acceptance criteria, evidence, dependencies, claim |
+| `apm_claim` | take the lease (token never crosses the wire) |
+| `apm_progress` | record what concretely changed + `next_action` (an identical request is a `no_op`) |
+| `apm_status` | workflow transition; target states come from the item's workflow, so custom states need no schema change |
+| `apm_context` | `action=show` or `action=revise` (a revise merges into the current document) |
+| `apm_release` | give the lease back |
+| `apm_sync` | liveness + lease renewal, never the progress clock |
+
+Writes take an optional `expect_version` (optimistic lock) and an optional
+`idempotency_key`. Domain failures come back as tool results with
+`isError: true` and the CLI's structured envelope (`code`, `details`, `hint`), not
+as transport errors; protocol problems use JSON-RPC codes instead (`-32601`
+unknown method, `-32602` unknown tool, `-32700` unparseable JSON).
+
+Claim tokens are bearer secrets. `apm-mcp` writes the plaintext from `claim` into
+the same 0600 session file the CLI uses (`<data_dir>/sessions/<session>.json`),
+keeps it in process memory, and returns `token: null` / `token_suppressed: true`
+in every result. Results and diagnostics are additionally scrubbed of
+`apm_[0-9a-f]{32,}`.
+
+### 8.4 Verify the connection
+
+```bash
+# 1. does the transport answer at all? (handshake + tool list, no model needed)
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | ./target/release/apm-mcp --db "$PWD/.apm/apm.db" | head -2
+
+# 2. real-client end-to-end (official @modelcontextprotocol/sdk, 4 tests)
+npx vitest run pi-apm/mcp-client.test.ts
+
+# 3. through Pi itself
+pi mcp list
+```
+
+Full details, error model and limitations: [`docs/mcp.md`](docs/mcp.md).
+
+### 8.5 REST over loopback (optional)
+
+`apm-serve` serves the same ledger over HTTP/1.1 on loopback, for local tools that
+speak neither the CLI nor MCP. It is a foreground process — start it, stop it with
+Ctrl-C — and the CLI keeps working while it is down.
+
+```bash
+apm-serve                                     # http://127.0.0.1:7717
+apm-serve --listen 127.0.0.1:0 --print-token  # ephemeral port, token on stdout
+```
+
+| protection | behaviour |
+|---|---|
+| bind | loopback only; a non-loopback `--listen` needs `--allow-remote` + a warning |
+| auth | `Authorization: Bearer <token>` on everything except `GET /health`; the token lives in `.apm/rest-token` (0600) |
+| browser | any `Origin` header is refused (`403 forbidden_origin`) and `Host` must name loopback (`403 forbidden_host`) — no CORS, no DNS-rebinding hole |
+| limits | 8 KiB headers, 64 KiB body, 10 s per connection, one request per connection |
+
+Routes: `GET /health`, `GET /dashboard`, `GET /items`, `GET /items/{id}`,
+`GET /claims`, `POST /items/{id}/claim|release|progress|status`. Writes take
+`expect_version` and `Idempotency-Key`; domain errors keep the CLI codes with the
+matching HTTP status (`409 version_conflict`, `409 claim_conflict`,
+`422 workflow_violation`, `404 not_found`, `400 invalid_input`). Claim tokens are
+never returned.
+
+```bash
+TOKEN=$(cat .apm/rest-token)
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7717/items
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -d '{"summary":"did the thing"}' \
+  http://127.0.0.1:7717/items/RST-1/progress
+```
+
+Client configuration, the full route/error tables, the token model and the
+"why not a framework" trade-off: [`docs/rest.md`](docs/rest.md). Operating it —
+single-machine boundary, hard limits, multi-instance behaviour, backup/restore,
+token rotation and troubleshooting — is in [`docs/rest-ops.md`](docs/rest-ops.md).
+
+Concurrency is enforced by the store, not by the HTTP layer, so it holds across
+processes: exactly one claim winner per item, exactly one writer per
+`expect_version`, and HTTP + CLI writers racing on the same item still produce one
+version bump. Several `apm-serve` instances may share one database and one token
+file (startup publishes the token atomically, so they all converge on the same
+one).
+
+```bash
+bash scripts/stress-rest.sh 10   # 10 servers + 10 HTTP racers + mixed HTTP/CLI writers
+bash scripts/stress.sh 10        # CLI-only baseline
+```
+
+---
+
+## 9. Data model
 
 ```
 projects(id, name, prefix, root_path, created_at, settings_json, workflow_json)
-work_items(id, project_id, number, identifier, title, item_type, status, priority,
+work_items(id, project_id, number, identifier, title, item_type,
+           status, state_category, workflow_id, workflow_version, priority,
            parent_id, version, context_version, progress_summary, next_action,
            blocker, waiting_on_human, waiting_reason, completion_note,
            created_by/at, updated_at, last_heartbeat_at, last_progress_at,
            last_run_sync_at, done_at, cancelled_at)
+workflows(project_id, id, version, name, definition_json, created_at, created_by)
+type_workflows(project_id, item_type, workflow_id, workflow_version,
+               updated_at, updated_by)
 context_versions(work_item_id, version, goal, current_state, constraints_json,
                  references_json, notes, doc_hash, revises_version, reason, author,
                  actor_kind, session_id, run_id, created_at)   ← full snapshots
@@ -575,7 +876,7 @@ on **stderr**; stdout stays machine-parseable for success paths.
 
 ---
 
-## 9. Attention requests (waiting for a human)
+## 10. Attention requests (waiting for a human)
 
 ```bash
 apm attention request --item APM-3 \
@@ -601,7 +902,7 @@ remains a coarse flag for cases where no structured question exists yet.
 
 ---
 
-## 10. CLI reference (condensed)
+## 11. CLI reference (condensed)
 
 ```
 apm init --name <n> [--prefix P] [--root DIR] [--lease-seconds N]
@@ -645,7 +946,7 @@ apm attention request|list|reply|withdraw [--token T]
 
 apm dashboard [--no-progress-after N] [--done-recent N]
 apm events [item] [--limit N]
-apm workflow
+apm workflow [show|list|types|validate|set|bind|upgrade] [...]
 apm expire
 apm doctor
 apm diag [--item ID] --code C --message M [--idempotency-key K]
@@ -657,20 +958,22 @@ ms|RFC3339>` is a hidden clock override used by tests and demos.
 
 ---
 
-## 11. Testing
+## 12. Testing
 
 ```bash
 just verify                # everything below that runs without a model
 just stress                # scripts/stress.sh 10
 
-cargo test                 # 50 tests: 10 unit + 23 core invariants + 17 CLI contract
+cargo test                 # 123 tests: 45 lib unit + 17 CLI + 32 core invariants
+                           #   + 9 workflow-CLI + 4 MCP + 7 REST + 9 REST concurrency
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 bash scripts/stress.sh 10  # cross-process claim/write race (10 real CLI processes)
+bash scripts/stress-rest.sh 10  # same race over HTTP + mixed HTTP/CLI writers
 
 npm install
 npx tsc -p tsconfig.json   # plugin type check
-npx vitest run             # 42 tests: 29 plugin unit + 13 end-to-end tests
+npx vitest run             # 51 tests: 29 plugin unit + 5 tool-schema + 4 real MCP client + 13 e2e
 
 npm run verify             # all of the above that can run non-interactively
 ```
@@ -779,7 +1082,7 @@ binary, so no model call and no network are involved.
 
 ---
 
-## 12. Repository layout
+## 13. Repository layout
 
 ```
 src/
@@ -789,22 +1092,41 @@ src/
   workflow.rs     declarative default state machine + guards
   dashboard.rs    dashboard buckets + doctor
   session_store.rs  0600 per-session claim-token file
-  store/          items, claims, context, misc (labels/deps/acceptance/evidence/
-                  attention), events, project
+  store/          items, claims, context, workflows (versioned documents,
+                  bindings, upgrades), misc (labels/deps/acceptance/evidence/
+                  attention), events, project, workflows
+  mcp.rs          MCP stdio adapter: JSON-RPC framing + the eight tool mappings
+  rest.rs         optional loopback REST adapter: HTTP/1.1 subset + routes
   main.rs         clap CLI, text rendering, JSON envelopes
+  bin/apm-mcp.rs  the `apm-mcp` server binary (flags, db discovery, stdio loop)
+  bin/apm-serve.rs  the optional `apm-serve` REST binary (bind rules, auth, token)
 Justfile          build / install / verify / stress recipes
+scripts/
+  stress.sh       CLI cross-process claim/write race
+  stress-rest.sh  REST variant: servers, HTTP racers, mixed HTTP/CLI writers
 tests/
   core.rs         invariants (claims, versions, context, sync, completion, ...)
   cli.rs          exit codes, JSON contract, session-token reuse, guards
+  mcp.rs          apm-mcp end to end: tool loop, token handling, custom states
+  rest.rs         apm-serve end to end: auth, routing, errors, limits
+  rest_concurrency.rs  races: HTTP claims/versions, HTTP+CLI, token bootstrap
 pi-apm/
   index.ts        hooks, tools, commands (the only file that imports pi)
-  lib.ts          pure logic: digest, decisions, keys, prompts, parsing
+  lib.ts          pure logic: digest, decisions, keys, prompts, parsing, report text
+  render.ts       the `apm-run-sync` entry renderer (pi-tui components)
   lib.test.ts     unit tests
+  render.test.ts  entry-renderer text tests
+  tools.test.ts   the tool schemas a model actually sees
+  render.snapshot.test.ts  component/snapshot: structure, widths, timeout, partial failure
+  mcp-client.test.ts     real MCP client (@modelcontextprotocol/sdk) → apm-mcp
   side-run.e2e.test.ts   hook → child process → SQLite, with a fake `pi`
 docs/agent-protocol.md   copy-paste AGENTS.md contract for repos using apm
+docs/mcp.md              MCP client guide: config, tools, errors, tokens
+docs/rest.md             REST guide: routes, protections, error mapping
+docs/rest-ops.md         REST operations: limits, multi-instance, backup, triage
 ```
 
-## 13. Design notes and boundaries
+## 14. Design notes and boundaries
 
 - **Local-first, single writer file.** SQLite in WAL mode is the authority. There
   is no HTTP layer in v1; MCP/REST are additive future work because the CLI/JSON

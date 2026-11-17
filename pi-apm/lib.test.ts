@@ -13,6 +13,7 @@ import {
 	planAbortSync,
 	planReconciliation,
 	redactSecrets,
+	formatRunSyncReport,
 	coveredItemIds,
 	preflightSkip,
 	runKey,
@@ -327,6 +328,72 @@ describe("planReconciliation", () => {
 		];
 		const covered = coveredItemIds(events, "run-1");
 		expect([...covered]).toEqual(["i1"]);
+	});
+});
+
+describe("formatRunSyncReport", () => {
+	const base = {
+		ran: true,
+		mode: "side-run" as const,
+		reason: "run completed",
+		runId: "run-1",
+		items: ["APM-7"],
+		reconciled: [{ identifier: "APM-7", action: "sync", ok: true }],
+		errors: [] as string[],
+		durationMs: 900,
+	};
+
+	it("labels success, skip and abort distinctly", () => {
+		expect(formatRunSyncReport(base)[0]).toMatchObject({ tone: "success" });
+		expect(formatRunSyncReport(base)[0].text).toContain("run synced");
+
+		const skipped = formatRunSyncReport({ ...base, mode: "skip", ran: false, reason: "no claims" });
+		expect(skipped[0].text).toContain("skipped");
+		expect(skipped[0].tone).toBe("muted");
+		expect(skipped.some((l) => l.text.includes("no claims"))).toBe(true);
+
+		const aborted = formatRunSyncReport({ ...base, mode: "abort-sync" });
+		expect(aborted[0].text).toContain("aborted run");
+		expect(aborted[0].tone).toBe("warning");
+	});
+
+	it("shows reconciliation outcomes and failure codes", () => {
+		const lines = formatRunSyncReport({
+			...base,
+			errors: ["side-run timed out"],
+			reconciled: [
+				{ identifier: "APM-7", action: "sync", ok: true },
+				{ identifier: "APM-8", action: "skip", ok: true },
+				{ identifier: "APM-9", action: "sync", ok: false, code: "claim_required" },
+			],
+		});
+		const text = lines.map((l) => l.text).join("\n");
+		expect(text).toContain("✓ APM-7 sync");
+		expect(text).toContain("· APM-8 already recorded");
+		expect(text).toContain("✗ APM-9 failed (claim_required)");
+		expect(lines.find((l) => l.text.includes("APM-9"))?.tone).toBe("error");
+	});
+
+	it("truncates output and redacts tokens without a terminal", () => {
+		const token = `apm_${"1234abcd".repeat(8)}`;
+		const output = Array.from({ length: 10 }, (_, i) => `line ${i} ${"y".repeat(300)}`).join("\n");
+		const collapsed = formatRunSyncReport({ ...base, output: `${token}\n${output}` });
+		const collapsedText = collapsed.map((l) => l.text).join("\n");
+		expect(collapsedText).not.toContain(token);
+		expect(collapsedText).toContain("apm_[redacted]");
+		expect(collapsed.some((l) => l.text.includes("line 1"))).toBe(false);
+
+		const expanded = formatRunSyncReport({ ...base, output }, { expanded: true });
+		expect(expanded.some((l) => l.text.includes("line 5"))).toBe(true);
+		for (const line of expanded) {
+			expect(line.text.length).toBeLessThanOrEqual(210);
+		}
+	});
+
+	it("degrades to a single muted line for missing data", () => {
+		const lines = formatRunSyncReport({});
+		expect(lines).toHaveLength(1);
+		expect(lines[0].text).toBe("[apm] no run-sync data");
 	});
 });
 

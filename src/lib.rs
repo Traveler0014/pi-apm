@@ -12,7 +12,9 @@
 pub mod dashboard;
 pub mod db;
 pub mod error;
+pub mod mcp;
 pub mod model;
+pub mod rest;
 pub mod session_store;
 pub mod store;
 pub mod workflow;

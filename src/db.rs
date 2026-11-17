@@ -11,9 +11,14 @@
 //!   `idempotency_key` is the second line of defence against duplicated
 //!   side-run writes (the `idempotency` table is the first).
 
-use rusqlite::Connection;
+use std::collections::HashMap;
 
-pub const SCHEMA_VERSION: i64 = 2;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+
+use crate::model::{Category, StateKey};
+use crate::workflow::Workflow;
+
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -196,7 +201,7 @@ CREATE INDEX IF NOT EXISTS attention_item ON attention_requests(work_item_id, st
 CREATE INDEX IF NOT EXISTS attention_project ON attention_requests(project_id, status);
 "#;
 
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -211,7 +216,226 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     conn.execute_batch(SCHEMA)?;
+    if version < 3 {
+        migrate_v3(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Schema v3: versioned workflows, per-type bindings and per-item snapshots.
+///
+/// The migration is written to be re-runnable (every step is `IF NOT EXISTS`,
+/// `INSERT OR IGNORE`, or an idempotent backfill) so a crash mid-way does not
+/// leave a half-upgraded database behind. Every item ends up bound to a workflow
+/// that actually declares its state; anything else is repaired to the workflow's
+/// initial state and recorded as a `workflow_migrated` event.
+fn migrate_v3(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+
+    add_column_if_missing(
+        &tx,
+        "work_items",
+        "workflow_id",
+        "TEXT NOT NULL DEFAULT 'apm-default'",
+    )?;
+    add_column_if_missing(
+        &tx,
+        "work_items",
+        "workflow_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        &tx,
+        "work_items",
+        "state_category",
+        "TEXT NOT NULL DEFAULT 'open'",
+    )?;
+    add_column_if_missing(&tx, "projects", "default_workflow_id", "TEXT")?;
+    add_column_if_missing(&tx, "projects", "default_workflow_version", "INTEGER")?;
+
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflows (
+            project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            id               TEXT NOT NULL,
+            version          INTEGER NOT NULL,
+            name             TEXT NOT NULL,
+            definition_json  TEXT NOT NULL,
+            created_at       INTEGER NOT NULL,
+            created_by       TEXT NOT NULL,
+            PRIMARY KEY (project_id, id, version)
+        );
+        CREATE TABLE IF NOT EXISTS type_workflows (
+            project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            item_type         TEXT NOT NULL,
+            workflow_id       TEXT NOT NULL,
+            workflow_version  INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            updated_by        TEXT NOT NULL,
+            PRIMARY KEY (project_id, item_type),
+            FOREIGN KEY (project_id, workflow_id, workflow_version)
+                REFERENCES workflows(project_id, id, version)
+        );",
+    )?;
+
+    let at = chrono::Utc::now().timestamp_millis();
+    let projects: Vec<(String, Option<String>)> = {
+        let mut stmt = tx.prepare("SELECT id, workflow_json FROM projects ORDER BY created_at")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Cache of parsed workflow documents keyed by (id, version) so a project with
+    // many items does not re-parse the same JSON per row.
+    let mut cache: HashMap<(String, i64), Workflow> = HashMap::new();
+
+    for (project_id, legacy_json) in projects {
+        let workflow = legacy_json
+            .as_deref()
+            .and_then(|raw| Workflow::from_json(raw).ok())
+            .unwrap_or_else(Workflow::default_v1);
+        let workflow_json = workflow.to_json().unwrap_or_else(|_| "{}".to_string());
+        cache.insert((workflow.id.clone(), workflow.version), workflow.clone());
+
+        tx.execute(
+            "INSERT OR IGNORE INTO workflows
+             (project_id, id, version, name, definition_json, created_at, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'migration')",
+            params![
+                project_id,
+                workflow.id,
+                workflow.version,
+                workflow.name,
+                workflow_json,
+                at
+            ],
+        )?;
+        tx.execute(
+            "UPDATE projects SET default_workflow_id = ?1, default_workflow_version = ?2
+             WHERE id = ?3",
+            params![workflow.id, workflow.version, project_id],
+        )?;
+
+        // Bind every item type that already exists in the project.
+        let item_types: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT item_type FROM work_items WHERE project_id = ?1 ORDER BY item_type",
+            )?;
+            stmt.query_map(params![project_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for item_type in &item_types {
+            tx.execute(
+                "INSERT OR IGNORE INTO type_workflows
+                 (project_id, item_type, workflow_id, workflow_version, updated_at, updated_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'migration')",
+                params![project_id, item_type, workflow.id, workflow.version, at],
+            )?;
+        }
+
+        // Backfill items with their snapshot and category, repairing any state
+        // the workflow does not declare.
+        let items: Vec<(String, String, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT id, item_type, status FROM work_items WHERE project_id = ?1")?;
+            stmt.query_map(params![project_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (item_id, item_type, current_state) in items {
+            let binding: (String, i64) = tx
+                .query_row(
+                    "SELECT workflow_id, workflow_version FROM type_workflows
+                     WHERE project_id = ?1 AND item_type = ?2",
+                    params![project_id, item_type],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .unwrap_or((workflow.id.clone(), workflow.version));
+            let bound = match cache.get(&binding) {
+                Some(wf) => wf.clone(),
+                None => {
+                    let json: String = tx.query_row(
+                        "SELECT definition_json FROM workflows
+                         WHERE project_id = ?1 AND id = ?2 AND version = ?3",
+                        params![project_id, binding.0, binding.1],
+                        |r| r.get(0),
+                    )?;
+                    let wf = Workflow::from_json(&json).unwrap_or_else(|_| Workflow::default_v1());
+                    cache.insert(binding.clone(), wf.clone());
+                    wf
+                }
+            };
+            let (state, repaired) = match StateKey::parse(&current_state) {
+                Ok(key) if bound.state(key.as_str()).is_some() => (key, false),
+                _ => (
+                    StateKey::parse(&bound.initial).unwrap_or_else(|_| StateKey::ready()),
+                    true,
+                ),
+            };
+            let category = bound
+                .category_of(state.as_str())
+                .unwrap_or_else(|| Category::legacy_for_state(state.as_str()));
+            tx.execute(
+                "UPDATE work_items SET workflow_id = ?1, workflow_version = ?2,
+                    state_category = ?3, status = ?4
+                 WHERE id = ?5",
+                params![
+                    bound.id,
+                    bound.version,
+                    category.as_str(),
+                    state.as_str(),
+                    item_id
+                ],
+            )?;
+            if repaired {
+                tx.execute(
+                    "INSERT INTO events
+                     (at, project_id, work_item_id, kind, actor, actor_kind, session_id, run_id,
+                      prev_version, new_version, idempotency_key, payload_json)
+                     VALUES (?1, ?2, ?3, 'workflow_migrated', 'apm-migration', 'agent', NULL, NULL,
+                             NULL, NULL, NULL, ?4)",
+                    params![
+                        at,
+                        project_id,
+                        item_id,
+                        serde_json::json!({
+                            "from": current_state,
+                            "to": state.as_str(),
+                            "workflow_id": bound.id,
+                            "workflow_version": bound.version,
+                            "reason": "state not declared by the bound workflow",
+                        })
+                        .to_string()
+                    ],
+                )?;
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`; check `PRAGMA table_info` first so
+/// a re-run after a partial migration is harmless.
+fn add_column_if_missing(
+    tx: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> rusqlite::Result<()> {
+    let exists: bool = {
+        let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == column)
+    };
+    if !exists {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};"))?;
+    }
     Ok(())
 }
 
@@ -221,9 +445,9 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();

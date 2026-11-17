@@ -668,7 +668,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &item.identifier,
             Some(&token),
             Some(1),
-            Status::Doing,
+            StateKey::doing(),
             None,
             None,
             &actor,
@@ -703,7 +703,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &item.identifier,
             Some(&token),
             Some(version),
-            Status::Done,
+            StateKey::done(),
             None,
             None,
             &actor,
@@ -738,7 +738,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &item.identifier,
             Some(&token),
             Some(version),
-            Status::Done,
+            StateKey::done(),
             None,
             None,
             &actor,
@@ -773,7 +773,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &item.identifier,
             Some(&token),
             Some(version),
-            Status::Done,
+            StateKey::done(),
             None,
             Some("verified by cargo test"),
             &actor,
@@ -781,7 +781,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             None,
         )
         .unwrap();
-    assert_eq!(done.status, Status::Done);
+    assert_eq!(done.status, StateKey::done());
     assert_eq!(done.health, Health::Ended);
     assert_eq!(done.claim.as_ref().unwrap().status, "released");
 
@@ -806,7 +806,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &bare.identifier,
             Some(&tb),
             Some(1),
-            Status::Doing,
+            StateKey::doing(),
             None,
             None,
             &actor,
@@ -827,7 +827,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &bare.identifier,
             Some(&tb),
             Some(version),
-            Status::Done,
+            StateKey::done(),
             None,
             None,
             &actor,
@@ -862,7 +862,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             &bare.identifier,
             Some(&tb),
             Some(version),
-            Status::Done,
+            StateKey::done(),
             None,
             Some("note"),
             &actor,
@@ -870,7 +870,7 @@ fn completion_requires_all_acceptance_or_evidence() {
             None,
         )
         .unwrap();
-    assert_eq!(done.status, Status::Done);
+    assert_eq!(done.status, StateKey::done());
 }
 
 #[test]
@@ -979,7 +979,7 @@ fn dashboard_surfaces_every_view() {
             &human_wait.identifier,
             Some(&token),
             Some(1),
-            Status::Blocked,
+            StateKey::blocked(),
             Some("waiting for creds"),
             None,
             &actor,
@@ -995,7 +995,7 @@ fn dashboard_surfaces_every_view() {
             &active.identifier,
             Some(&ta),
             Some(1),
-            Status::Doing,
+            StateKey::doing(),
             None,
             None,
             &actor,
@@ -1025,7 +1025,7 @@ fn dashboard_surfaces_every_view() {
             &stalled.identifier,
             Some(&ts_),
             Some(1),
-            Status::Doing,
+            StateKey::doing(),
             None,
             None,
             &actor,
@@ -1046,7 +1046,7 @@ fn dashboard_surfaces_every_view() {
             &lost.identifier,
             Some(&_tl),
             Some(1),
-            Status::Doing,
+            StateKey::doing(),
             None,
             None,
             &actor,
@@ -1074,7 +1074,7 @@ fn dashboard_surfaces_every_view() {
             &finished.identifier,
             Some(&tf),
             Some(1),
-            Status::Doing,
+            StateKey::doing(),
             None,
             None,
             &actor,
@@ -1106,7 +1106,7 @@ fn dashboard_surfaces_every_view() {
             &finished.identifier,
             Some(&tf),
             Some(v),
-            Status::Done,
+            StateKey::done(),
             None,
             Some("note"),
             &actor,
@@ -2126,4 +2126,1137 @@ fn plaintext_claim_tokens_are_never_persisted_or_replayed() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// APM-7: custom states, per-type workflows, versioned schema and migration
+// ---------------------------------------------------------------------------
+
+use apm::workflow::{GuardDef, StateDef, TransitionDef, Workflow};
+
+fn state(key: &str, category: Category, terminal: bool, cancel: bool) -> StateDef {
+    StateDef {
+        key: key.to_string(),
+        label: key.to_string(),
+        category,
+        terminal,
+        cancel,
+    }
+}
+
+fn tr(from: &str, to: &str, requires: &[&str]) -> TransitionDef {
+    TransitionDef {
+        from: from.to_string(),
+        to: to.to_string(),
+        requires: requires.iter().map(|r| r.to_string()).collect(),
+    }
+}
+
+/// Four non-closed states plus a completion and a cancel outcome.
+fn delivery_workflow() -> Workflow {
+    Workflow {
+        id: "delivery".into(),
+        version: 2,
+        name: "Delivery".into(),
+        initial: "intake".into(),
+        states: vec![
+            state("intake", Category::Open, false, false),
+            state("building", Category::Active, false, false),
+            state("verifying", Category::Review, false, false),
+            state("shipped", Category::Closed, true, false),
+            state("aborted", Category::Closed, true, true),
+        ],
+        transitions: vec![
+            tr("intake", "building", &[]),
+            tr("intake", "aborted", &["reason"]),
+            tr("building", "verifying", &[]),
+            tr("building", "aborted", &["reason"]),
+            tr("verifying", "building", &["reason"]),
+            tr(
+                "verifying",
+                "shipped",
+                &["evidence_or_acceptance", "progress_or_note"],
+            ),
+            tr("shipped", "building", &["reason"]),
+        ],
+        guards: Workflow::builtin_guards(),
+    }
+}
+
+#[test]
+fn custom_workflow_binds_per_item_type_and_items_keep_their_snapshot() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-wf");
+    let workflow = fx
+        .store
+        .register_workflow(Some(&fx.project), delivery_workflow(), &actor, fx.at(0))
+        .unwrap();
+    assert_eq!(workflow.id, "delivery");
+    assert_eq!(workflow.version, 2);
+
+    let binding = fx
+        .store
+        .bind_type_workflow(Some(&fx.project), "epic", "delivery", 2, &actor, fx.at(1))
+        .unwrap();
+    assert_eq!(binding.item_type, "epic");
+    assert_eq!(binding.workflow_id, "delivery");
+    assert_eq!(binding.workflow_version, 2);
+
+    let epic = fx
+        .store
+        .create_item(
+            Some(&fx.project),
+            NewItem {
+                title: "Ship the epic".into(),
+                context: fx.doc("ship", "intake"),
+                item_type: Some("epic".into()),
+                priority: None,
+                parent: None,
+                depends_on: vec![],
+                labels: vec![],
+                acceptance: vec!["tests pass".into()],
+                actor: actor.clone(),
+            },
+            fx.at(2),
+            None,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(epic.status.as_str(), "intake");
+    assert_eq!(epic.status_category, "open");
+    assert_eq!(epic.workflow_id, "delivery");
+    assert_eq!(epic.workflow_version, 2);
+
+    // A task continues to use the default six-state workflow.
+    let task = fx.create("Plain task");
+    assert_eq!(task.workflow_id, "apm-default");
+    assert_eq!(task.workflow_version, 1);
+
+    let (_c, token) = fx.claim(&epic.identifier, &actor, fx.at(3));
+    let moved = fx
+        .store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(1),
+            StateKey::parse("building").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(moved.status_category, "active");
+
+    // States outside the snapshot are rejected, even though they exist in the
+    // default workflow.
+    let err = fx
+        .store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(2),
+            StateKey::ready(),
+            Some("not in this workflow"),
+            None,
+            &actor,
+            fx.at(5),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "workflow_violation");
+    assert!(err.to_string().contains("delivery v2"), "{err}");
+
+    // Completion still needs evidence + progress.
+    fx.store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(2),
+            StateKey::parse("verifying").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(6),
+            None,
+        )
+        .unwrap();
+    let v = fx
+        .store
+        .get_item(&epic.identifier, fx.at(6))
+        .unwrap()
+        .item
+        .version;
+    let err = fx
+        .store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(v),
+            StateKey::parse("shipped").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(7),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "completion_evidence_required");
+
+    // Re-binding the type does not reinterpret the existing item...
+    fx.store
+        .bind_type_workflow(
+            Some(&fx.project),
+            "epic",
+            "apm-default",
+            1,
+            &actor,
+            fx.at(8),
+        )
+        .unwrap();
+    let after_rebind = fx.store.get_item(&epic.identifier, fx.at(8)).unwrap().item;
+    assert_eq!(after_rebind.workflow_id, "delivery");
+    assert_eq!(after_rebind.workflow_version, 2);
+    // ...and a new item picks up the new binding.
+    let new_epic = fx
+        .store
+        .create_item(
+            Some(&fx.project),
+            NewItem {
+                title: "Another epic".into(),
+                context: fx.doc("g", "c"),
+                item_type: Some("epic".into()),
+                priority: None,
+                parent: None,
+                depends_on: vec![],
+                labels: vec![],
+                acceptance: vec![],
+                actor,
+            },
+            fx.at(9),
+            None,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(new_epic.workflow_id, "apm-default");
+    assert_eq!(new_epic.status.as_str(), "ready");
+}
+
+#[test]
+fn workflow_registration_rejects_invalid_documents_and_is_idempotent() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-wf");
+    let valid = delivery_workflow();
+    fx.store
+        .register_workflow(Some(&fx.project), valid.clone(), &actor, fx.at(0))
+        .unwrap();
+    // Same id/version/content: idempotent.
+    fx.store
+        .register_workflow(Some(&fx.project), valid.clone(), &actor, fx.at(1))
+        .unwrap();
+
+    let mut changed = valid.clone();
+    changed.name = "Different".into();
+    assert_eq!(
+        fx.store
+            .register_workflow(Some(&fx.project), changed, &actor, fx.at(2))
+            .unwrap_err()
+            .code(),
+        "invalid_input",
+        "same id/version with different content must be rejected"
+    );
+
+    // Unknown state in a transition.
+    let mut broken = valid.clone();
+    broken.id = "broken-target".into();
+    broken.transitions.push(tr("intake", "ghost", &[]));
+    assert_eq!(
+        fx.store
+            .register_workflow(Some(&fx.project), broken, &actor, fx.at(3))
+            .unwrap_err()
+            .code(),
+        "invalid_input"
+    );
+
+    // Dead end: remove every exit from a non-closed state.
+    let mut dead = valid.clone();
+    dead.id = "dead".into();
+    dead.transitions.retain(|t| t.from != "building");
+    assert_eq!(
+        fx.store
+            .register_workflow(Some(&fx.project), dead, &actor, fx.at(4))
+            .unwrap_err()
+            .code(),
+        "invalid_input"
+    );
+
+    // Unreachable state.
+    let mut orphan = valid.clone();
+    orphan.id = "orphan".into();
+    orphan
+        .states
+        .push(state("icebox", Category::Open, false, false));
+    orphan.transitions.push(tr(
+        "icebox",
+        "shipped",
+        &["evidence_or_acceptance", "progress_or_note"],
+    ));
+    assert_eq!(
+        fx.store
+            .register_workflow(Some(&fx.project), orphan, &actor, fx.at(5))
+            .unwrap_err()
+            .code(),
+        "invalid_input"
+    );
+
+    // Weakened completion guard.
+    let mut weak = valid.clone();
+    weak.id = "weak".into();
+    for t in &mut weak.transitions {
+        if t.to == "shipped" {
+            t.requires.retain(|g| g != "evidence_or_acceptance");
+        }
+    }
+    assert_eq!(
+        fx.store
+            .register_workflow(Some(&fx.project), weak, &actor, fx.at(6))
+            .unwrap_err()
+            .code(),
+        "invalid_input"
+    );
+
+    // Unknown guard kind, closed initial state and version 0.
+    let mut bad_guard = valid.clone();
+    bad_guard.id = "bad-guard".into();
+    bad_guard.guards.insert(
+        "reason".into(),
+        GuardDef {
+            kind: "magic".into(),
+            description: None,
+        },
+    );
+    assert!(
+        fx.store
+            .register_workflow(Some(&fx.project), bad_guard, &actor, fx.at(7))
+            .is_err()
+    );
+
+    let mut closed_initial = valid.clone();
+    closed_initial.id = "closed-initial".into();
+    closed_initial.initial = "shipped".into();
+    assert!(
+        fx.store
+            .register_workflow(Some(&fx.project), closed_initial, &actor, fx.at(8))
+            .is_err()
+    );
+
+    let mut zero_version = valid.clone();
+    zero_version.id = "zero".into();
+    zero_version.version = 0;
+    assert!(
+        fx.store
+            .register_workflow(Some(&fx.project), zero_version, &actor, fx.at(9))
+            .is_err()
+    );
+
+    // Nothing invalid was persisted.
+    let list = fx.store.list_workflows(Some(&fx.project)).unwrap();
+    let ids: Vec<String> = list.iter().map(|w| w.id.clone()).collect();
+    assert!(ids.contains(&"delivery".to_string()));
+    assert!(ids.contains(&"apm-default".to_string()));
+    assert!(!ids.contains(&"dead".to_string()));
+    assert!(!ids.contains(&"weak".to_string()));
+}
+
+#[test]
+fn default_workflow_is_unchanged_and_records_its_snapshot() {
+    let mut fx = Fx::new();
+    let wf = fx.store.workflow(Some(&fx.project)).unwrap();
+    assert_eq!(wf.id, "apm-default");
+    assert_eq!(wf.version, 1);
+    assert_eq!(wf.initial, "ready");
+    assert_eq!(wf.states.len(), 6);
+    assert_eq!(wf.transitions.len(), 17);
+    assert_eq!(wf.guards.len(), 3);
+
+    let item = fx.create("Default behaviour");
+    assert_eq!(item.workflow_id, "apm-default");
+    assert_eq!(item.workflow_version, 1);
+    assert_eq!(item.status.as_str(), "ready");
+    assert_eq!(item.status_category, "open");
+
+    let actor = fx.agent("agent-a", "sess-wf");
+    let (_c, token) = fx.claim(&item.identifier, &actor, 0);
+    fx.store
+        .set_status(
+            &item.identifier,
+            Some(&token),
+            Some(1),
+            StateKey::doing(),
+            None,
+            None,
+            &actor,
+            fx.at(1),
+            None,
+        )
+        .unwrap();
+    let events = fx.store.item_events(&item.identifier, 50).unwrap();
+    let change = events.iter().find(|e| e.kind == "status_changed").unwrap();
+    assert_eq!(change.payload["workflow_id"], "apm-default");
+    assert_eq!(change.payload["workflow_version"], 1);
+    assert_eq!(change.payload["to_category"], "active");
+    assert_eq!(change.payload["terminal"], false);
+}
+
+#[test]
+fn dashboard_buckets_follow_categories_not_state_names() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-wf");
+    fx.store
+        .register_workflow(Some(&fx.project), delivery_workflow(), &actor, fx.at(0))
+        .unwrap();
+    fx.store
+        .bind_type_workflow(Some(&fx.project), "epic", "delivery", 2, &actor, fx.at(1))
+        .unwrap();
+
+    let epic = fx
+        .store
+        .create_item(
+            Some(&fx.project),
+            NewItem {
+                title: "Custom-state epic".into(),
+                context: fx.doc("ship", "intake"),
+                item_type: Some("epic".into()),
+                priority: None,
+                parent: None,
+                depends_on: vec![],
+                labels: vec![],
+                acceptance: vec![],
+                actor: actor.clone(),
+            },
+            fx.at(2),
+            None,
+        )
+        .unwrap()
+        .item;
+    let (_c, token) = fx.claim(&epic.identifier, &actor, fx.at(3));
+    fx.store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(1),
+            StateKey::parse("building").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(4),
+            None,
+        )
+        .unwrap();
+
+    let dash = fx
+        .store
+        .dashboard(Some(&fx.project), fx.at(5), DashboardOptions::default())
+        .unwrap();
+    assert!(
+        dash.buckets
+            .in_progress
+            .iter()
+            .any(|i| i.identifier == epic.identifier)
+    );
+    assert!(
+        !dash
+            .buckets
+            .ready_unclaimed
+            .iter()
+            .any(|i| i.identifier == epic.identifier)
+    );
+
+    // Completion moves it into recently done by category + done_at.
+    fx.store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(2),
+            StateKey::parse("verifying").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(5),
+            None,
+        )
+        .unwrap();
+    fx.progress(&epic.identifier, &token, &actor, 6, "built and verified");
+    fx.store
+        .add_evidence(
+            &epic.identifier,
+            "test",
+            "cargo test",
+            None,
+            Some(&token),
+            &actor,
+            fx.at(7),
+            None,
+        )
+        .unwrap();
+    let v = fx
+        .store
+        .get_item(&epic.identifier, fx.at(7))
+        .unwrap()
+        .item
+        .version;
+    fx.store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(v),
+            StateKey::parse("shipped").unwrap(),
+            None,
+            Some("verified"),
+            &actor,
+            fx.at(8),
+            None,
+        )
+        .unwrap();
+    let dash = fx
+        .store
+        .dashboard(Some(&fx.project), fx.at(9), DashboardOptions::default())
+        .unwrap();
+    let row = dash
+        .buckets
+        .recently_done
+        .iter()
+        .find(|i| i.identifier == epic.identifier)
+        .expect("closed custom state is recently done");
+    assert_eq!(row.status_category, "closed");
+}
+
+#[test]
+fn migration_from_v2_backfills_workflows_and_repairs_orphan_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("apm.db");
+    let project_id;
+    let item_id;
+    let legacy;
+
+    {
+        let mut store = Store::open(&path).unwrap();
+        let (project, _) = store
+            .init_project(
+                "Migrating",
+                Some("MIG"),
+                None,
+                Settings::default(),
+                &Actor::human("setup"),
+            )
+            .unwrap();
+        project_id = project.id.clone();
+        let mut legacy_wf = Workflow::default_v1();
+        legacy_wf.id = "legacy-flow".into();
+        legacy_wf.version = 3;
+        legacy_wf.name = "Legacy flow".into();
+        let actor = Actor::agent("agent-a").with_session(Some("sess-m".into()));
+        let item = store
+            .create_item(
+                Some(&project_id),
+                NewItem {
+                    title: "Legacy item".into(),
+                    context: ContextDoc {
+                        goal: "survive".into(),
+                        current_state: "old".into(),
+                        ..Default::default()
+                    },
+                    item_type: Some("task".into()),
+                    priority: None,
+                    parent: None,
+                    depends_on: vec![],
+                    labels: vec![],
+                    acceptance: vec![],
+                    actor,
+                },
+                1_700_000_000_000,
+                None,
+            )
+            .unwrap()
+            .item;
+        item_id = item.id.clone();
+        legacy = legacy_wf;
+    }
+
+    // Downgrade the file to a v2 shape: no workflow tables/columns, the legacy
+    // project workflow JSON, and an item whose state no workflow declares.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE type_workflows;
+             DROP TABLE workflows;
+             ALTER TABLE work_items DROP COLUMN workflow_id;
+             ALTER TABLE work_items DROP COLUMN workflow_version;
+             ALTER TABLE work_items DROP COLUMN state_category;
+             ALTER TABLE projects DROP COLUMN default_workflow_id;
+             ALTER TABLE projects DROP COLUMN default_workflow_version;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE projects SET workflow_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy.to_json().unwrap(), project_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_items SET status = 'legacy_state' WHERE id = ?1",
+            rusqlite::params![item_id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let detail = store.get_item(&item_id, 1_700_000_100_000).unwrap();
+    // Bound to the imported legacy workflow, state repaired to its initial.
+    assert_eq!(detail.item.workflow_id, "legacy-flow");
+    assert_eq!(detail.item.workflow_version, 3);
+    assert_eq!(detail.item.status.as_str(), "ready");
+    assert_eq!(detail.item.status_category, "open");
+    // The repair is auditable.
+    let events = store.item_events(&item_id, 100).unwrap();
+    assert!(events.iter().any(|e| e.kind == "workflow_migrated"));
+    // No orphan: the item can still transition.
+    let wf = store.workflow(Some(&project_id)).unwrap();
+    assert_eq!(wf.id, "legacy-flow");
+    assert_eq!(wf.version, 3);
+    assert!(wf.transition("ready", "doing").is_some());
+    let list = store
+        .list_items(
+            ListFilter {
+                project: Some(project_id.clone()),
+                include_closed: true,
+                ..Default::default()
+            },
+            1_700_000_100_000,
+        )
+        .unwrap();
+    assert_eq!(list.len(), 1);
+}
+
+#[test]
+fn custom_closed_states_are_filtered_by_category() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-closed");
+    fx.store
+        .register_workflow(Some(&fx.project), delivery_workflow(), &actor, fx.at(0))
+        .unwrap();
+    fx.store
+        .bind_type_workflow(Some(&fx.project), "epic", "delivery", 2, &actor, fx.at(1))
+        .unwrap();
+
+    let mk = |fx: &mut Fx, title: &str| {
+        fx.store
+            .create_item(
+                Some(&fx.project),
+                NewItem {
+                    title: title.into(),
+                    context: fx.doc("ship", "intake"),
+                    item_type: Some("epic".into()),
+                    priority: None,
+                    parent: None,
+                    depends_on: vec![],
+                    labels: vec![],
+                    acceptance: vec![],
+                    actor: actor.clone(),
+                },
+                fx.at(2),
+                None,
+            )
+            .unwrap()
+            .item
+    };
+    let shipped = mk(&mut fx, "Shipped epic");
+    let aborted = mk(&mut fx, "Aborted epic");
+
+    // Ship one item through the custom completion state.
+    let (_c1, token) = fx.claim(&shipped.identifier, &actor, fx.at(3));
+    for (offset, state) in [(4, "building"), (5, "verifying")] {
+        let v = fx
+            .store
+            .get_item(&shipped.identifier, fx.at(offset))
+            .unwrap()
+            .item
+            .version;
+        fx.store
+            .set_status(
+                &shipped.identifier,
+                Some(&token),
+                Some(v),
+                StateKey::parse(state).unwrap(),
+                None,
+                None,
+                &actor,
+                fx.at(offset),
+                None,
+            )
+            .unwrap();
+    }
+    fx.progress(&shipped.identifier, &token, &actor, 6, "built and verified");
+    fx.store
+        .add_evidence(
+            &shipped.identifier,
+            "test",
+            "cargo test",
+            None,
+            Some(&token),
+            &actor,
+            fx.at(7),
+            None,
+        )
+        .unwrap();
+    let v = fx
+        .store
+        .get_item(&shipped.identifier, fx.at(7))
+        .unwrap()
+        .item
+        .version;
+    fx.store
+        .set_status(
+            &shipped.identifier,
+            Some(&token),
+            Some(v),
+            StateKey::parse("shipped").unwrap(),
+            None,
+            Some("shipped"),
+            &actor,
+            fx.at(8),
+            None,
+        )
+        .unwrap();
+
+    // Cancel the other one through the custom cancel state.
+    let (_c2, token2) = fx.claim(&aborted.identifier, &actor, fx.at(3));
+    fx.store
+        .set_status(
+            &aborted.identifier,
+            Some(&token2),
+            Some(1),
+            StateKey::parse("aborted").unwrap(),
+            Some("not needed anymore"),
+            None,
+            &actor,
+            fx.at(9),
+            None,
+        )
+        .unwrap();
+
+    // Default list: neither custom closed state appears.
+    let default_list = fx
+        .store
+        .list_items(
+            ListFilter {
+                project: Some(fx.project.clone()),
+                ..Default::default()
+            },
+            fx.at(10),
+        )
+        .unwrap();
+    assert!(
+        default_list.is_empty(),
+        "custom closed states leaked into the open list"
+    );
+
+    // include_closed surfaces both.
+    let closed_list = fx
+        .store
+        .list_items(
+            ListFilter {
+                project: Some(fx.project.clone()),
+                include_closed: true,
+                ..Default::default()
+            },
+            fx.at(10),
+        )
+        .unwrap();
+    assert_eq!(closed_list.len(), 2);
+    assert!(closed_list.iter().all(|i| i.status_category == "closed"));
+
+    // Doctor does not count custom closed states as open.
+    let doctor = fx.store.doctor(Some(&fx.project), fx.at(10)).unwrap();
+    assert_eq!(doctor.open_items, 0, "closed custom states counted as open");
+
+    // Recently done window: inside it, shipped appears and aborted does not.
+    let recent = fx
+        .store
+        .dashboard(Some(&fx.project), fx.at(10), DashboardOptions::default())
+        .unwrap();
+    assert!(
+        recent
+            .buckets
+            .recently_done
+            .iter()
+            .any(|i| i.id == shipped.id)
+    );
+    assert!(
+        !recent
+            .buckets
+            .recently_done
+            .iter()
+            .any(|i| i.id == aborted.id)
+    );
+
+    // Beyond done_recent_seconds the shipped item must disappear instead of
+    // living in recently_done forever.
+    let later = fx.at(10) + 90_000_000;
+    let stale = fx
+        .store
+        .dashboard(Some(&fx.project), later, DashboardOptions::default())
+        .unwrap();
+    assert!(
+        !stale
+            .buckets
+            .recently_done
+            .iter()
+            .any(|i| i.id == shipped.id),
+        "shipped stayed in recently_done past the window"
+    );
+}
+
+#[test]
+fn named_guard_aliases_are_validated_by_kind() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-alias");
+    let mut wf = delivery_workflow();
+    wf.id = "delivery-alias".into();
+    wf.version = 4;
+    for tr in &mut wf.transitions {
+        tr.requires = tr
+            .requires
+            .iter()
+            .map(|g| match g.as_str() {
+                "reason" => "why".to_string(),
+                "evidence_or_acceptance" => "completion_evidence".to_string(),
+                "progress_or_note" => "completion_progress".to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+    }
+    wf.guards.clear();
+    wf.guards.insert(
+        "why".into(),
+        GuardDef {
+            kind: "reason".into(),
+            description: None,
+        },
+    );
+    wf.guards.insert(
+        "completion_evidence".into(),
+        GuardDef {
+            kind: "evidence_or_acceptance".into(),
+            description: None,
+        },
+    );
+    wf.guards.insert(
+        "completion_progress".into(),
+        GuardDef {
+            kind: "progress_or_note".into(),
+            description: None,
+        },
+    );
+    fx.store
+        .register_workflow(Some(&fx.project), wf, &actor, fx.at(0))
+        .expect("aliased guards must validate by kind");
+    fx.store
+        .bind_type_workflow(
+            Some(&fx.project),
+            "epic",
+            "delivery-alias",
+            4,
+            &actor,
+            fx.at(1),
+        )
+        .unwrap();
+
+    let epic = fx
+        .store
+        .create_item(
+            Some(&fx.project),
+            NewItem {
+                title: "Alias epic".into(),
+                context: fx.doc("ship", "intake"),
+                item_type: Some("epic".into()),
+                priority: None,
+                parent: None,
+                depends_on: vec![],
+                labels: vec![],
+                acceptance: vec![],
+                actor: actor.clone(),
+            },
+            fx.at(2),
+            None,
+        )
+        .unwrap()
+        .item;
+    let (_c, token) = fx.claim(&epic.identifier, &actor, fx.at(3));
+    let mut version = 1;
+    for (offset, state) in [(4, "building"), (5, "verifying")] {
+        fx.store
+            .set_status(
+                &epic.identifier,
+                Some(&token),
+                Some(version),
+                StateKey::parse(state).unwrap(),
+                None,
+                None,
+                &actor,
+                fx.at(offset),
+                None,
+            )
+            .unwrap();
+        version = fx
+            .store
+            .get_item(&epic.identifier, fx.at(offset))
+            .unwrap()
+            .item
+            .version;
+    }
+    // Runtime enforcement follows the guard kinds as well.
+    let err = fx
+        .store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(version),
+            StateKey::parse("shipped").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(6),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "completion_evidence_required");
+
+    fx.progress(&epic.identifier, &token, &actor, 7, "verified");
+    fx.store
+        .add_evidence(
+            &epic.identifier,
+            "test",
+            "aliased guards",
+            None,
+            Some(&token),
+            &actor,
+            fx.at(8),
+            None,
+        )
+        .unwrap();
+    let v = fx
+        .store
+        .get_item(&epic.identifier, fx.at(8))
+        .unwrap()
+        .item
+        .version;
+    let done = fx
+        .store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(v),
+            StateKey::parse("shipped").unwrap(),
+            None,
+            Some("shipped with aliased guards"),
+            &actor,
+            fx.at(9),
+            None,
+        )
+        .unwrap();
+    assert_eq!(done.status.as_str(), "shipped");
+
+    let events = fx.store.item_events(&epic.identifier, 100).unwrap();
+    let change = events.iter().find(|e| e.kind == "status_changed").unwrap();
+    assert_eq!(change.payload["workflow_id"], "delivery-alias");
+    assert_eq!(change.payload["workflow_version"], 4);
+}
+
+#[test]
+fn item_type_changes_do_not_reinterpret_the_workflow_snapshot() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-type");
+    let item = fx.create("Rename my type");
+    let (_c, token) = fx.claim(&item.identifier, &actor, fx.at(0));
+    assert_eq!(item.workflow_id, "apm-default");
+
+    let updated = fx
+        .store
+        .update_item(
+            &item.identifier,
+            Some(&token),
+            Some(1),
+            ItemPatch {
+                item_type: Some("Epic".into()),
+                ..Default::default()
+            },
+            &actor,
+            fx.at(1),
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated.item_type, "epic");
+    assert_eq!(
+        updated.workflow_id, "apm-default",
+        "changing the type must not silently migrate the workflow snapshot"
+    );
+    assert_eq!(updated.workflow_version, 1);
+
+    let err = fx
+        .store
+        .update_item(
+            &item.identifier,
+            Some(&token),
+            Some(updated.version),
+            ItemPatch {
+                item_type: Some("bad type".into()),
+                ..Default::default()
+            },
+            &actor,
+            fx.at(2),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_input");
+}
+
+#[test]
+fn upgrade_plan_refuses_to_overwrite_a_concurrently_changed_item() {
+    let mut fx = Fx::new();
+    let actor = fx.agent("agent-a", "sess-cas");
+    let mut v1 = delivery_workflow();
+    v1.version = 1;
+    fx.store
+        .register_workflow(Some(&fx.project), v1, &actor, fx.at(0))
+        .unwrap();
+    let v2 = delivery_workflow(); // version 2, same states
+    fx.store
+        .register_workflow(Some(&fx.project), v2, &actor, fx.at(1))
+        .unwrap();
+    fx.store
+        .bind_type_workflow(Some(&fx.project), "epic", "delivery", 1, &actor, fx.at(2))
+        .unwrap();
+
+    let epic = fx
+        .store
+        .create_item(
+            Some(&fx.project),
+            NewItem {
+                title: "CAS epic".into(),
+                context: fx.doc("ship", "intake"),
+                item_type: Some("epic".into()),
+                priority: None,
+                parent: None,
+                depends_on: vec![],
+                labels: vec![],
+                acceptance: vec![],
+                actor: actor.clone(),
+            },
+            fx.at(3),
+            None,
+        )
+        .unwrap()
+        .item;
+    let (_c, token) = fx.claim(&epic.identifier, &actor, fx.at(4));
+    fx.store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(1),
+            StateKey::parse("building").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(5),
+            None,
+        )
+        .unwrap();
+
+    // Plan against the current state/version.
+    let plan = fx
+        .store
+        .plan_workflow_upgrade(
+            Some(&fx.project),
+            "epic",
+            "delivery",
+            2,
+            &std::collections::BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(plan.migrated, 1);
+
+    // Another writer moves the item before the plan is applied.
+    let v = fx
+        .store
+        .get_item(&epic.identifier, fx.at(6))
+        .unwrap()
+        .item
+        .version;
+    fx.store
+        .set_status(
+            &epic.identifier,
+            Some(&token),
+            Some(v),
+            StateKey::parse("verifying").unwrap(),
+            None,
+            None,
+            &actor,
+            fx.at(7),
+            None,
+        )
+        .unwrap();
+
+    let err = fx
+        .store
+        .apply_workflow_upgrade(Some(&fx.project), plan, &actor, fx.at(8))
+        .unwrap_err();
+    assert_eq!(err.code(), "version_conflict");
+    let current = fx.store.get_item(&epic.identifier, fx.at(8)).unwrap().item;
+    assert_eq!(
+        current.status.as_str(),
+        "verifying",
+        "newer state must survive"
+    );
+    assert_eq!(current.workflow_version, 1, "rolled back snapshot change");
+    assert!(
+        !fx.store
+            .item_events(&epic.identifier, 100)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "workflow_migrated"),
+        "no audit event for a rolled-back upgrade"
+    );
+
+    // Re-planning and applying now succeeds, and the event carries versions.
+    let plan = fx
+        .store
+        .plan_workflow_upgrade(
+            Some(&fx.project),
+            "epic",
+            "delivery",
+            2,
+            &std::collections::BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+    let report = fx
+        .store
+        .apply_workflow_upgrade(Some(&fx.project), plan, &actor, fx.at(9))
+        .unwrap();
+    assert_eq!(report.migrated, 1);
+    let current = fx.store.get_item(&epic.identifier, fx.at(9)).unwrap().item;
+    assert_eq!(current.workflow_version, 2);
+    let event = fx
+        .store
+        .item_events(&epic.identifier, 100)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "workflow_migrated")
+        .unwrap();
+    assert_eq!(event.prev_version, Some(3));
+    assert_eq!(event.new_version, Some(4));
+    assert_eq!(event.payload["to_category"], "review");
 }

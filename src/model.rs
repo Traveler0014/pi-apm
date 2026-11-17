@@ -41,65 +41,171 @@ pub fn ts_opt(ms: Option<i64>) -> Option<String> {
 // Status
 // ---------------------------------------------------------------------------
 
-/// Business status. Deliberately small; execution state lives in `Health`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Ready,
-    Doing,
-    Blocked,
-    Review,
-    Done,
-    Cancelled,
+/// A business state key.
+///
+/// States are declared by a workflow, not by a Rust enum: a project can define
+/// its own state machine per work-item type. The key is a validated slug, and
+/// every state belongs to exactly one `Category` that the dashboard, health and
+/// "is this item open?" logic use.
+///
+/// `Status` remains as an alias so older code (including the CLI) keeps
+/// compiling: `Status::parse("doing")` still works and serialises as `"doing"`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StateKey(String);
+
+/// Compatibility alias for the pre-workflow name of this type.
+pub type Status = StateKey;
+
+impl StateKey {
+    pub const MAX_LEN: usize = 64;
+    /// The six built-in state keys, in the order used by the default workflow.
+    pub const BUILTIN: [&'static str; 6] =
+        ["ready", "doing", "blocked", "review", "done", "cancelled"];
+
+    pub fn ready() -> StateKey {
+        StateKey::parse("ready").expect("builtin state")
+    }
+    pub fn doing() -> StateKey {
+        StateKey::parse("doing").expect("builtin state")
+    }
+    pub fn blocked() -> StateKey {
+        StateKey::parse("blocked").expect("builtin state")
+    }
+    pub fn review() -> StateKey {
+        StateKey::parse("review").expect("builtin state")
+    }
+    pub fn done() -> StateKey {
+        StateKey::parse("done").expect("builtin state")
+    }
+    pub fn cancelled() -> StateKey {
+        StateKey::parse("cancelled").expect("builtin state")
+    }
+
+    /// Parse and normalise a state key.
+    ///
+    /// Legacy spellings from the fixed six-state era are folded onto their
+    /// canonical keys; anything else must be a lowercase slug so the key is safe
+    /// in JSON, SQL and CLI arguments. Whether the key exists is decided by the
+    /// item's workflow, not here.
+    pub fn parse(raw: &str) -> Result<StateKey> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(Error::invalid("state key must be non-empty"));
+        }
+        let normalised = match trimmed.to_ascii_lowercase().as_str() {
+            "in_progress" | "in-progress" => "doing".to_string(),
+            "complete" | "completed" => "done".to_string(),
+            "canceled" => "cancelled".to_string(),
+            other => other.to_string(),
+        };
+        if normalised.len() > Self::MAX_LEN {
+            return Err(Error::invalid(format!(
+                "state key '{normalised}' is longer than {} characters",
+                Self::MAX_LEN
+            )));
+        }
+        let first = normalised.chars().next().expect("non-empty");
+        if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+            return Err(Error::invalid(format!(
+                "invalid state key '{normalised}': must start with a lowercase letter or digit"
+            )));
+        }
+        if !normalised
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(Error::invalid(format!(
+                "invalid state key '{normalised}': use lowercase letters, digits, '.', '_' or '-'"
+            )));
+        }
+        Ok(StateKey(normalised))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        Self::BUILTIN.contains(&self.0.as_str())
+    }
 }
 
-impl Status {
-    pub const ALL: [Status; 6] = [
-        Status::Ready,
-        Status::Doing,
-        Status::Blocked,
-        Status::Review,
-        Status::Done,
-        Status::Cancelled,
+impl std::fmt::Display for StateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for StateKey {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<StateKey> {
+        StateKey::parse(s)
+    }
+}
+
+/// The five dashboard/health categories every workflow state must map onto.
+///
+/// Categories are what makes custom states safe: dashboard buckets, execution
+/// health and the "closed" rule never depend on a state's literal key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    Open,
+    Active,
+    Waiting,
+    Review,
+    Closed,
+}
+
+impl Category {
+    pub const ALL: [Category; 5] = [
+        Category::Open,
+        Category::Active,
+        Category::Waiting,
+        Category::Review,
+        Category::Closed,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Status::Ready => "ready",
-            Status::Doing => "doing",
-            Status::Blocked => "blocked",
-            Status::Review => "review",
-            Status::Done => "done",
-            Status::Cancelled => "cancelled",
+            Category::Open => "open",
+            Category::Active => "active",
+            Category::Waiting => "waiting",
+            Category::Review => "review",
+            Category::Closed => "closed",
         }
     }
 
-    pub fn parse(s: &str) -> Result<Status> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "ready" => Ok(Status::Ready),
-            "doing" | "in_progress" | "in-progress" => Ok(Status::Doing),
-            "blocked" => Ok(Status::Blocked),
-            "review" => Ok(Status::Review),
-            "done" | "completed" => Ok(Status::Done),
-            "cancelled" | "canceled" => Ok(Status::Cancelled),
+    pub fn parse(raw: &str) -> Result<Category> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "open" => Ok(Category::Open),
+            "active" => Ok(Category::Active),
+            "waiting" => Ok(Category::Waiting),
+            "review" => Ok(Category::Review),
+            "closed" => Ok(Category::Closed),
             other => Err(Error::invalid(format!(
-                "unknown status '{other}' (expected one of: ready, doing, blocked, review, done, cancelled)"
+                "unknown category '{other}' (expected one of: open, active, waiting, review, closed)"
             ))),
         }
     }
 
-    /// Open items are the ones the dashboard cares about.
-    pub fn is_open(self) -> bool {
-        !matches!(self, Status::Done | Status::Cancelled)
+    pub fn is_closed(self) -> bool {
+        self == Category::Closed
     }
 
-    /// Coarse workflow category, exported in `apm workflow --json`.
-    pub fn category(self) -> &'static str {
-        match self {
-            Status::Ready => "open",
-            Status::Doing | Status::Review => "active",
-            Status::Blocked => "waiting",
-            Status::Done | Status::Cancelled => "closed",
+    /// Legacy mapping used when migrating a v2 row whose state is one of the six
+    /// built-ins and no workflow document is available.
+    pub fn legacy_for_state(state: &str) -> Category {
+        match state {
+            "doing" | "review" => Category::Active,
+            "blocked" => Category::Waiting,
+            "done" | "cancelled" => Category::Closed,
+            _ => Category::Open,
         }
     }
 }
@@ -392,7 +498,16 @@ pub struct DependencyRef {
     pub id: String,
     pub identifier: String,
     pub title: String,
-    pub status: Status,
+    pub status: StateKey,
+    /// Category of the dependency's state, so "is this dependency still open?"
+    /// works for custom workflows without a second lookup.
+    pub status_category: String,
+}
+
+impl DependencyRef {
+    pub fn is_open(&self) -> bool {
+        self.status_category != Category::Closed.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,8 +595,12 @@ pub struct WorkItemView {
     pub identifier: String,
     pub title: String,
     pub item_type: String,
-    pub status: Status,
+    pub status: StateKey,
     pub status_category: String,
+    /// The workflow snapshot this item runs on (id + version), recorded at
+    /// creation so later configuration changes cannot reinterpret history.
+    pub workflow_id: String,
+    pub workflow_version: i64,
     pub priority: String,
     pub parent_id: Option<String>,
     pub parent_identifier: Option<String>,
@@ -512,6 +631,13 @@ pub struct WorkItemView {
     pub last_run: Option<RunSyncView>,
     /// Seconds since the last *substantive* progress event (never heartbeat).
     pub seconds_since_progress: Option<i64>,
+}
+
+impl WorkItemView {
+    /// Closed is a category, not a hard-coded state key.
+    pub fn is_open(&self) -> bool {
+        self.status_category != Category::Closed.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,12 +708,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_roundtrip() {
-        for s in Status::ALL {
-            assert_eq!(Status::parse(s.as_str()).unwrap(), s);
+    fn state_key_roundtrip_and_normalisation() {
+        for s in StateKey::BUILTIN {
+            assert_eq!(StateKey::parse(s).unwrap().as_str(), s);
         }
-        assert!(Status::parse("nope").is_err());
-        assert_eq!(Status::parse("Done").unwrap(), Status::Done);
+        assert_eq!(StateKey::parse("Done").unwrap(), StateKey::done());
+        assert_eq!(StateKey::parse("in_progress").unwrap(), StateKey::doing());
+        assert_eq!(StateKey::parse("canceled").unwrap(), StateKey::cancelled());
+        assert!(StateKey::parse("").is_err());
+        assert!(StateKey::parse("has space").is_err());
+        assert_eq!(StateKey::parse("Upper").unwrap().as_str(), "upper");
+        assert!(StateKey::parse(&"x".repeat(65)).is_err());
+        assert_eq!(
+            StateKey::parse("agent_verified").unwrap().as_str(),
+            "agent_verified"
+        );
+    }
+
+    #[test]
+    fn categories_roundtrip() {
+        for c in Category::ALL {
+            assert_eq!(Category::parse(c.as_str()).unwrap(), c);
+        }
+        assert_eq!(Category::legacy_for_state("review"), Category::Active);
+        assert_eq!(Category::legacy_for_state("done"), Category::Closed);
     }
 
     #[test]

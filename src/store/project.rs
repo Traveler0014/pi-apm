@@ -49,6 +49,7 @@ impl Store {
                     settings_json
                 ],
             )?;
+            super::workflows::seed_default_workflow(tx, &id_for_tx, now, actor)?;
             super::events::append_event(
                 tx,
                 super::events::EventInput {
@@ -116,12 +117,19 @@ impl Store {
     }
 
     /// Machine-readable declarative workflow currently in force.
+    /// The project's default workflow (used by `apm workflow`).
+    ///
+    /// Per-type bindings live in `type_workflows`; this is the fallback for item
+    /// types without an explicit binding.
     pub fn workflow(&self, project: Option<&str>) -> Result<workflow::Workflow> {
         let row = self.require_project(project)?;
-        match row.workflow_json {
-            Some(json) => workflow::Workflow::from_json(&json),
-            None => Ok(workflow::Workflow::default_v1()),
-        }
+        let id = row
+            .default_workflow_id
+            .unwrap_or_else(|| workflow::DEFAULT_WORKFLOW_ID.to_string());
+        let version = row
+            .default_workflow_version
+            .unwrap_or(workflow::DEFAULT_WORKFLOW_VERSION);
+        self.load_workflow(&row.id, &id, version)
     }
 }
 
