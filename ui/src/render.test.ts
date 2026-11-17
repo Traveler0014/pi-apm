@@ -20,6 +20,7 @@ import {
 	updateMetrics,
 	updateDagPanel,
 	updateQueue,
+	updateStatusScope,
 	updateSelectionSummary,
 	updateTopology,
 	updateViews,
@@ -69,12 +70,14 @@ function mount() {
 		updateMetrics(shell, summarize(dashboard));
 		updateFilters(shell, state, dashboard);
 		updateViews(shell, view.mode, view.selected);
+		updateStatusScope(shell, state);
 		updateQueue(shell, buildQueue(dashboard, items, state), ctx());
-		const graph = buildGraph(items);
-		updateTopology(shell, topologySummary(graph), ctx());
+		const graph = buildGraph(items, NOW);
+		const queue = buildQueue(dashboard, items, state);
+		updateTopology(shell, topologySummary(graph), ctx(), state.statusScope === "open" ? undefined : queue.closed);
 		const selected = view.selected ? (items.find((item) => item.id === view.selected) ?? null) : null;
 		updateSelectionSummary(shell, ctx(), selected, { acceptance: [{ status: "met" }, { status: "open" }] });
-		updateDagPanel(shell, ctx(), selected, buildGraph(items), view.scope, (id) => {
+		updateDagPanel(shell, ctx(), selected, buildGraph(items, NOW), view.scope, (id) => {
 			view.selected = id;
 		});
 	};
@@ -95,6 +98,41 @@ describe("dashboard shell: list view", () => {
 		const first = shell.queue.querySelector<HTMLElement>(".row");
 		expect(first?.querySelector(".identifier")?.textContent).toMatch(/^APM-/);
 		expect(first?.querySelector(".stage-bar")).not.toBeNull();
+	});
+
+	it("renders mutually exclusive groups with Startable only holding startable work", () => {
+		const { shell } = mount();
+		const groups = [...shell.queue.querySelectorAll<HTMLElement>(".queue-group")];
+		expect(groups.length).toBeGreaterThan(0);
+		expect(groups.map((group) => group.dataset.group)).toEqual(
+			expect.arrayContaining(["needs_human", "at_risk", "in_progress", "waiting_upstream", "startable"].filter((key) =>
+				groups.some((group) => group.dataset.group === key),
+			)),
+		);
+		for (const group of groups) {
+			for (const row of group.querySelectorAll<HTMLElement>(".row")) {
+				expect(row.dataset.group).toBe(group.dataset.group);
+			}
+		}
+		const startable = groups.find((group) => group.dataset.group === "startable");
+		for (const row of startable?.querySelectorAll<HTMLElement>(".row") ?? []) {
+			// A startable row must be unclaimed and cannot carry the in-progress badge.
+			expect(row.textContent).not.toContain("in progress");
+		}
+	});
+
+	it("keeps a doing item with open blockers under In progress and badges the blockers", () => {
+		const { items, shell } = mount();
+		const doingWithBlockers = items.find(
+			(item) => item.status_category === "active" && item.blocked_by.length > 0,
+		);
+		if (!doingWithBlockers) return; // fixture has no such item; covered by groups.test.ts
+		const row = [...shell.queue.querySelectorAll<HTMLElement>(".row")].find(
+			(node) => node.dataset.itemId === doingWithBlockers.id,
+		)!;
+		const group = row.closest<HTMLElement>(".queue-group")!;
+		expect(group.dataset.group).toBe("in_progress");
+		expect(row.textContent).toContain("blocked by");
 	});
 
 	it("shows one row for an item in several buckets, with both badges", () => {
@@ -287,6 +325,33 @@ describe("dashboard shell: topology view", () => {
 });
 
 describe("dashboard shell: local dependency graph (APM-21)", () => {
+	it("expands the graph into a dialog and restores focus on Escape (APM-29)", () => {
+		const { shell, view, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		const expand = shell.dagPanel.querySelector<HTMLButtonElement>(".dag-expand")!;
+		expect(expand).not.toBeNull();
+		expect(expand.getAttribute("aria-haspopup")).toBe("dialog");
+		expand.click();
+		expect(shell.dagDialog.open || shell.dagDialog.hasAttribute("open")).toBe(true);
+		// The overlay uses larger boxes and keeps the relations (not a screenshot).
+		const expanded = shell.dagDialogBody.querySelector<HTMLElement>(".dag")!;
+		expect(expanded).not.toBeNull();
+		expect(expanded.querySelectorAll(".dag-node").length).toBeGreaterThan(0);
+		expect(shell.dagDialogBody.textContent).toContain("dependency");
+		const close = shell.dagDialogBody.querySelector<HTMLButtonElement>('[data-action="close-graph"]')!;
+		expect(shell.dagDialogBody.contains(document.activeElement)).toBe(true);
+		// Close via the button; focus returns to the trigger.
+		close.click();
+		expect(shell.dagDialog.open || shell.dagDialog.hasAttribute("open")).toBe(false);
+		expect(document.activeElement).toBe(expand);
+		// Re-open and close with Escape (the native dialog path plus the emulated one).
+		expand.click();
+		shell.dagDialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+		expect(shell.dagDialog.open || shell.dagDialog.hasAttribute("open")).toBe(false);
+	});
+
 	it("renders the neighbourhood with dependency and parent edges kept apart", () => {
 		const { shell, view, render } = mount();
 		view.mode = "topology";
@@ -409,5 +474,60 @@ describe("dashboard shell: selection summary controls (APM-26)", () => {
 		// graph node is a button itself; its own click selects, so use the card's
 		// Details for the drawer and the DAG node for selection.
 		expect(opened).toEqual(["i-17"]);
+	});
+});
+
+describe("dashboard shell: status scope and closed group (APM-30)", () => {
+	it("offers an accessible Open/Closed/All control that reflects the state", () => {
+		const { shell, state, render } = mount();
+		const scopes = [...shell.statusScope.querySelectorAll<HTMLButtonElement>("[data-status-scope]")].map(
+			(button) => button.dataset.statusScope,
+		);
+		expect(scopes).toEqual(["open", "closed", "all"]);
+		expect(shell.statusScope.getAttribute("aria-label")).toBe("Status scope");
+		expect(shell.statusScope.querySelector('[data-status-scope="open"]')!.getAttribute("aria-pressed")).toBe("true");
+		render({ statusScope: "closed" });
+		expect(shell.statusScope.querySelector('[data-status-scope="closed"]')!.getAttribute("aria-pressed")).toBe("true");
+		expect(state.statusScope).toBe("closed");
+	});
+
+	it("renders closed work as a group in both views and hides the fold", () => {
+		const { shell, view, render } = mount();
+		view.mode = "list";
+		render({ statusScope: "closed", showRecentlyDone: true });
+		// The list shows the closed group (no folded duplicate).
+		expect(shell.queue.querySelectorAll(".row").length).toBeGreaterThan(0);
+		expect(shell.queue.textContent).toContain("Closed");
+		expect(shell.doneFold.hidden).toBe(true);
+
+		view.mode = "topology";
+		render({ statusScope: "closed", showRecentlyDone: true });
+		const closed = shell.topologyGroups.querySelector('[data-group="closed"]');
+		expect(closed).not.toBeNull();
+		const identifiers = [...closed!.querySelectorAll("[data-item-id]")].map(
+			(node) => node.querySelector(".identifier")?.textContent,
+		);
+		expect(identifiers).toContain("APM-12"); // done
+		expect(identifiers).toContain("APM-19"); // cancelled
+		expect(identifiers).toContain("APM-18"); // aborted (custom closed)
+	});
+
+	it("keeps the open scope free of a closed group", () => {
+		const { shell, view, render } = mount();
+		view.mode = "topology";
+		render({ statusScope: "open" });
+		expect(shell.topologyGroups.querySelector('[data-group="closed"]')).toBeNull();
+		expect(shell.doneFold.hidden).toBe(false);
+	});
+
+	it("closed group rows keep the full detail entry point", () => {
+		const { shell, view, render } = mount();
+		const opened: string[] = [];
+		shell.onOpenItem((id) => opened.push(id));
+		view.mode = "topology";
+		render({ statusScope: "closed", showRecentlyDone: true });
+		const card = shell.topologyGroups.querySelector<HTMLElement>('[data-group="closed"] [data-item-id]')!;
+		card.querySelector<HTMLElement>('[data-action="open-detail"]')!.click();
+		expect(opened).toHaveLength(1);
 	});
 });

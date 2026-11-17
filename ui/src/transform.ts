@@ -6,6 +6,7 @@
  * testable without a browser.
  */
 
+import { GROUPS, groupItems, groupMeta, indexItems, type GroupKey, type GroupMeta } from "./groups";
 import type { BucketKey, Dashboard, WorkItem } from "./types";
 
 export interface BucketMeta {
@@ -38,6 +39,9 @@ export function bucketMeta(key: BucketKey): BucketMeta {
 
 export type SortKey = "queue" | "priority" | "updated" | "identifier" | "progress";
 
+/** Which lifecycle half the queue shows. `all` = open groups + the closed group. */
+export type StatusScope = "open" | "closed" | "all";
+
 export interface ViewState {
 	search: string;
 	/** Empty means "every bucket". */
@@ -45,10 +49,17 @@ export interface ViewState {
 	priorities: string[];
 	sort: SortKey;
 	showRecentlyDone: boolean;
+	/**
+	 * Explicit lifecycle filter (APM-30). `open` keeps the historical behaviour
+	 * (open groups + a folded closed list); `closed`/`all` promote the closed
+	 * items into a real group so done/cancelled/aborted work is searchable and
+	 * filterable exactly like open work.
+	 */
+	statusScope: StatusScope;
 }
 
 export function defaultViewState(): ViewState {
-	return { search: "", buckets: [], priorities: [], sort: "queue", showRecentlyDone: false };
+	return { search: "", buckets: [], priorities: [], sort: "queue", showRecentlyDone: false, statusScope: "open" };
 }
 
 const PRIORITY_RANK: Record<string, number> = {
@@ -66,11 +77,24 @@ export function priorityRank(priority: string): number {
 export interface QueuedItem {
 	item: WorkItem;
 	badges: BucketMeta[];
+	/** Mutually exclusive headline group (see groups.ts for the precedence). */
+	group: GroupKey;
+	/** Why this item landed in that group; used as the row's explanation. */
+	explanation: string;
+	/** Blockers that are still open, resolved against the loaded snapshot. */
+	openBlockerCount: number;
+}
+
+export interface QueueSection {
+	meta: GroupMeta;
+	rows: QueuedItem[];
 }
 
 export interface QueueModel {
 	/** Open items (any non-closed category), filtered and sorted. */
 	items: QueuedItem[];
+	/** The same rows partitioned into mutually exclusive display groups. */
+	groups: QueueSection[];
 	/** How many open items exist before filtering. */
 	total: number;
 	/** How many open items the current filters hide. */
@@ -82,6 +106,11 @@ export interface QueueModel {
 	 */
 	closed: QueuedItem[];
 	closedTotal: number;
+	/**
+	 * True when closed items are rendered as a real group (status scope includes
+	 * them) instead of the folded list.
+	 */
+	showClosedGroup: boolean;
 }
 
 function isClosed(item: Pick<WorkItem, "status_category">): boolean {
@@ -130,31 +159,71 @@ function badgesFor(item: WorkItem, keys: BucketKey[] | undefined): BucketMeta[] 
  * state may appear in none, and `recently_done` excludes cancelled work by
  * design. Building from the snapshot guarantees every item is reachable.
  */
-export function buildQueue(dashboard: Dashboard | null, items: WorkItem[] | null, state: ViewState): QueueModel {
-	const openItems = (items ?? []).filter((item) => !isClosed(item));
-	const closedItems = (items ?? []).filter(isClosed);
+export function buildQueue(
+	dashboard: Dashboard | null,
+	items: WorkItem[] | null,
+	state: ViewState,
+	now: number = Date.now(),
+): QueueModel {
+	const all = items ?? [];
+	const openItems = all.filter((item) => !isClosed(item));
+	const closedItems = all.filter(isClosed);
 	const membership = bucketMembership(dashboard);
+	const grouped = groupItems(all, now, indexItems(all));
 
-	const openRows: QueuedItem[] = openItems.map((item) => ({
-		item,
-		badges: badgesFor(item, membership.get(item.id)),
-	}));
+	const rowFor = (item: WorkItem, badges: BucketMeta[]): QueuedItem => {
+		const classification = grouped.classification.get(item.id);
+		return {
+			item,
+			badges,
+			group: classification?.group ?? (isClosed(item) ? "closed" : "startable"),
+			explanation: classification?.explanation ?? "",
+			openBlockerCount: classification?.openBlockers.length ?? 0,
+		};
+	};
+
+	const scope = state.statusScope;
+	const openRows: QueuedItem[] = openItems.map((item) =>
+		rowFor(item, badgesFor(item, membership.get(item.id))),
+	);
 	const queued = applyFilters(openRows, state);
+	const showOpen = scope !== "closed";
+	const sections: QueueSection[] = showOpen
+		? GROUPS.filter((group) => group.key !== "closed")
+				.map((meta) => ({
+					meta,
+					rows: sortQueue(
+						queued.filter((row) => row.group === meta.key),
+						state.sort,
+					),
+				}))
+				.filter((section) => section.rows.length > 0)
+		: [];
 
-	// The fold ignores bucket chips (they describe the open queue) but honours the
-	// search box and the priority filter, so "show me every closed APM-1x" works.
-	const closedRows: QueuedItem[] = closedItems.map((item) => ({
-		item,
-		badges: [{ key: "recently_done", label: item.status, symbol: "✓", tone: "muted" }],
-	}));
-	const closedFiltered = applyFilters(closedRows, { ...state, buckets: [] });
+	// Closed rows share the search box and the priority filter (bucket chips
+	// describe the open queue, so they are ignored here). They become a real group
+	// whenever the status scope includes closed work, which keeps List and Topology
+	// reading the same rows.
+	const closedRows: QueuedItem[] = closedItems.map((item) =>
+		rowFor(item, [{ key: "recently_done", label: item.status, symbol: "✓", tone: "muted" }]),
+	);
+	const closedFiltered = sortQueue(
+		applyFilters(closedRows, { ...state, buckets: [] }),
+		state.sort === "queue" ? "updated" : state.sort,
+	);
+	const showClosed = scope !== "open";
+	if (showClosed && closedFiltered.length > 0) {
+		sections.push({ meta: groupMeta("closed"), rows: closedFiltered });
+	}
 
 	return {
-		items: sortQueue(queued, state.sort),
-		total: openItems.length,
-		filtered: openItems.length - queued.length,
-		closed: sortQueue(closedFiltered, state.sort === "queue" ? "updated" : state.sort),
+		items: showOpen ? sortQueue(queued, state.sort) : [],
+		groups: sections,
+		total: showOpen ? openItems.length : 0,
+		filtered: showOpen ? openItems.length - queued.length : 0,
+		closed: closedFiltered,
 		closedTotal: closedItems.length,
+		showClosedGroup: showClosed,
 	};
 }
 

@@ -11,12 +11,17 @@
  * the views must still render, without infinite recursion.
  */
 
+import { groupItems, indexItems, type GroupKey } from "./groups";
 import type { WorkItem } from "./types";
 
 export type EdgeKind = "dependency" | "parent";
 
 export interface GraphNode {
 	item: WorkItem;
+	/** Mutually exclusive headline group (groups.ts); drives the summary lists. */
+	group: GroupKey;
+	/** Why the node is in that group (tooltip / accessibility text). */
+	explanation: string;
 	/** Open = not a closed category (done/cancelled/aborted/custom closed). */
 	open: boolean;
 	/** Ids this node waits for, restricted to nodes present in the snapshot. */
@@ -41,10 +46,16 @@ export interface TopologyGraph {
 	edges: GraphEdge[];
 	/** Ids that belong to at least one dependency cycle. */
 	cycles: string[];
-	/** Ids of open nodes whose blockers are all closed: start here. */
+	/** Ids of *startable* nodes (open, unclaimed, healthy, no open blockers). */
 	readyIds: string[];
 	/** Ids of open nodes with at least one open blocker. */
 	waitingIds: string[];
+	/** Active/review or validly claimed. */
+	inProgressIds: string[];
+	/** Waiting for a human answer. */
+	needsHumanIds: string[];
+	/** Stale lease, failed recovery or an unexplained waiting state. */
+	atRiskIds: string[];
 }
 
 const CLOSED = "closed";
@@ -60,12 +71,16 @@ export function isOpenItem(item: Pick<WorkItem, "status_category">): boolean {
  * project) are dropped rather than guessed at, so `dependsOn` only contains
  * nodes the UI can actually show.
  */
-export function buildGraph(items: WorkItem[]): TopologyGraph {
+export function buildGraph(items: WorkItem[], now: number = Date.now()): TopologyGraph {
 	const nodes = new Map<string, GraphNode>();
 	const byIdentifier = new Map<string, string>();
+	const grouped = groupItems(items, now, indexItems(items));
 	for (const item of items) {
+		const classification = grouped.classification.get(item.id);
 		nodes.set(item.id, {
 			item,
+			group: classification?.group ?? "startable",
+			explanation: classification?.explanation ?? "",
 			open: isOpenItem(item),
 			dependsOn: [],
 			blockedDependents: [],
@@ -100,15 +115,47 @@ export function buildGraph(items: WorkItem[]): TopologyGraph {
 
 	const readyIds: string[] = [];
 	const waitingIds: string[] = [];
+	const inProgressIds: string[] = [];
+	const needsHumanIds: string[] = [];
+	const atRiskIds: string[] = [];
 	for (const node of nodes.values()) {
 		if (!node.open) continue;
-		const openBlockers = node.dependsOn.filter((id) => nodes.get(id)!.open);
-		// A node inside a cycle is never "ready": nothing can unblock it first.
-		if (openBlockers.length === 0 && !node.inCycle) readyIds.push(node.item.id);
-		else waitingIds.push(node.item.id);
+		const openBlockerIds = node.dependsOn.filter((id) => nodes.get(id)!.open);
+		const hasCycle = node.inCycle;
+		switch (node.group) {
+			case "in_progress":
+				inProgressIds.push(node.item.id);
+				break;
+			case "needs_human":
+				needsHumanIds.push(node.item.id);
+				break;
+			case "at_risk":
+				atRiskIds.push(node.item.id);
+				break;
+			case "waiting_upstream":
+				waitingIds.push(node.item.id);
+				break;
+			case "startable":
+				// A node inside a cycle is never "ready": nothing can unblock it first.
+				if (openBlockerIds.length === 0 && !hasCycle) readyIds.push(node.item.id);
+				else waitingIds.push(node.item.id);
+				break;
+			default:
+				break;
+		}
 	}
 
-	return { nodes, byIdentifier, edges, cycles, readyIds, waitingIds };
+	return {
+		nodes,
+		byIdentifier,
+		edges,
+		cycles,
+		readyIds,
+		waitingIds,
+		inProgressIds,
+		needsHumanIds,
+		atRiskIds,
+	};
 }
 
 /**
@@ -314,7 +361,14 @@ export function localDagText(dag: LocalDag): string[] {
 }
 
 export interface TopologySummary {
+	/** Aliases "startable": open, unclaimed, unblocked, healthy. */
 	ready: WorkItem[];
+	/** Active/review/claimed work, kept out of Ready to start. */
+	inProgress: WorkItem[];
+	/** Waiting on a human answer. */
+	needsHuman: WorkItem[];
+	/** Stale lease, failed recovery or an unexplained waiting state. */
+	atRisk: WorkItem[];
 	/** Unlock count per open item (how many transitive dependents it frees). */
 	unlocks: Map<string, number>;
 	waiting: Array<{ item: WorkItem; directBlockers: WorkItem[]; transitiveBlockers: number; unlocks: number }>;
@@ -330,8 +384,15 @@ export function topologySummary(graph: TopologyGraph): TopologySummary {
 	const ready = graph.readyIds
 		.map((id) => graph.nodes.get(id)!.item)
 		.sort(byIdentifier);
+	const itemsFor = (ids: string[]): WorkItem[] =>
+		ids.map((id) => graph.nodes.get(id)!.item).sort(byIdentifier);
+	const inProgress = itemsFor(graph.inProgressIds);
+	const needsHuman = itemsFor(graph.needsHumanIds);
+	const atRisk = itemsFor(graph.atRiskIds);
 	const unlocks = new Map<string, number>();
-	for (const id of [...graph.readyIds, ...graph.waitingIds]) unlocks.set(id, unlockCount(graph, id));
+	for (const id of [...new Set([...graph.readyIds, ...graph.inProgressIds, ...graph.waitingIds])]) {
+		unlocks.set(id, unlockCount(graph, id));
+	}
 	const waiting = graph.waitingIds
 		.map((id) => {
 			const chain = upstreamChain(graph, id);
@@ -348,5 +409,5 @@ export function topologySummary(graph: TopologyGraph): TopologySummary {
 		.filter((node) => !node.open)
 		.map((node) => node.item)
 		.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || byIdentifier(a, b));
-	return { ready, waiting, cycles, closed, unlocks };
+	return { ready, inProgress, needsHuman, atRisk, waiting, cycles, closed, unlocks };
 }

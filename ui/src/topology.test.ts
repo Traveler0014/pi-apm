@@ -22,6 +22,7 @@ interface Spec {
 	blockedBy?: string[];
 	parent?: string;
 	health?: string;
+	waitingHuman?: boolean;
 }
 
 function make(specs: Spec[]): WorkItem[] {
@@ -45,7 +46,7 @@ function make(specs: Spec[]): WorkItem[] {
 		progress_summary: null,
 		next_action: null,
 		blocker: null,
-		waiting_on_human: false,
+		waiting_on_human: spec.waitingHuman ?? false,
 		waiting_reason: null,
 		completion_note: null,
 		created_by: "test",
@@ -106,7 +107,7 @@ describe("buildGraph", () => {
 });
 
 describe("ready / waiting", () => {
-	it("only counts open blockers, so closed work stops blocking", () => {
+	it("only counts open blockers, and never calls active work startable", () => {
 		const items = make([
 			{ id: "done", category: "closed", status: "done" },
 			{ id: "open", category: "active", status: "doing" },
@@ -115,12 +116,29 @@ describe("ready / waiting", () => {
 			{ id: "waiting_chain", blockedBy: ["waiting_open"], category: "waiting" },
 		]);
 		const graph = buildGraph(items);
-		// `open` has no blockers itself; `waiting_done` is unblocked because `done` closed.
-		expect(graph.readyIds).toEqual(["open", "waiting_done"]);
+		// `open` is doing, so it belongs to In progress, not Ready to start; its
+		// former blocker `done` closed, leaving `waiting_done` without a reason.
+		expect(graph.readyIds).toEqual([]);
+		expect(graph.inProgressIds).toEqual(["open"]);
+		expect(graph.atRiskIds).toEqual(["waiting_done"]);
 		expect(new Set(graph.waitingIds)).toEqual(new Set(["waiting_open", "waiting_chain"]));
 		expect(openBlockers(graph, "waiting_open").map((item) => item.id)).toEqual(["open"]);
 		expect(openBlockers(graph, "waiting_done")).toEqual([]);
 		expect(openDependents(graph, "open").map((item) => item.id)).toEqual(["waiting_open"]);
+	});
+
+	it("splits needs-human, at-risk and in-progress out of Ready to start", () => {
+		const items = make([
+			{ id: "doing", category: "active", status: "doing" },
+			{ id: "human", category: "open", waitingHuman: true },
+			{ id: "stale", category: "open", health: "stale" },
+			{ id: "ready", category: "open" },
+		]);
+		const summary = topologySummary(buildGraph(items));
+		expect(summary.inProgress.map((item) => item.id)).toEqual(["doing"]);
+		expect(summary.needsHuman.map((item) => item.id)).toEqual(["human"]);
+		expect(summary.atRisk.map((item) => item.id)).toEqual(["stale"]);
+		expect(summary.ready.map((item) => item.id)).toEqual(["ready"]);
 	});
 
 	it("reports direct and transitive blockers and how much a node unlocks", () => {
@@ -135,7 +153,8 @@ describe("ready / waiting", () => {
 		expect(unlockCount(graph, "a")).toBe(2); // b and c
 		expect(unlockCount(graph, "c")).toBe(0);
 		const summary = topologySummary(graph);
-		expect(summary.ready.map((item) => item.id)).toEqual(["a", "d"]);
+		expect(summary.ready.map((item) => item.id)).toEqual(["d"]);
+		expect(summary.inProgress.map((item) => item.id)).toEqual(["a"]);
 		const waiting = summary.waiting.find((entry) => entry.item.id === "c")!;
 		expect(waiting.directBlockers.map((item) => item.id)).toEqual(["b"]);
 		expect(waiting.transitiveBlockers).toBe(2);

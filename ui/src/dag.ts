@@ -16,11 +16,53 @@
 import type { LocalDag, DagScope, TopologyGraph } from "./topology";
 import type { WorkItem } from "./types";
 
-export const NODE_W = 168;
-export const NODE_H = 58;
-export const GAP_X = 46;
-export const GAP_Y = 18;
+/**
+ * Node geometry. APM-29 widened and heightened the boxes so a title gets two
+ * readable lines instead of being clipped; the overlay scales these further.
+ */
+export const NODE_W = 208;
+export const NODE_H = 76;
+export const GAP_X = 56;
+export const GAP_Y = 22;
 const PAD = 14;
+
+export interface LayoutOptions {
+	nodeW?: number;
+	nodeH?: number;
+	gapX?: number;
+	gapY?: number;
+	pad?: number;
+}
+
+/** Split a title into at most two lines without cutting a word mid-way. */
+export function wrapTitle(title: string, maxChars = 26, maxLines = 2): string[] {
+	const words = title.trim().split(/\s+/).filter(Boolean);
+	if (words.length === 0) return [""];
+	const lines: string[] = [];
+	let current = "";
+	for (const word of words) {
+		const candidate = current ? `${current} ${word}` : word;
+		if (candidate.length <= maxChars || current === "") {
+			current = candidate;
+			continue;
+		}
+		lines.push(current);
+		current = word;
+		if (lines.length === maxLines - 1) break;
+	}
+	if (lines.length < maxLines && current) lines.push(current);
+	// If anything was dropped, mark the second line so the title attribute (and
+	// the node's aria-label) still carries the full text.
+	if (lines.length === maxLines) {
+		let consumed = lines.join(" ").length;
+		const total = title.trim().length;
+		if (consumed < total) {
+			const last = lines[maxLines - 1]!;
+			lines[maxLines - 1] = `${last.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+		}
+	}
+	return lines;
+}
 
 export type DagRole = LocalDag["nodes"][number]["role"];
 
@@ -57,7 +99,12 @@ export interface DagLayout {
  * `dag.nodes[].depth` is negative upstream, 0 for the selected/parent/child
  * column and positive downstream, so the column index is just the depth.
  */
-export function layoutDag(dag: LocalDag): DagLayout {
+export function layoutDag(dag: LocalDag, options: LayoutOptions = {}): DagLayout {
+	const nodeW = options.nodeW ?? NODE_W;
+	const nodeH = options.nodeH ?? NODE_H;
+	const gapX = options.gapX ?? GAP_X;
+	const gapY = options.gapY ?? GAP_Y;
+	const pad = options.pad ?? PAD;
 	const columns = new Map<number, LocalDag["nodes"]>();
 	for (const entry of dag.nodes) {
 		const column = entry.role === "parent" || entry.role === "child" || entry.role === "selected" ? 0 : entry.depth;
@@ -75,20 +122,20 @@ export function layoutDag(dag: LocalDag): DagLayout {
 		const bucket = [...(columns.get(column) ?? [])].sort(
 			(a, b) => (order[a.role] ?? 0) - (order[b.role] ?? 0) || a.item.number - b.item.number,
 		);
-		const totalHeight = bucket.length * NODE_H + Math.max(0, bucket.length - 1) * GAP_Y;
+		const totalHeight = bucket.length * nodeH + Math.max(0, bucket.length - 1) * gapY;
 		bucket.forEach((entry, index) => {
-			const x = PAD + (column - minColumn) * (NODE_W + GAP_X);
+			const x = pad + (column - minColumn) * (nodeW + gapX);
 			// Rows are centred inside the tallest column so the selected node sits in
 			// the middle of its neighbourhood.
-			const y = PAD + index * (NODE_H + GAP_Y) + Math.max(0, (maxRows(columns) * (NODE_H + GAP_Y) - totalHeight) / 2);
+			const y = pad + index * (nodeH + gapY) + Math.max(0, (maxRows(columns) * (nodeH + gapY) - totalHeight) / 2);
 			placed.set(entry.item.id, {
 				id: entry.item.id,
 				item: entry.item,
 				role: entry.role,
 				x,
 				y,
-				w: NODE_W,
-				h: NODE_H,
+				w: nodeW,
+				h: nodeH,
 			});
 		});
 	}
@@ -116,8 +163,8 @@ export function layoutDag(dag: LocalDag): DagLayout {
 		}
 	}
 
-	const width = Math.max(1, PAD * 2 + (maxColumn - minColumn + 1) * NODE_W + (maxColumn - minColumn) * GAP_X);
-	const height = Math.max(1, PAD * 2 + maxRows(columns) * NODE_H + (maxRows(columns) - 1) * GAP_Y);
+	const width = Math.max(1, pad * 2 + (maxColumn - minColumn + 1) * nodeW + (maxColumn - minColumn) * gapX);
+	const height = Math.max(1, pad * 2 + maxRows(columns) * nodeH + (maxRows(columns) - 1) * gapY);
 
 	return { width, height, nodes: [...placed.values()], edges, empty: placed.size === 0 };
 }
@@ -180,6 +227,8 @@ export function dagTextLines(dag: LocalDag): string[] {
 export interface DagRenderOptions {
 	scope: DagScope;
 	onSelect: (id: string) => void;
+	/** Overlay view: larger boxes and gaps, same layout algorithm. */
+	expanded?: boolean;
 }
 
 /**
@@ -189,7 +238,9 @@ export interface DagRenderOptions {
  */
 export function renderDag(dag: LocalDag, options: DagRenderOptions): HTMLElement {
 	const scoped = scopeDag(dag, options.scope);
-	const layout = layoutDag(scoped);
+	const layout = options.expanded
+		? layoutDag(scoped, { nodeW: NODE_W + 56, nodeH: NODE_H + 26, gapX: GAP_X + 24, gapY: GAP_Y + 12, pad: 20 })
+		: layoutDag(scoped);
 	const wrapper = document.createElement("div");
 	wrapper.className = "dag";
 	wrapper.dataset.scope = options.scope;
@@ -253,7 +304,13 @@ export function renderDag(dag: LocalDag, options: DagRenderOptions): HTMLElement
 		id.textContent = node.item.identifier;
 		const title = document.createElement("span");
 		title.className = "dag-node-title";
-		title.textContent = node.item.title;
+		title.title = node.item.title;
+		for (const line of wrapTitle(node.item.title, options.expanded ? 34 : 28)) {
+			const span = document.createElement("span");
+			span.className = "dag-node-title-line";
+			span.textContent = line;
+			title.append(span);
+		}
 		const meta = document.createElement("span");
 		meta.className = "dag-node-meta";
 		// Symbol + word, never colour alone.

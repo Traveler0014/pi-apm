@@ -205,6 +205,40 @@ async function main() {
 		"create", "--title", "Abandoned idea", "--goal", "verify the UI", "--current-state", "fixture ready",
 	]);
 	run(BIN, ["--human", "status", cancelled, "--to", "cancelled", "--reason", "duplicate", "--json"], env);
+	// A closed item with a long title: the closed group must wrap, not overflow.
+	const longClosed = identifier([
+		"create", "--title",
+		"Superseded by the parser rewrite that landed after the cluster upgrade but before the cache migration and therefore never shipped",
+		"--goal", "verify the UI", "--current-state", "fixture ready",
+	]);
+	run(BIN, ["--human", "status", longClosed, "--to", "cancelled", "--reason", "superseded", "--json"], env);
+
+	// APM-33: one open item with a long title (must wrap), a two-level dependency
+	// chain (transitive blocker count), and a custom closed state (not just
+	// done/cancelled) so the closed group is exercised across workflows.
+	const longOpen = identifier([
+		"create", "--title",
+		"Refactor the incremental snapshot loader so it survives partial migrations from the legacy cluster without dropping subscriber state",
+		"--goal", "verify long open titles wrap", "--current-state", "fixture ready",
+	]);
+	const chain = identifier([
+		"create", "--title", "Third item behind a chain", "--goal", "verify transitive blockers",
+		"--current-state", "fixture ready",
+	]);
+	run(BIN, ["claim", chain, "--session", "browser", "--json"], env);
+	run(BIN, ["dep", "add", chain, dependent, "--session", "browser", "--json"], env);
+	run(BIN, ["release", chain, "--session", "browser", "--json"], env);
+	const customClosed = identifier([
+		"create", "--title", "Custom flow that was dropped", "--goal", "verify custom closed states",
+		"--current-state", "fixture ready", "--type", "spike",
+	]);
+	run(BIN, ["claim", customClosed, "--session", "browser", "--json"], env);
+	run(BIN, ["status", customClosed, "--session", "browser", "--to", "reviewing", "--json"], env);
+	run(
+		BIN,
+		["status", customClosed, "--session", "browser", "--to", "dropped", "--reason", "not needed", "--json"],
+		env,
+	);
 
 	const dashboard = apmJson(["dashboard"], env);
 
@@ -212,17 +246,20 @@ async function main() {
 		env: { ...process.env, ...env },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
+	let expectReplayConflict = false;
 	let serverOut = "";
 	let serverErr = "";
 	server.stdout.on("data", (chunk) => (serverOut += chunk));
 	server.stderr.on("data", (chunk) => (serverErr += chunk));
 
 	const cleanup = async () => {
+		globalThis.__apmUiCleanup = null;
 		await browser?.close().catch(() => {});
 		server.kill("SIGKILL");
 		fs.rmSync(tmp, { recursive: true, force: true });
 	};
 	let browser;
+	globalThis.__apmUiCleanup = cleanup;
 	process.on("exit", () => {
 		server.kill("SIGKILL");
 		fs.rmSync(tmp, { recursive: true, force: true });
@@ -251,14 +288,31 @@ async function main() {
 	const cspViolations = [];
 	page.on("console", (message) => {
 		const text = message.text();
+		if (expectReplayConflict && /409 \(Conflict\)/.test(text)) return; // expected replay
 		if (message.type() === "error") consoleErrors.push(text);
 		if (/content security policy/i.test(text)) cspViolations.push(text);
 	});
 	page.on("pageerror", (error) => consoleErrors.push(String(error)));
 
+	const pageTicket = new URL(launchUrl).hash.replace(/^#/, "").split("&").find((part) => part.startsWith("ticket="))?.slice("ticket=".length) ?? "";
 	await page.goto(launchUrl, { waitUntil: "networkidle" });
 	await page.waitForSelector('section[aria-label="Summary"]');
 	await page.waitForFunction(() => /MAIN QUEUE · \d+/.test(document.body.innerText));
+	const initialGroups = await page.evaluate(() =>
+		[...document.querySelectorAll(".queue-group")].map((group) => ({
+			key: group.dataset.group,
+			rows: [...group.querySelectorAll("[data-item-id]")].map(
+				(node) => node.querySelector(".identifier")?.textContent,
+			),
+		})),
+	);
+	// Long open titles must render in full (wrapping is checked visually below).
+	const longTitleState = await page.evaluate((id) => {
+		const row = [...document.querySelectorAll(".row")].find(
+			(node) => node.querySelector(".identifier")?.textContent === id,
+		);
+		return { found: Boolean(row), rowText: row?.querySelector(".title")?.textContent ?? "" };
+	}, longOpen);
 
 	// 1. Ticket exchange and credential hygiene.
 	const url = page.url();
@@ -318,6 +372,20 @@ async function main() {
 	await clickChip("waiting human");
 	text = await page.evaluate(() => document.body.innerText);
 	assert(/MAIN QUEUE · \d+ OF \d+/.test(text), "queue filter narrows the list and says how many were filtered out");
+	const startable = initialGroups.find((group) => group.key === "startable");
+	assert(
+		Boolean(startable) && !startable.rows.includes(blocked) && !startable.rows.includes(waiting),
+		`list Startable holds only startable work (${startable?.rows.join(",")})`,
+	);
+	assert(
+		Boolean(startable?.rows.includes(longOpen)),
+		`a long-titled open item is still startable (${longOpen})`,
+	);
+	assert(
+		longTitleState.found && longTitleState.rowText.startsWith("Refactor the incremental snapshot loader so it survives"),
+		`long open titles render in full (${JSON.stringify(longTitleState)})`,
+	);
+
 	await clickChip("waiting human");
 
 	const search = page.locator('input[aria-label="Search work items"]');
@@ -352,6 +420,13 @@ async function main() {
 		ready: [...document.querySelectorAll('[data-group="ready"] [data-item-id]')].map(
 			(node) => node.querySelector(".identifier")?.textContent,
 		),
+		inProgress: [
+			...new Set(
+				[...document.querySelectorAll('[data-group="in_progress"] [data-item-id]')].map(
+					(node) => node.querySelector(".identifier")?.textContent,
+				),
+			),
+		],
 		waiting: [...document.querySelectorAll('[data-group="waiting"] [data-item-id]')].map((node) => ({
 			id: node.querySelector(".identifier")?.textContent,
 			facts: node.querySelector(".topo-facts")?.textContent ?? "",
@@ -360,12 +435,26 @@ async function main() {
 		hash: location.hash,
 	}));
 	assert(topo.ready.includes(ready), `topology lists unblocked items under Ready to start (${topo.ready.join(",")})`);
+	// APM-32: active/claimed work must never leak into Ready to start.
+	assert(
+		!topo.ready.includes(blocked) && !topo.ready.includes(waiting),
+		`doing items stay out of Ready to start (${topo.ready.join(",")})`,
+	);
+	assert(
+		topo.inProgress.includes(blocked),
+		`${blocked} is listed under In progress (${topo.inProgress.join(",")})`,
+	);
 	const dependentCard = topo.waiting.find((entry) => entry.id === dependent);
 	assert(
 		Boolean(dependentCard) && dependentCard.blockers.includes(blocked),
 		`${dependent} is listed as waiting on ${blocked}`,
 	);
 	assert(/\d+ upstream blocker/.test(dependentCard?.facts ?? ""), `waiting card shows the transitive blocker count (${dependentCard?.facts})`);
+	const chainCard = topo.waiting.find((entry) => entry.id === chain);
+	assert(
+		Boolean(chainCard) && /2 upstream blocker/.test(chainCard.facts),
+		`a two-level chain reports both transitive blockers (${chainCard?.facts})`,
+	);
 	const unlockCard = await page.evaluate((id) => {
 		const card = [...document.querySelectorAll('.topology-view [data-item-id]')].find(
 			(node) => node.querySelector(".identifier")?.textContent === id,
@@ -459,6 +548,85 @@ async function main() {
 	assert(blocking.parentEdges === 0, "the blocking-chain scope hides hierarchy edges");
 	assert(blocking.hash.includes("scope=blocking"), "graph scope is reflected in the URL");
 	await page.click('[data-scope="all"]');
+
+	// Expanded graph (APM-29): same relations at a larger size, Esc restores focus,
+	// scope switches and the text view stay available in the overlay.
+	const expandTrigger = page.locator(".dag-expand");
+	await expandTrigger.click();
+	await page.waitForSelector('.dag-dialog[open] .dag .dag-node');
+	const overlay = await page.evaluate(() => {
+		const dialog = document.querySelector(".dag-dialog");
+		const dag = dialog.querySelector(".dag");
+		const rect = dialog.getBoundingClientRect();
+		const inline = document.querySelector(".dag-panel > .dag") ?? document.querySelector(".dag-panel .dag");
+		return {
+			open: dialog.hasAttribute("open") || dialog.open,
+			nodes: dag.querySelectorAll(".dag-node").length,
+			inlineNodes: inline ? inline.querySelectorAll(".dag-node").length : 0,
+			text: dialog.querySelector(".dag-text")?.textContent ?? "",
+			viewport: innerWidth,
+			width: Math.round(rect.width),
+			focusedInside: dialog.contains(document.activeElement),
+			overflowX: Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth),
+		};
+	});
+	assert(overlay.open && overlay.focusedInside, "the expanded graph opens as a focused dialog");
+	assert(overlay.nodes === graph.roles.length, `the overlay keeps every relation (${overlay.nodes}/${graph.roles.length})`);
+	assert(overlay.nodes === overlay.inlineNodes, "the overlay is the same graph, not a different one");
+	assert(overlay.width <= overlay.viewport, `the overlay fits the viewport (${overlay.width}/${overlay.viewport})`);
+	assert(/blocks/.test(overlay.text) && /parent/.test(overlay.text), "the overlay keeps the text view");
+	assert(overlay.overflowX === 0, "the expanded graph adds no horizontal page overflow");
+	await page.click('.dag-dialog [data-scope="upstream"]');
+	await page.waitForTimeout(250);
+	const overlayScope = await page.evaluate(() => ({
+		pressed: document.querySelector('.dag-dialog [data-scope="upstream"]')?.getAttribute("aria-pressed"),
+		panelPressed: document.querySelector('.dag-panel [data-scope="upstream"]')?.getAttribute("aria-pressed"),
+		open: document.querySelector(".dag-dialog")?.hasAttribute("open") ?? false,
+	}));
+	assert(
+		overlayScope.pressed === "true" && overlayScope.panelPressed === "true",
+		`scope switches stay in sync between panel and overlay (${JSON.stringify(overlayScope)})`,
+	);
+	assert(overlayScope.open, "changing scope keeps the overlay open");
+	await page.keyboard.press("Escape");
+	await page.waitForTimeout(200);
+	const afterGraphEscape = await page.evaluate(() => ({
+		open: document.querySelector(".dag-dialog")?.hasAttribute("open") ?? false,
+		focus: document.activeElement?.getAttribute("aria-label"),
+	}));
+	assert(!afterGraphEscape.open, "Escape closes the expanded graph");
+	assert(afterGraphEscape.focus === "Expand local dependency graph", "focus returns to the Expand trigger");
+	await page.click('.dag-panel [data-scope="all"]');
+	await page.waitForTimeout(200);
+
+	// A single-node neighbourhood is still legible and expandable (not a tiny blob).
+	await page.evaluate((id) => {
+		[...document.querySelectorAll('.topology-view [data-item-id]')]
+			.find((node) => node.querySelector(".identifier")?.textContent === id)
+			?.click();
+	}, ready);
+	await page.waitForFunction(() => document.querySelectorAll(".dag-panel .dag .dag-node").length === 1);
+	const single = await page.evaluate(() => {
+		const node = document.querySelector(".dag-panel .dag .dag-node");
+		const rect = node.getBoundingClientRect();
+		return { width: Math.round(rect.width), height: Math.round(rect.height), title: node.querySelector(".dag-node-title")?.textContent ?? "" };
+	});
+	assert(single.width >= 180 && single.height >= 60, `a single node keeps a readable box (${single.width}x${single.height})`);
+	assert(single.title.length > 0, "a single node still shows its title");
+	await page.click(".dag-expand");
+	await page.waitForSelector(".dag-dialog[open] .dag .dag-node");
+	const singleOverlay = await page.evaluate(() => document.querySelectorAll(".dag-dialog .dag .dag-node").length);
+	assert(singleOverlay === 1, "the single-node graph expands too");
+	await page.keyboard.press("Escape");
+	await page.waitForTimeout(150);
+
+	// Restore the multi-node selection the following checks describe.
+	await page.evaluate((id) => {
+		[...document.querySelectorAll('.topology-view [data-item-id]')]
+			.find((node) => node.querySelector(".identifier")?.textContent === id)
+			?.click();
+	}, dependent);
+	await page.waitForFunction(() => document.querySelectorAll(".dag-panel .dag .dag-node").length > 1);
 
 	// Selected summary must not carry duplicate/dead controls (APM-26): the
 	// entry point lives on the card, the graph node and the list row.
@@ -617,6 +785,133 @@ async function main() {
 	await page.waitForFunction(() => !/offline · cached/i.test(document.body.innerText), { timeout: 9000 });
 	pass("banner clears when the connection recovers");
 
+	// 8b. The HttpOnly session cookie survives a reload; the ticket stays single-use.
+	const beforeReload = await page.evaluate(() => ({
+		connection: document.querySelector(".connection")?.textContent ?? "",
+		search: document.querySelector('input[aria-label="Search work items"]')?.value ?? "",
+	}));
+	await page.reload({ waitUntil: "networkidle" });
+	await page.waitForFunction(() => /MAIN QUEUE · \d+/.test(document.body.innerText), { timeout: 10_000 });
+	expectReplayConflict = true;
+	const afterReload = await page.evaluate(async (ticket) => {
+		const state = {
+			connection: document.querySelector(".connection")?.textContent ?? "",
+			search: document.querySelector('input[aria-label="Search work items"]')?.value ?? "",
+			url: location.href,
+			cookieVisible: document.cookie,
+			storage: localStorage.length + sessionStorage.length,
+			rows: document.querySelectorAll(".list-view .row").length,
+		};
+		// Replaying the consumed ticket must fail even though the cookie works.
+		window.__expectReplay = true;
+		const replay = await fetch("/api/bootstrap", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ ticket }),
+		});
+		const replayBody = await replay.text();
+		return {
+			...state,
+			replayStatus: replay.status,
+			replayCode: JSON.parse(replayBody || "{}")?.error?.code ?? "",
+		};
+	}, pageTicket);
+	assert(afterReload.connection.startsWith("live"), `a page reload keeps the session via the cookie (${afterReload.connection})`);
+	assert(afterReload.rows >= 5, "the reload renders the queue without asking for a ticket");
+	assert(afterReload.url === new URL(launchUrl).origin + "/ui/", `the reload URL carries no ticket (${afterReload.url})`);
+	assert(afterReload.cookieVisible === "", "the session cookie is HttpOnly (invisible to JavaScript)");
+	assert(afterReload.storage === 0, "no Web Storage was used by the reload flow");
+	assert(
+		afterReload.replayStatus === 409 && afterReload.replayCode === "ticket_consumed",
+		`replaying the consumed ticket still fails (${afterReload.replayStatus} ${afterReload.replayCode})`,
+	);
+	assert(beforeReload.connection.startsWith("live"), "pre-reload session was live");
+	expectReplayConflict = false;
+
+	// 8c. Status scope + closed group (APM-30): done/cancelled/aborted are
+	// searchable and open the full drawer from the closed group.
+	await page.click('[data-view="list"]');
+	await page.click('.status-scope [data-status-scope="closed"]');
+	await page.waitForTimeout(300);
+	const closedScope = await page.evaluate(() => ({
+		hash: location.hash,
+		rows: [...document.querySelectorAll(".list-view .queue-group .row .identifier")].map((node) => node.textContent),
+		foldHidden: document.querySelector(".done-fold")?.hidden ?? false,
+		pressed: document.querySelector('.status-scope [data-status-scope="closed"]')?.getAttribute("aria-pressed"),
+	}));
+	assert(closedScope.pressed === "true" && closedScope.hash.includes("status=closed"), "the Closed scope is active and reflected in the URL");
+	assert(
+		closedScope.rows.includes(done) && closedScope.rows.includes(cancelled) && closedScope.rows.includes(customClosed),
+		`the closed scope lists every closed category incl. custom states (${closedScope.rows.join(",")})`,
+	);
+	assert(closedScope.foldHidden, "the closed fold is hidden when closed work is a real group");
+	await page.fill('input[aria-label="Search work items"]', "Superseded");
+	await page.waitForTimeout(300);
+	const longClosedSearch = await page.evaluate(() => ({
+		rows: [...document.querySelectorAll(".list-view .queue-group .row .identifier")].map((node) => node.textContent),
+		overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+	}));
+	assert(
+		longClosedSearch.rows.length === 1 && longClosedSearch.rows[0] === longClosed,
+		`searching a long closed title returns it (${longClosedSearch.rows.join(",")})`,
+	);
+	assert(longClosedSearch.overflow === 0, "a long closed title wraps instead of overflowing");
+	await page.fill('input[aria-label="Search work items"]', "");
+
+	// Search reaches a done item directly, and its drawer opens.
+	await page.fill('input[aria-label="Search work items"]', done);
+	await page.waitForTimeout(300);
+	const doneSearch = await page.evaluate(() => ({
+		rows: [...document.querySelectorAll(".list-view .queue-group .row .identifier")].map((node) => node.textContent),
+	}));
+	assert(doneSearch.rows.length === 1 && doneSearch.rows[0] === done, `searching a done item returns exactly it (${doneSearch.rows.join(",")})`);
+	await page.click(`button[aria-label="Open details for ${done}"]`);
+	await page.waitForSelector('aside[role="dialog"]:visible');
+	await page.waitForFunction(() => {
+		const subtitle = document.querySelector('aside[role="dialog"] .drawer-subtitle')?.textContent ?? "";
+		return subtitle.length > 0 && !subtitle.includes("Loading");
+	}, { timeout: 5000 });
+	const doneDrawer = await page.evaluate(() => ({
+		title: document.querySelector('aside[role="dialog"] .drawer-title')?.textContent ?? "",
+		subtitle: document.querySelector('aside[role="dialog"] .drawer-subtitle')?.textContent ?? "",
+	}));
+	assert(doneDrawer.title.includes(done) && doneDrawer.subtitle.includes("done"), `a done item opens the full drawer (${doneDrawer.title} · ${doneDrawer.subtitle})`);
+	await page.keyboard.press("Escape");
+	await page.waitForSelector('aside[role="dialog"]', { state: "hidden" });
+	await page.waitForTimeout(150);
+
+	// Topology keeps the same closed rows as a group.
+	await page.click('[data-view="topology"]');
+	await page.waitForSelector('[data-group="closed"]', { state: "attached" });
+	const topoClosed = await page.evaluate(() => ({
+		rows: [...document.querySelectorAll('[data-group="closed"] [data-item-id] .identifier')].map((node) => node.textContent),
+		title: document.querySelector('[data-group="closed"] .topo-title')?.textContent ?? "",
+	}));
+	assert(topoClosed.rows.length >= 2 && topoClosed.title.includes("Closed"), `topology has an accessible closed group (${topoClosed.title})`);
+
+	// The status scope survives a refresh like the other view state.
+	await page.click('.status-scope [data-status-scope="all"]');
+	await page.fill('input[aria-label="Search work items"]', "");
+	await page.waitForTimeout(300);
+	const scopeBefore = await page.evaluate(() => location.hash);
+	await page.waitForTimeout(5000);
+	const scopeAfter = await page.evaluate(() => ({
+		hash: location.hash,
+		pressed: document.querySelector('.status-scope [data-status-scope="all"]')?.getAttribute("aria-pressed"),
+	}));
+	assert(scopeAfter.hash === scopeBefore && scopeAfter.pressed === "true", "the status scope survives an automatic refresh");
+
+	// 390 px with the closed group visible: still no horizontal overflow.
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.waitForTimeout(300);
+	const narrowClosed = await page.evaluate(
+		() => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+	);
+	assert(narrowClosed === 0, "no horizontal overflow at 390px with the closed group visible");
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.click('.status-scope [data-status-scope="open"]');
+	await page.waitForTimeout(200);
+
 	// 9. XSS payloads stay text.
 	const xss = identifier([
 		"create", "--title", '<img src=x onerror="window.__xss=1"> <script>window.__xss2=1</script>',
@@ -640,9 +935,90 @@ async function main() {
 	);
 	assert(narrow === 0, "no horizontal overflow at 390px");
 
+	// The expanded graph stays usable on a phone-sized viewport: it fills the
+	// screen, keeps the text view reachable and still closes with Escape.
+	await page.click('[data-view="topology"]');
+	await page.evaluate(() => {
+		document.querySelector(".topology-view .topo-card[data-item-id]")?.click();
+	});
+	await page.waitForSelector(".dag-panel .dag-expand");
+	const beforeOverlay = await page.evaluate(() => ({
+		scroll: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+		offenders: [...document.querySelectorAll("*")]
+			.map((element) => ({ element, right: element.getBoundingClientRect().right }))
+			.filter((entry) => entry.right > innerWidth + 1)
+			.sort((a, b) => b.right - a.right)
+			.slice(0, 4)
+			.map((entry) => `${entry.element.tagName}.${entry.element.className} right=${Math.round(entry.right)}`),
+	}));
+	assert(
+		beforeOverlay.scroll === 0,
+		`topology view adds no overflow at 390px (${JSON.stringify(beforeOverlay)})`,
+	);
+	await page.click(".dag-expand");
+	await page.waitForSelector(".dag-dialog[open] .dag .dag-node");
+	const narrowDialog = await page.evaluate(() => {
+		const dialog = document.querySelector(".dag-dialog");
+		const rect = dialog.getBoundingClientRect();
+		return {
+			width: Math.round(rect.width),
+			height: Math.round(rect.height),
+			left: Math.round(rect.left),
+			right: Math.round(rect.right),
+			viewport: innerWidth,
+			scrollX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+			hasText: Boolean(dialog.querySelector(".dag-text")),
+			offenders: [...document.querySelectorAll("*")]
+				.map((element) => ({ element, right: element.getBoundingClientRect().right }))
+				.filter((entry) => entry.right > innerWidth + 1)
+				.sort((a, b) => b.right - a.right)
+				.slice(0, 5)
+				.map((entry) => `${entry.element.tagName}.${entry.element.className} right=${Math.round(entry.right)}`),
+		};
+	});
+	assert(narrowDialog.width <= narrowDialog.viewport, `expanded graph fits a 390px screen (${narrowDialog.width}/${narrowDialog.viewport})`);
+	assert(narrowDialog.height <= 844, `expanded graph fits the phone height (${narrowDialog.height})`);
+	assert(narrowDialog.hasText, "the phone overlay keeps the text view");
+	assert(
+		narrowDialog.scrollX <= beforeOverlay.scroll,
+		`the phone overlay adds no page overflow (before=${JSON.stringify(beforeOverlay)}, ${JSON.stringify(narrowDialog)})`,
+	);
+	await page.keyboard.press("Escape");
+	await page.waitForTimeout(150);
+
 	// 11. Console hygiene.
 	assert(cspViolations.length === 0, "no CSP violations in the console");
 	assert(consoleErrors.length === 0, `console has no errors (${consoleErrors.join(" | ")})`);
+
+	// 12. A restarted process is a different session: it mints a new token, so the
+	// old HttpOnly cookie cannot authenticate against it. The cookie-level proof
+	// lives in tests/ui.rs (the old cookie gets 401 from the new process); here we
+	// assert the observable half — a fresh one-time ticket, never the old one.
+	server.kill("SIGKILL");
+	const second = spawn(BIN, ["ui", "--db", db, "--no-open", "--port", "0"], {
+		env: { ...process.env, ...env },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let secondOut = "";
+	const secondUrl = await new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`second apm ui did not start: ${secondOut}`)), 20_000);
+		second.stdout.on("data", (chunk) => {
+			secondOut += String(chunk);
+			const match = secondOut.match(/ui: (http:\/\/\S+#ticket=\S+)/);
+			if (match) {
+				clearTimeout(timer);
+				resolve(match[1]);
+			}
+		});
+	});
+	const secondTicket =
+		new URL(secondUrl)
+			.hash.replace(/^#/, "")
+			.split("&")
+			.find((part) => part.startsWith("ticket="))
+			?.slice("ticket=".length) ?? "";
+	assert(Boolean(secondTicket) && secondTicket !== pageTicket, "a restarted apm ui issues a fresh one-time ticket");
+	second.kill("SIGKILL");
 
 	await cleanup();
 	pass("browser check complete");
@@ -650,5 +1026,8 @@ async function main() {
 
 main().catch(async (error) => {
 	console.error(`FAIL ${error.message}`);
-	process.exitCode = 1;
+	// A thrown check leaves a Chromium and an `apm ui` behind; without an explicit
+	// exit the event loop keeps the process alive and a caller's timeout kills it.
+	await globalThis.__apmUiCleanup?.().catch(() => {});
+	process.exit(1);
 });

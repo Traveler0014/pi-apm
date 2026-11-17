@@ -14,6 +14,27 @@
 	--info: #2f6feb;
 	--radius: 10px;
 	--mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+	/* Design tokens shared by list, topology, graph and detail (APM-32). Use
+	   these instead of ad-hoc px values so the four surfaces stay consistent. */
+	--space-1: 4px;
+	--space-2: 6px;
+	--space-3: 8px;
+	--space-4: 12px;
+	--space-5: 16px;
+	--space-6: 24px;
+	--radius-sm: 6px;
+	--radius-md: 10px;
+	--radius-lg: 14px;
+	--font-xs: 11px;
+	--font-sm: 12px;
+	--font-md: 15px;
+	--font-lg: 18px;
+	--line-tight: 1.25;
+	--line-normal: 1.45;
+	--control-height: 32px;
+	--group-gap: 14px;
+
 	color-scheme: light dark;
 }
 
@@ -311,7 +332,63 @@ label.search {
 .queue {
 	display: flex;
 	flex-direction: column;
-	gap: 8px;
+	gap: var(--group-gap);
+}
+
+/* --- mutually exclusive groups (APM-32) ------------------------------ */
+
+.queue-group {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-2);
+	border-left: 3px solid var(--border);
+	padding-left: var(--space-4);
+}
+
+.queue-group[data-tone="danger"] {
+	border-left-color: var(--danger);
+}
+
+.queue-group[data-tone="warn"] {
+	border-left-color: var(--warn);
+}
+
+.queue-group[data-tone="info"] {
+	border-left-color: var(--info);
+}
+
+.queue-group[data-tone="ok"] {
+	border-left-color: var(--ok);
+}
+
+.group-title {
+	margin: 0;
+	font-size: var(--font-sm);
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	line-height: var(--line-tight);
+	color: var(--text);
+	display: flex;
+	gap: var(--space-2);
+	align-items: baseline;
+}
+
+.group-symbol {
+	font-size: var(--font-sm);
+	color: var(--muted);
+}
+
+.group-description {
+	margin: 0;
+	font-size: var(--font-sm);
+	line-height: var(--line-normal);
+	color: var(--muted);
+}
+
+.group-rows {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-3);
 }
 
 .row {
@@ -1271,4 +1348,209 @@ pre.field-value {
 		height: auto;
 		min-height: var(--dag-height, 120px);
 	}
+}
+
+/* --- unified component scale (APM-32) --------------------------------
+   One typography/spacing/radius scale for list, topology, local graph and the
+   detail drawer. Values come from the tokens at the top of this file so the
+   four surfaces cannot drift apart; this is consistency, not a redesign. */
+
+.refresh,
+.views .view,
+.open-detail,
+.topo-card button,
+.drawer-actions button {
+	min-height: var(--control-height);
+	border-radius: var(--radius-sm);
+	padding: 0 var(--space-4);
+	font-size: var(--font-sm);
+	line-height: var(--line-tight);
+}
+
+.row,
+.topo-card,
+.drawer {
+	border-radius: var(--radius-md);
+	padding: var(--space-4);
+}
+
+.badge {
+	font-size: var(--font-xs);
+	line-height: var(--line-tight);
+	border-radius: 999px;
+	padding: 1px var(--space-3);
+}
+
+.section-title,
+.group-title,
+.topo-title {
+	font-size: var(--font-sm);
+	line-height: var(--line-tight);
+	letter-spacing: 0.06em;
+	margin: 0;
+}
+
+.drawer-title {
+	font-size: var(--font-lg);
+	line-height: var(--line-tight);
+}
+
+.drawer-subtitle,
+.row-foot,
+.group-description {
+	font-size: var(--font-sm);
+	line-height: var(--line-normal);
+	color: var(--muted);
+}
+
+.identifier {
+	font-family: var(--mono);
+	font-size: var(--font-sm);
+}
+
+.row .title,
+.topo-card .title {
+	font-size: var(--font-md);
+	line-height: var(--line-normal);
+}
+
+/* --- expanded local graph (APM-29) ---------------------------------- */
+
+.dag-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-3);
+}
+
+.dag-node {
+	font-size: var(--font-sm);
+	padding: var(--space-2) var(--space-3);
+	border-radius: var(--radius-sm);
+	gap: 2px;
+}
+
+.dag-node-title {
+	white-space: normal;
+	display: flex;
+	flex-direction: column;
+	line-height: var(--line-tight);
+}
+
+.dag-node-title-line {
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.dag-dialog {
+	width: min(96vw, 1180px);
+	max-height: 90vh;
+	overflow: hidden;
+	padding: 0;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-lg);
+	background: var(--surface);
+	color: var(--text);
+}
+
+.dag-dialog::backdrop {
+	background: rgb(0 0 0 / 45%);
+}
+
+.dag-dialog-body {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-3);
+	padding: var(--space-5);
+	max-height: calc(90vh - 2px);
+	overflow: auto;
+}
+
+.dag-dialog-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-3);
+	position: sticky;
+	top: 0;
+	background: var(--surface);
+	padding-bottom: var(--space-2);
+	z-index: 1;
+}
+
+.dag-dialog .dag {
+	max-width: 100%;
+	overflow: auto;
+}
+
+@media (max-width: 720px) {
+	.dag-dialog {
+		width: 100%;
+		max-width: 100vw;
+		max-height: 100vh;
+		height: 100vh;
+		border-radius: 0;
+		border-inline: 0;
+	}
+
+	.dag-dialog-body {
+		max-height: 100vh;
+		padding: var(--space-4);
+	}
+}
+
+/* Narrow screens: grid/flex children default to min-width:auto, which lets a
+   long card fact push the whole topology column past the viewport (APM-29).
+   Allow them to shrink and wrap instead of scrolling the page sideways. */
+@media (max-width: 860px) {
+	.topology-view,
+	.topology-groups,
+	.topo-group,
+	.dag-panel,
+	.selection-summary,
+	.topo-card,
+	.topo-facts,
+	.topo-blockers {
+		min-width: 0;
+	}
+
+	.topo-facts,
+	.topo-blockers {
+		overflow-wrap: anywhere;
+		white-space: normal;
+	}
+}
+
+/* --- status scope (APM-30) -------------------------------------------- */
+
+.status-scope {
+	display: inline-flex;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	overflow: hidden;
+	align-self: end;
+}
+
+.status-scope .scope {
+	border: none;
+	background: var(--surface);
+	color: var(--muted);
+	font: inherit;
+	font-size: 13px;
+	padding: 6px 12px;
+	cursor: pointer;
+}
+
+.status-scope .scope[aria-pressed="true"] {
+	background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+	color: var(--text);
+	font-weight: 600;
+}
+
+.status-scope .scope:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: -2px;
 }

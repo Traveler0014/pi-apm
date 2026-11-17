@@ -866,7 +866,10 @@ edges dashed — with scope switches (blocking chain / upstream / downstream) an
 text view that carries the same relations for keyboard and screen-reader users.
 Closed work is first-class too: the `Closed items` fold holds `done`,
 `cancelled`, `aborted` and any custom closed state, and each opens the full
-detail drawer from the fold, a search hit or a `#item=` deep link.
+detail drawer from the fold, a search hit or a `#item=` deep link. An explicit
+**Open / Closed / All** scope (`#status=`) promotes those items into a real
+`✓ Closed` group in both views, so closed work can be searched, filtered and
+sorted with the same controls as open work.
 
 Troubleshooting and the full protocol live in [`docs/ui.md`](docs/ui.md)
 (ticket lifecycle, error codes, CSP, embedded assets, route table). Verify the

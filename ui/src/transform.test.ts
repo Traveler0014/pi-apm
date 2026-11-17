@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MOCK_DONE, MOCK_ITEMS, mockDashboard } from "./fixtures";
+import { MOCK_CLOSED_EXTRA, MOCK_DONE, MOCK_ITEMS, mockDashboard } from "./fixtures";
 import {
 	BUCKETS,
 	buildQueue,
@@ -26,7 +26,7 @@ function dashboard(): Dashboard {
 
 /** Everything the server would return for `?all=true`, open first. */
 function allItems(): typeof MOCK_ITEMS {
-	return [...MOCK_ITEMS, ...MOCK_DONE];
+	return [...MOCK_ITEMS, ...MOCK_DONE, ...MOCK_CLOSED_EXTRA];
 }
 
 function queue(patch: Partial<ReturnType<typeof defaultViewState>> = {}, items: typeof MOCK_ITEMS | null = allItems()) {
@@ -58,8 +58,9 @@ describe("buildQueue: dedupe and multi-badges", () => {
 	it("keeps the recently done bucket out of the main queue and counts it separately", () => {
 		const model = queue();
 		expect(model.items.some((row) => row.item.identifier === "APM-11")).toBe(false);
-		expect(model.closedTotal).toBe(MOCK_DONE.length);
-		expect(model.closed.map((row) => row.item.identifier)).toEqual(["APM-12", "APM-11"]);
+		expect(model.closedTotal).toBe(MOCK_DONE.length + MOCK_CLOSED_EXTRA.length);
+		// Every closed category is counted, not just the dashboard's recently-done window.
+		expect(model.closed.map((row) => row.item.identifier).sort()).toEqual(["APM-11", "APM-12", "APM-18", "APM-19"]);
 		expect(model.total).toBe(MOCK_ITEMS.length);
 	});
 
@@ -118,6 +119,9 @@ describe("sortQueue", () => {
 				{
 					item: { ...MOCK_ITEMS[0]!, id: "i-lease", identifier: "APM-99", title: "lost lease" },
 					badges: [{ key: "lost_lease", label: "lost lease", symbol: "▲", tone: "danger" }],
+					group: "at_risk",
+					explanation: "health lost_lease",
+					openBlockerCount: 0,
 				},
 			],
 			"queue",
@@ -235,3 +239,54 @@ describe("connectionView", () => {
 function orderOf(key: BucketKey): number {
 	return BUCKETS.findIndex((bucket) => bucket.key === key);
 }
+
+describe("status scope (APM-30)", () => {
+	it("open scope keeps the historical behaviour (open groups, closed only in the fold)", () => {
+		const model = queue({ statusScope: "open" });
+		expect(model.showClosedGroup).toBe(false);
+		expect(model.groups.every((section) => section.meta.key !== "closed")).toBe(true);
+		expect(model.items.length).toBeGreaterThan(0);
+		expect(model.closedTotal).toBeGreaterThan(0);
+	});
+
+	it("closed scope promotes every closed category into one group and empties the open list", () => {
+		const model = queue({ statusScope: "closed" });
+		expect(model.showClosedGroup).toBe(true);
+		expect(model.items).toEqual([]);
+		expect(model.total).toBe(0);
+		const closed = model.groups.find((section) => section.meta.key === "closed")!;
+		expect(closed.meta.label).toBe("Closed");
+		const ids = closed.rows.map((row) => row.item.identifier);
+		expect(ids).toContain("APM-12"); // done
+		expect(ids).toContain("APM-19"); // cancelled
+		expect(ids).toContain("APM-18"); // aborted (custom closed state)
+		expect(closed.rows.every((row) => row.group === "closed")).toBe(true);
+	});
+
+	it("all scope shows open groups plus the closed group", () => {
+		const model = queue({ statusScope: "all" });
+		expect(model.showClosedGroup).toBe(true);
+		expect(model.groups.some((section) => section.meta.key === "closed")).toBe(true);
+		expect(model.groups.some((section) => section.meta.key !== "closed")).toBe(true);
+		expect(model.items.length).toBeGreaterThan(0);
+	});
+
+	it("search reaches closed work directly in every scope that shows it", () => {
+		const closedOnly = queue({ statusScope: "closed", search: "APM-19" });
+		expect(closedOnly.groups[0]!.rows.map((row) => row.item.identifier)).toEqual(["APM-19"]);
+		const all = queue({ statusScope: "all", search: "APM-18" });
+		const closed = all.groups.find((section) => section.meta.key === "closed")!;
+		expect(closed.rows.map((row) => row.item.identifier)).toEqual(["APM-18"]);
+		// A closed item does not leak into the open part of `all`.
+		expect(all.items.some((row) => row.item.identifier === "APM-18")).toBe(false);
+	});
+
+	it("keeps total/filtered/closedTotal semantics for the open queue", () => {
+		const all = queue({ statusScope: "open" });
+		const filtered = queue({ statusScope: "open", search: "no-such-item" });
+		expect(filtered.total).toBe(all.total);
+		expect(filtered.filtered).toBe(all.total);
+		expect(filtered.items).toEqual([]);
+		expect(filtered.closedTotal).toBe(all.closedTotal);
+	});
+});

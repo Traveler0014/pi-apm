@@ -16,8 +16,10 @@ import {
 	type ConnectionView,
 	type Metric,
 	type QueueModel,
+	type QueueSection,
 	type QueuedItem,
 	type SortKey,
+	type StatusScope,
 	type ViewState,
 	bucketMeta,
 	clockTime,
@@ -25,7 +27,8 @@ import {
 	relativeTime,
 } from "./transform";
 import { renderDag, renderDagText } from "./dag";
-import { type DagScope, localDag, type TopologyGraph, type TopologySummary } from "./topology";
+import { groupMeta } from "./groups";
+import { type DagScope, type LocalDag, localDag, type TopologyGraph, type TopologySummary } from "./topology";
 import type { BucketKey, Dashboard, WorkItem } from "./types";
 import { acceptanceProgress, categoryMark, stageBadge, type StageModel } from "./workflow";
 
@@ -49,6 +52,7 @@ export interface Shell {
 	metrics: HTMLElement;
 	banner: HTMLElement;
 	viewToggle: HTMLElement;
+	statusScope: HTMLElement;
 	filters: HTMLElement;
 	search: HTMLInputElement;
 	sort: HTMLSelectElement;
@@ -56,6 +60,9 @@ export interface Shell {
 	topologyView: HTMLElement;
 	topologyGroups: HTMLElement;
 	dagPanel: HTMLElement;
+	/** Modal overlay for the expanded local graph (APM-29). */
+	dagDialog: HTMLDialogElement;
+	dagDialogBody: HTMLElement;
 	summary: HTMLElement;
 	queue: HTMLElement;
 	queueCaption: HTMLElement;
@@ -66,6 +73,7 @@ export interface Shell {
 	onRefresh: (handler: () => void) => void;
 	onStateChange: (handler: (next: Partial<ViewState>) => void) => void;
 	onViewChange: (handler: (view: ViewMode) => void) => void;
+	onStatusScopeChange: (handler: (scope: StatusScope) => void) => void;
 	onSelect: (handler: (id: string | null) => void) => void;
 	onDagScope: (handler: (scope: DagScope) => void) => void;
 	onOpenItem: (handler: (id: string) => void) => void;
@@ -128,6 +136,18 @@ export function createShell(root: HTMLElement): Shell {
 		button.dataset.view = mode;
 		viewToggle.append(button);
 	}
+	const statusScope = el("div", { className: "status-scope", attrs: { role: "group", "aria-label": "Status scope" } });
+	for (const [scope, label] of [
+		["open", "Open"],
+		["closed", "Closed"],
+		["all", "All"],
+	] as Array<[StatusScope, string]>) {
+		const button = el("button", { className: "scope", text: label, attrs: { type: "button", "aria-pressed": "false" } });
+		// `data-scope` is the DAG scope; keep the status control on its own key so
+		// generic scope selectors cannot grab the wrong button.
+		button.dataset.statusScope = scope;
+		statusScope.append(button);
+	}
 	const filters = el("div", { className: "filters", attrs: { role: "group", "aria-label": "Filter by queue" } });
 
 	const searchWrap = el("label", { className: "search" });
@@ -152,13 +172,13 @@ export function createShell(root: HTMLElement): Shell {
 		sort.append(option);
 	}
 	sortWrap.append(sort);
-	controls.append(viewToggle, filters, searchWrap, sortWrap);
+	controls.append(viewToggle, statusScope, filters, searchWrap, sortWrap);
 
 	// --- list view --------------------------------------------------------
 	const main = el("main", { className: "content" });
 	const listView = el("section", { className: "list-view", attrs: { "aria-label": "Main queue" } });
 	const queueCaption = el("h2", { className: "section-title" });
-	const queue = el("div", { className: "queue", attrs: { role: "list" } });
+	const queue = el("div", { className: "queue" });
 	const empty = el("p", { className: "empty", text: "Nothing matches the current filters.", attrs: { hidden: "" } });
 	const doneFold = el("details", { className: "done-fold" }) as HTMLDetailsElement;
 	const doneSummary = el("summary", { className: "done-summary" });
@@ -172,6 +192,17 @@ export function createShell(root: HTMLElement): Shell {
 	const dagPanel = el("section", { className: "dag-panel", attrs: { "aria-label": "Local dependency graph" } });
 	const summary = el("aside", { className: "selection-summary", attrs: { "aria-label": "Selected item" } });
 	topologyView.append(topologyGroups, dagPanel, summary);
+
+	// Expanded graph overlay: native <dialog> gives focus trapping and Esc for
+	// free; the same layout runs with larger boxes. Rendered on demand.
+	const dagDialog = el("dialog", {
+		className: "dag-dialog",
+		attrs: { "aria-label": "Expanded local dependency graph" },
+	}) as HTMLDialogElement;
+	const dagDialogBody = el("div", { className: "dag-dialog-body" });
+	dagDialog.append(dagDialogBody);
+	// Inside the topology view so the delegated scope/selection handlers see it.
+	topologyView.append(dagDialog);
 
 	main.append(listView, topologyView);
 	shellRoot.append(header, metrics, banner, controls, main);
@@ -193,6 +224,7 @@ export function createShell(root: HTMLElement): Shell {
 		metrics,
 		banner,
 		viewToggle,
+		statusScope,
 		filters,
 		search,
 		sort,
@@ -200,6 +232,8 @@ export function createShell(root: HTMLElement): Shell {
 		topologyView,
 		topologyGroups,
 		dagPanel,
+		dagDialog,
+		dagDialogBody,
 		summary,
 		queue,
 		queueCaption,
@@ -222,6 +256,12 @@ export function createShell(root: HTMLElement): Shell {
 		onStateChange(handler) {
 			search.addEventListener("input", () => handler({ search: search.value }));
 			sort.addEventListener("change", () => handler({ sort: sort.value as SortKey }));
+		},
+		onStatusScopeChange(handler) {
+			statusScope.addEventListener("click", (event) => {
+				const button = (event.target as HTMLElement).closest<HTMLElement>("[data-status-scope]");
+				if (button?.dataset.statusScope) handler(button.dataset.statusScope as StatusScope);
+			});
 		},
 		onViewChange(handler) {
 			viewToggle.addEventListener("click", (event) => {
@@ -351,6 +391,13 @@ export function updateFilters(shell: Shell, state: ViewState, dashboard: Dashboa
 	shell.filters.dataset.active = state.buckets.join(",");
 }
 
+/** Reflect the open/closed/all scope in the segmented control. */
+export function updateStatusScope(shell: Shell, state: ViewState): void {
+	for (const button of shell.statusScope.querySelectorAll<HTMLButtonElement>("[data-status-scope]")) {
+		button.setAttribute("aria-pressed", String(button.dataset.statusScope === state.statusScope));
+	}
+}
+
 export function updateViews(shell: Shell, view: ViewMode, selectedId: string | null): void {
 	for (const button of shell.viewToggle.querySelectorAll<HTMLButtonElement>("[data-view]")) {
 		const active = button.dataset.view === view;
@@ -369,10 +416,12 @@ export function updateQueue(shell: Shell, model: QueueModel, ctx: RenderContext)
 	shell.queueCaption.textContent = `Main queue · ${model.items.length}${
 		model.filtered > 0 ? ` of ${model.total} (+${model.filtered} filtered out)` : ""
 	}`;
-	shell.queue.replaceChildren(...model.items.map((row) => renderRow(row, ctx)));
-	shell.empty.hidden = model.items.length > 0;
+	shell.queue.replaceChildren(...model.groups.map((section) => renderGroup(section, ctx)));
+	shell.empty.hidden = model.groups.some((section) => section.rows.length > 0);
 
-	shell.doneFold.hidden = model.closedTotal === 0;
+	// When the status scope promotes closed work into a group, the fold would show
+	// the same rows twice, so it is hidden instead.
+	shell.doneFold.hidden = model.showClosedGroup || model.closedTotal === 0;
 	shell.doneFold.open = ctx.state.showRecentlyDone;
 	// Every closed category lives here (done/cancelled/aborted/custom), not just
 	// the dashboard's "recently done" window.
@@ -380,6 +429,31 @@ export function updateQueue(shell: Shell, model: QueueModel, ctx: RenderContext)
 		model.closed.length !== model.closedTotal ? ` (${model.closed.length} shown)` : ""
 	}`;
 	shell.doneList.replaceChildren(...(ctx.state.showRecentlyDone ? model.closed.map((row) => renderRow(row, ctx)) : []));
+}
+
+/**
+ * One mutually exclusive group: a heading (symbol + label + count), the rule in
+ * one sentence, then its rows. The heading is what makes "Startable" mean only
+ * startable work — a `doing` item with blockers sits under "In progress" and
+ * carries an upstream badge instead of leaking into the ready list.
+ */
+function renderGroup(section: QueueSection, ctx: RenderContext): HTMLElement {
+	const group = el("section", {
+		className: "queue-group",
+		attrs: { "aria-label": `${section.meta.label} (${section.rows.length})` },
+	});
+	group.dataset.group = section.meta.key;
+	group.dataset.tone = section.meta.tone;
+	const title = el("h3", { className: "group-title" });
+	title.append(
+		el("span", { className: "group-symbol", text: section.meta.symbol }),
+		el("span", { className: "group-label", text: `${section.meta.label} · ${section.rows.length}` }),
+	);
+	const description = el("p", { className: "group-description", text: section.meta.description });
+	const rows = el("div", { className: "group-rows", attrs: { role: "list" } });
+	rows.append(...section.rows.map((row) => renderRow(row, ctx)));
+	group.append(title, description, rows);
+	return group;
 }
 
 function renderRow(row: QueuedItem, ctx: RenderContext): HTMLElement {
@@ -400,6 +474,10 @@ function renderRow(row: QueuedItem, ctx: RenderContext): HTMLElement {
 	node.dataset.priority = item.priority;
 	node.dataset.health = item.health;
 	node.dataset.selected = String(selected);
+	node.dataset.group = row.group;
+	// The group explanation is available on hover and to screen readers, so the
+	// classification is never just a colour.
+	if (row.explanation) node.title = row.explanation;
 
 	const head = el("div", { className: "row-head" });
 	head.append(el("span", { className: "identifier", text: item.identifier }), el("span", { className: "title", text: item.title }));
@@ -410,6 +488,9 @@ function renderRow(row: QueuedItem, ctx: RenderContext): HTMLElement {
 		chip.dataset.tone = badge.tone;
 		chip.dataset.bucket = badge.key;
 		badges.append(chip);
+	}
+	if (row.openBlockerCount > 0 && !row.badges.some((badge) => badge.key === "waiting_dependencies")) {
+		badges.append(tagged(`◆ blocked by ${row.openBlockerCount}`, "warn", "waiting_dependencies"));
 	}
 	if (item.waiting_on_human) badges.append(tagged("⏸ waiting human", "warn", "waiting_human"));
 	if (item.claim && item.claim.status === "active") {
@@ -504,15 +585,40 @@ function acceptanceLine(progress: NonNullable<ReturnType<typeof acceptanceProgre
 // Topology view
 // ---------------------------------------------------------------------------
 
-/** Cards for the two decision groups plus a delta for the selected item. */
+/**
+ * Decision groups in the same order and with the same names as the queue:
+ * Needs human, At risk, In progress, Waiting upstream, Ready to start. Only
+ * startable items may appear under "Ready to start".
+ */
 export function updateTopology(
 	shell: Shell,
 	summary: TopologySummary,
 	ctx: RenderContext,
+	closedRows?: QueuedItem[],
 ): void {
 	const groups: HTMLElement[] = [];
+	// Status scope wins: with `closed`/`all`, the open groups are still drawn (they
+	// simply contain no closed items) and a real Closed group is appended.
+	const scope = ctx.state.statusScope;
+	const hideOpen = scope === "closed";
+
+	const groupSection = (key: string, label: string, items: TopologySummary["ready"], empty: string): HTMLElement => {
+		const section = el("section", { className: "topo-group", attrs: { "aria-label": label } });
+		section.dataset.group = key;
+		section.append(el("h3", { className: "topo-title", text: `${label} · ${items.length}` }));
+		if (items.length === 0) section.append(el("p", { className: "muted", text: empty }));
+		for (const item of items) section.append(renderCard(item, ctx, { unlocks: summary.unlocks.get(item.id) }));
+		return section;
+	};
+
+	if (!hideOpen) {
+		groups.push(groupSection("needs_human", "Needs human", summary.needsHuman, "Nobody is waiting on a human answer."));
+		groups.push(groupSection("at_risk", "At risk", summary.atRisk, "No stale leases or unexplained waiting states."));
+		groups.push(groupSection("in_progress", "In progress", summary.inProgress, "No active or claimed work."));
+	}
 
 	const ready = el("section", { className: "topo-group", attrs: { "aria-label": "Ready to start" } });
+	if (hideOpen) ready.hidden = true;
 	ready.dataset.group = "ready";
 	ready.append(el("h3", { className: "topo-title", text: `Ready to start · ${summary.ready.length}` }));
 	if (summary.ready.length === 0) ready.append(el("p", { className: "muted", text: "Nothing is unblocked right now." }));
@@ -520,6 +626,7 @@ export function updateTopology(
 	groups.push(ready);
 
 	const waiting = el("section", { className: "topo-group", attrs: { "aria-label": "Waiting on upstream" } });
+	if (hideOpen) waiting.hidden = true;
 	waiting.dataset.group = "waiting";
 	waiting.append(el("h3", { className: "topo-title", text: `Waiting on upstream · ${summary.waiting.length}` }));
 	if (summary.waiting.length === 0) waiting.append(el("p", { className: "muted", text: "Nothing is waiting on another item." }));
@@ -528,7 +635,7 @@ export function updateTopology(
 	}
 	groups.push(waiting);
 
-	if (summary.cycles.length > 0) {
+	if (!hideOpen && summary.cycles.length > 0) {
 		const cycles = el("section", { className: "topo-group", attrs: { "aria-label": "Dependency cycles" } });
 		cycles.dataset.group = "cycles";
 		cycles.append(el("h3", { className: "topo-title", text: `Dependency cycles · ${summary.cycles.length}` }));
@@ -540,6 +647,21 @@ export function updateTopology(
 		);
 		for (const item of summary.cycles) cycles.append(renderCard(item, ctx, { cycle: true }));
 		groups.push(cycles);
+	}
+
+	// Closed work becomes a first-class group when the status scope asks for it:
+	// done, cancelled, aborted and custom closed states are searchable and open the
+	// same detail drawer as open items. Rows are the already filtered/sorted ones
+	// from `buildQueue`, so List and Topology never disagree.
+	if (closedRows) {
+		const meta = groupMeta("closed");
+		const closed = el("section", { className: "topo-group", attrs: { "aria-label": `${meta.label} items` } });
+		closed.dataset.group = "closed";
+		closed.append(el("h3", { className: "topo-title", text: `${meta.symbol} ${meta.label} · ${closedRows.length}` }));
+		closed.append(el("p", { className: "muted", text: meta.description }));
+		if (closedRows.length === 0) closed.append(el("p", { className: "muted", text: "No closed item matches the current search." }));
+		for (const row of closedRows) closed.append(renderCard(row.item, ctx));
+		groups.push(closed);
 	}
 
 	shell.topologyGroups.replaceChildren(...groups);
@@ -678,11 +800,13 @@ export function updateDagPanel(
 		shell.dagPanel.replaceChildren(
 			el("p", { className: "muted", text: "Select an item to see its upstream and downstream items." }),
 		);
+		if (shell.dagDialog.open) closeDagDialog(shell.dagDialog);
 		return;
 	}
 	const dag = localDag(graph, item.id, 2);
 	const nodes: HTMLElement[] = [];
 	nodes.push(el("h3", { className: "topo-title", text: `Local graph · ${item.identifier}` }));
+	const toolbar = el("div", { className: "dag-toolbar" });
 	const scopes = el("div", { className: "dag-scopes", attrs: { role: "group", "aria-label": "Graph scope" } });
 	for (const [value, label] of [
 		["all", "All"],
@@ -694,7 +818,23 @@ export function updateDagPanel(
 		button.dataset.scope = value;
 		scopes.append(button);
 	}
-	nodes.push(scopes);
+	toolbar.append(scopes);
+	const expand = el("button", {
+		className: "ghost dag-expand",
+		text: "Expand graph",
+		attrs: { type: "button", "aria-haspopup": "dialog", "aria-label": "Expand local dependency graph" },
+	});
+	expand.addEventListener("click", () => {
+		renderDagDialog(shell, dag, item, scope, onSelect);
+		openDagDialog(shell.dagDialog);
+		const close = shell.dagDialogBody.querySelector<HTMLButtonElement>("[data-action=close-graph]");
+		close?.focus();
+	});
+	// Native dialog focus trap + Esc; returning focus to the trigger matters for
+	// keyboard users and is asserted in the browser checks.
+	shell.dagDialog.onclose = () => expand.focus();
+	toolbar.append(expand);
+	nodes.push(toolbar);
 	nodes.push(renderDag(dag, { scope, onSelect }));
 	const legend = el("p", { className: "dag-legend" });
 	legend.append(el("span", { className: "legend solid", text: "── dependency (blocks)" }));
@@ -705,6 +845,71 @@ export function updateDagPanel(
 	details.append(renderDagText(dag, { scope, onSelect }));
 	nodes.push(details);
 	shell.dagPanel.replaceChildren(...nodes);
+
+	// Changing scope inside the overlay goes through the normal delegated handler,
+	// which re-renders the panel; keep the open overlay in sync with it.
+	if (shell.dagDialog.open) renderDagDialog(shell, dag, item, scope, onSelect);
+}
+
+function openDagDialog(dialog: HTMLDialogElement): void {
+	if (typeof dialog.showModal === "function") {
+		if (!dialog.open) dialog.showModal();
+	} else {
+		dialog.setAttribute("open", "");
+	}
+}
+
+function closeDagDialog(dialog: HTMLDialogElement): void {
+	if (typeof dialog.close === "function") dialog.close();
+	else dialog.removeAttribute("open");
+}
+
+/** Expanded graph: same layout with larger boxes, plus scopes, legend and text view. */
+function renderDagDialog(
+	shell: Shell,
+	dag: LocalDag,
+	item: WorkItem,
+	scope: DagScope,
+	onSelect: (id: string) => void,
+): void {
+	const body = shell.dagDialogBody;
+	const head = el("div", { className: "dag-dialog-head" });
+	head.append(el("h3", { className: "topo-title", text: `Local graph · ${item.identifier}` }));
+	const close = el("button", {
+		className: "ghost",
+		text: "Close ✕",
+		attrs: { type: "button", "aria-label": "Close expanded graph", "data-action": "close-graph" },
+	});
+	close.addEventListener("click", () => closeDagDialog(shell.dagDialog));
+	head.append(close);
+	const scopes = el("div", { className: "dag-scopes", attrs: { role: "group", "aria-label": "Graph scope" } });
+	for (const [value, label] of [
+		["all", "All"],
+		["blocking", "Blocking chain"],
+		["upstream", "Upstream"],
+		["downstream", "Downstream"],
+	] as Array<[DagScope, string]>) {
+		const button = el("button", { className: "ghost dag-scope", text: label, attrs: { type: "button", "aria-pressed": String(scope === value) } });
+		button.dataset.scope = value;
+		scopes.append(button);
+	}
+	const selectAndClose = (id: string) => {
+		closeDagDialog(shell.dagDialog);
+		onSelect(id);
+	};
+	const graph = renderDag(dag, { scope, onSelect: selectAndClose, expanded: true });
+	const legend = el("p", { className: "dag-legend" });
+	legend.append(el("span", { className: "legend solid", text: "── dependency (blocks)" }));
+	legend.append(el("span", { className: "legend dashed", text: "╌╌ parent / child" }));
+	const text = renderDagText(dag, { scope, onSelect: selectAndClose });
+	body.replaceChildren(head, scopes, graph, legend, text);
+	// Esc closes even where <dialog> semantics are emulated (tests, older engines).
+	shell.dagDialog.onkeydown = (event: KeyboardEvent) => {
+		if (event.key === "Escape") {
+			event.preventDefault();
+			closeDagDialog(shell.dagDialog);
+		}
+	};
 }
 
 export { bucketMeta };

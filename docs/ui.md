@@ -180,6 +180,17 @@ relations in reading order (`← blocks`, `↑ parent`, `● selected`,
 `↓ child`, `→ unblocks`) with *Select* buttons that drive the same selection —
 that list is the keyboard and screen-reader equivalent of the picture.
 
+**Status scope (Open / Closed / All).** The segmented control next to the view
+switch decides which lifecycle half the queue shows, and is kept in the URL
+(`#status=closed`) like the other view state. `Open` keeps the historical layout
+(open groups plus the folded `Closed items` list); `Closed` replaces the open
+groups with one accessible **`✓ Closed`** group; `All` shows both. The closed
+group uses the same rows as the list — same search, priority filter and sort — so
+the two views cannot drift, and each row opens the full detail drawer. Search
+covers closed work directly: type `APM-19` (or a title fragment) while a closed
+scope is active to reach done/cancelled/aborted/custom-closed items without
+expanding anything. A refresh or a deep link keeps the chosen scope.
+
 **Closed items are first-class.** The `Closed items` fold contains every closed
 category — `done`, `cancelled`, `aborted` and any custom closed state — not just
 the dashboard's "recently done" window. Any of them opens the full detail drawer
@@ -207,6 +218,86 @@ prints `SKIP` (exit 0) when none exists. The Rust side is covered by
 `tests/ui.rs` (real process, raw TCP): assets, CSP, redirects, traversal,
 ticket exchange/expiry/replay, restart invalidation, logs without the token,
 Origin matrix and event routes.
+
+## Groups and status semantics
+
+Every item is in **exactly one** headline group; the other dimensions stay
+visible as badges, so the list is unambiguous without hiding information.
+
+| Group | Rule (first match wins) | What it means |
+|---|---|---|
+| Needs human | not active/claimed, `waiting_on_human` | A human owes an answer; agents cannot progress. |
+| At risk | not active/claimed, unhealthy lease (`stale`, `lost_lease`, `recovery_failed`, expired claim) or a `waiting` category with no recorded dependency or human request | The execution record needs repair. |
+| In progress | category `active`/`review`, or a **valid** claim | Work is owned right now. |
+| Waiting upstream | not active/claimed, at least one open blocker | Cannot start until upstream closes. |
+| Startable | open, **unclaimed**, no open blockers, healthy | The only group labelled Ready to start. |
+| Closed | category `closed` | Done, cancelled, aborted or a custom terminal state. |
+
+Rules that follow from this:
+
+- A `doing`/`review` item is **never** Startable. If it also has open blockers it
+  stays in In progress and shows a `◆ blocked by N` badge.
+- A claim protects an item only while it is active and unexpired; an expired
+  lease moves an otherwise-ready item to At risk instead of pretending it is
+  owned.
+- Blockers are resolved against the loaded item snapshot: a blocker whose
+  `status_category` is `closed` (including custom closed states) no longer
+  blocks. References outside the snapshot (other project, deleted row) are
+  ignored, matching the topology graph.
+- A `waiting` category must say why. With an open dependency it is Waiting
+  upstream; with a human request it is Needs human; with neither it is At risk
+  ("waiting without a recorded reason").
+- Group membership uses text, symbols and section headings — never colour alone.
+  The reason is also exposed as the row's tooltip/accessible description.
+
+The queue and the topology view use the same order and names: Needs human, At
+risk, In progress, Waiting upstream, Startable, then the Closed fold. Closed
+items are first-class (every terminal state, not just the dashboard's recent
+window) and are reachable from the fold, search or a `#item=` deep link.
+
+The classification is implemented as pure functions in `ui/src/groups.ts` and
+pinned by `groups.test.ts`; `transform.ts` (queue sections) and `topology.ts`
+(decision lists) consume it, so the rules cannot drift between views.
+
+## Visual and interaction spec
+
+The dashboard has one visual language across list, topology, local graph and the
+detail drawer. Consistency comes from tokens in `ui/src/style.css`, not from
+per-view spacing:
+
+| Token group | Used for |
+|---|---|
+| `--space-1…6` | paddings of rows, cards, drawer sections, group gaps |
+| `--radius-sm/md/lg` | buttons and badges, cards/rows/drawer, the expanded graph |
+| `--font-xs/sm/md/lg` + `--line-tight/normal` | badges/labels, section titles and metadata, row titles, drawer title |
+| `--control-height` | every button, scope switch and view toggle |
+| `--group-gap` | distance between mutually exclusive groups |
+
+Rules that are exercised by the browser checks:
+
+- **Text before colour.** Every group has a heading, symbol and count; every
+  badge has a symbol and a word; health is written (`health stale`), not only
+  tinted. Group order is Needs human → At risk → In progress → Waiting upstream
+  → Startable → Closed.
+- **Keyboard.** Rows and cards are reachable with Tab and open with
+  Enter/Space. The drawer and the expanded graph are native dialogs with a
+  focus trap; `Escape` closes them and returns focus to the trigger. Copy
+  buttons announce through `aria-live`.
+- **Expanded graph.** `Expand graph` renders the same layout with larger boxes
+  and keeps dependency/parent edges, scope switches and the text view. On a
+  narrow screen the dialog fills the viewport, scrolls inside, and the page
+  itself never scrolls sideways.
+- **Status scope.** `Open / Closed / All` narrows the queue; closed work is a
+  real group with the same rows/cards (searchable, deep-linkable via `#item=`)
+  and is reflected in `#status=`, so a reload keeps it. When closed is a group,
+  the old fold is hidden.
+- **Freshness.** Data refreshes every 4 s; manual refresh is `R`/button; an
+  outage keeps the cached rows under `offline · cached <time>` and recovers
+  automatically. Filters, sort, scope and the expanded selection survive a
+  refresh.
+- **Narrow screens.** One column below 860 px; grid/flex children set
+  `min-width: 0` so long titles wrap instead of widening the page; the graph
+  dialog is full-screen below 720 px.
 
 ## Routes
 

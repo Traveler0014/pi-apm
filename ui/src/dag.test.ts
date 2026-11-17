@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GAP_X, NODE_H, NODE_W, dagTextLines, layoutDag, scopeDag } from "./dag";
+import { GAP_X, NODE_H, NODE_W, dagTextLines, layoutDag, scopeDag, wrapTitle } from "./dag";
 import { buildGraph, localDag } from "./topology";
 import type { WorkItem } from "./types";
 
@@ -140,5 +140,35 @@ describe("dagTextLines", () => {
 		const scoped = dagTextLines(scopeDag(localDag(graph, "mid", 2), "upstream"));
 		expect(scoped.join("\n")).not.toContain("unblocks");
 		expect(scoped.join("\n")).toContain("blocks");
+	});
+});
+
+describe("readable node geometry (APM-29)", () => {
+	it("uses boxes tall enough for a two-line title", () => {
+		expect(NODE_W).toBeGreaterThanOrEqual(200);
+		expect(NODE_H).toBeGreaterThanOrEqual(72);
+	});
+
+	it("wraps titles into at most two lines without cutting words", () => {
+		const lines = wrapTitle("Parser crashes on an empty page in production");
+		expect(lines.length).toBeLessThanOrEqual(2);
+		expect(lines.join(" ").length).toBeLessThanOrEqual(
+			"Parser crashes on an empty page in production".length + 1,
+		);
+		for (const line of lines) expect(line.length).toBeLessThanOrEqual(28);
+		expect(lines[0]!.startsWith("Parser")).toBe(true);
+	});
+
+	it("keeps short titles on one line and never emits empty lines", () => {
+		expect(wrapTitle("Short title")).toEqual(["Short title"]);
+		expect(wrapTitle("", 10)).toEqual([""]);
+	});
+
+	it("the expanded layout is larger than the inline one", () => {
+		const dag = localDag(graph, "mid", 2);
+		const inline = layoutDag(dag);
+		const expanded = layoutDag(dag, { nodeW: NODE_W + 56, nodeH: NODE_H + 26 });
+		expect(expanded.width).toBeGreaterThan(inline.width);
+		expect(expanded.height).toBeGreaterThan(inline.height);
 	});
 });

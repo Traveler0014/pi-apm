@@ -33,6 +33,7 @@ import {
 	updateProject,
 	updateDagPanel,
 	updateQueue,
+	updateStatusScope,
 	updateSelectionSummary,
 	updateTopology,
 	updateViews,
@@ -143,13 +144,14 @@ function render(): void {
 	});
 	updateBanner(shell, connection);
 	updateViews(shell, view, selectedId);
+	updateStatusScope(shell, state);
 	updateFilters(shell, state, dashboard);
 
 	const queue = buildQueue(dashboard, snapshot?.items ?? null, state);
 	updateQueue(shell, queue, ctx);
 
 	const graph = buildGraph(snapshot?.items ?? []);
-	updateTopology(shell, topologySummary(graph), ctx);
+	updateTopology(shell, topologySummary(graph), ctx, state.statusScope === "open" ? undefined : queue.closed);
 	const selected = selectedId ? (snapshot?.items.find((item) => item.id === selectedId) ?? null) : null;
 	updateSelectionSummary(shell, ctx, selected, selected ? details.get(selected.id)?.detail : undefined);
 	updateDagPanel(shell, ctx, selected, graph, dagScope, (id) => {
@@ -279,6 +281,15 @@ shell.onDagScope((scope) => {
 	render();
 });
 
+shell.onStatusScopeChange((scope) => {
+	state.statusScope = scope;
+	// Closed work folds by default; promoting it into a group means the user asked
+	// to see it, so the fold state follows the scope instead of hiding the rows.
+	state.showRecentlyDone = scope !== "open";
+	updateHash();
+	render();
+});
+
 shell.onViewChange((next) => {
 	view = next;
 	updateHash();
@@ -324,6 +335,7 @@ function updateHash(extra: { item?: string | null } = {}): void {
 	const hash = new URLSearchParams();
 	if (view !== "list") hash.set("view", view);
 	if (dagScope !== "all") hash.set("scope", dagScope);
+	if (state.statusScope !== "open") hash.set("status", state.statusScope);
 	const item = extra.item !== undefined ? extra.item : selectedId ? identifierOf(selectedId) : null;
 	if (item) hash.set("item", item);
 	const suffix = hash.toString();
@@ -347,6 +359,11 @@ async function openDeepLink(): Promise<void> {
 	const hash = new URLSearchParams(raw);
 	const wantedView = hash.get("view");
 	if (wantedView === "topology" || wantedView === "list") view = wantedView;
+	const wantedStatus = hash.get("status");
+	if (wantedStatus === "open" || wantedStatus === "closed" || wantedStatus === "all") {
+		state.statusScope = wantedStatus;
+		state.showRecentlyDone = wantedStatus !== "open";
+	}
 	const wantedScope = hash.get("scope");
 	if (wantedScope === "all" || wantedScope === "blocking" || wantedScope === "upstream" || wantedScope === "downstream") dagScope = wantedScope;
 	const wanted = hash.get("item");
@@ -355,6 +372,7 @@ async function openDeepLink(): Promise<void> {
 		if (match) {
 			selectedId = match.id;
 			updateViews(shell, view, selectedId);
+	updateStatusScope(shell, state);
 			render();
 			if (!drawer.isOpen() || drawer.currentIdentifier() !== match.identifier) await drawer.open(match.id);
 			return;
