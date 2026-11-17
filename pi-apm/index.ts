@@ -63,6 +63,9 @@ interface ActiveRun {
 let activeRun: ActiveRun | null = null;
 let runSeq = 0;
 let sideRunInFlight = false;
+/// Cancels the in-flight side-run when the session shuts down, so quitting never
+/// waits for a slow/hung child (and never orphans it).
+let sideRunController: AbortController | null = null;
 /// Env vars this extension injected for bash-invoked `apm` calls, with their
 /// previous values, so every run restores exactly what it changed.
 let injectedEnv: Array<[string, string | undefined]> = [];
@@ -102,6 +105,8 @@ interface ProcessResult {
 	stdout: string;
 	stderr: string;
 	timedOut: boolean;
+	/** True when `signal` aborted: the child was killed on purpose, not failed. */
+	aborted: boolean;
 	spawnError?: string;
 }
 
@@ -112,6 +117,8 @@ function runProcess(input: {
 	env?: Record<string, string>;
 	timeoutMs: number;
 	signal?: AbortSignal;
+	/** Own process group, so cancellation reaches `apm` and any grandchildren. */
+	detached?: boolean;
 }): Promise<ProcessResult> {
 	return new Promise((resolve) => {
 		let child: ReturnType<typeof spawn>;
@@ -119,11 +126,14 @@ function runProcess(input: {
 		let stderr = "";
 		let settled = false;
 		let timedOut = false;
+		let aborted = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let abortFallback: ReturnType<typeof setTimeout> | undefined;
 		const finish = (result: ProcessResult) => {
 			if (settled) return;
 			settled = true;
 			if (killTimer) clearTimeout(killTimer);
+			if (abortFallback) clearTimeout(abortFallback);
 			resolve(result);
 		};
 		try {
@@ -131,6 +141,7 @@ function runProcess(input: {
 				cwd: input.cwd,
 				env: { ...process.env, ...input.env },
 				stdio: ["ignore", "pipe", "pipe"],
+				detached: input.detached === true,
 			});
 		} catch (error) {
 			finish({
@@ -138,6 +149,7 @@ function runProcess(input: {
 				stdout: "",
 				stderr: "",
 				timedOut: false,
+				aborted: false,
 				spawnError: error instanceof Error ? error.message : String(error),
 			});
 			return;
@@ -149,10 +161,34 @@ function runProcess(input: {
 			stderr += chunk.toString();
 			if (stderr.length > 20_000) stderr = stderr.slice(-20_000);
 		});
+		// The side-run child runs `apm`, and the model CLI can spawn further
+		// processes. `child.kill` would orphan those grandchildren, so a detached
+		// child is signalled through its process group. Windows has no equivalent
+		// here, so it keeps the direct kill.
+		const killTree = (signal: NodeJS.Signals): void => {
+			if (input.detached === true && process.platform !== "win32" && child.pid) {
+				try {
+					process.kill(-child.pid, signal);
+					return;
+				} catch {
+					// Already gone, or no process group: fall back to the direct kill.
+				}
+			}
+			try {
+				child.kill(signal);
+			} catch {
+				// Already gone.
+			}
+		};
+		// SIGTERM first so the child can flush, then SIGKILL: a wedged child (the
+		// DNS/libuv hang this was written for) ignores the polite signal.
+		const escalate = (): void => {
+			killTree("SIGTERM");
+			killTimer = setTimeout(() => killTree("SIGKILL"), 3_000);
+		};
 		const timer = setTimeout(() => {
 			timedOut = true;
-			child.kill("SIGTERM");
-			killTimer = setTimeout(() => child.kill("SIGKILL"), 3_000);
+			escalate();
 		}, input.timeoutMs);
 		child.on("error", (error) => {
 			clearTimeout(timer);
@@ -161,15 +197,34 @@ function runProcess(input: {
 				stdout,
 				stderr,
 				timedOut,
+				aborted,
 				spawnError: error instanceof Error ? error.message : String(error),
 			});
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			finish({ code, stdout, stderr, timedOut });
+			finish({ code, stdout, stderr, timedOut, aborted });
 		});
 		if (input.signal) {
-			const abort = () => child.kill("SIGTERM");
+			const abort = () => {
+				aborted = true;
+				// Quitting must be immediate: a wedged child ignores SIGTERM, so the
+				// ordinary 3s escalation would make every /quit stall. SIGKILL now; the
+				// `close` event still fires, so the child is reaped before we resolve.
+				killTree("SIGKILL");
+				// `close` waits for the child to exit *and* for stdout/stderr to reach
+				// EOF. A grandchild that left the process group (setsid) survives the
+				// group kill and keeps those pipes open, so `close` would never fire.
+				// Drop our read ends and cap the wait: quitting must not block on
+				// something we cannot reap. A process stuck in uninterruptible sleep
+				// (D state) ignores SIGKILL too, and this cap covers that as well.
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+				abortFallback = setTimeout(
+					() => finish({ code: null, stdout, stderr, timedOut, aborted }),
+					500,
+				);
+			};
 			if (input.signal.aborted) abort();
 			else input.signal.addEventListener("abort", abort, { once: true });
 		}
@@ -199,7 +254,7 @@ class ApmBinaryError extends Error {}
 async function callApm(
 	ctx: ExtensionContext,
 	args: string[],
-	options: { env?: Record<string, string>; timeoutMs?: number } = {},
+	options: { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<ApmResult> {
 	const projectDir = findProjectDir(ctx.cwd);
 	if (!projectDir) {
@@ -214,11 +269,25 @@ async function callApm(
 		cwd: projectDir,
 		env: options.env,
 		timeoutMs: options.timeoutMs ?? 30_000,
+		signal: options.signal,
 	});
 	if (result.spawnError) {
 		throw new ApmBinaryError(
 			`cannot execute \`${bin}\` (${result.spawnError}). Install the apm CLI or pass --apm-bin <path>.`,
 		);
+	}
+	if (result.aborted) {
+		// Session shutdown, not a failure: callers skip diagnostics on this code.
+		return {
+			ok: false,
+			error: {
+				code: "cancelled",
+				message: "apm call cancelled: the session is shutting down",
+				details: {},
+				exitCode: -1,
+			},
+			raw: "",
+		};
 	}
 	const stdout = result.stdout.trim();
 	const stderr = result.stderr.trim();
@@ -278,17 +347,19 @@ function sessionIdOf(ctx: ExtensionContext): string | null {
 	return env && env.trim() ? env : null;
 }
 
-async function loadClaims(ctx: ExtensionContext, sessionId: string): Promise<ClaimSnapshot[]> {
+async function loadClaims(
+	ctx: ExtensionContext,
+	sessionId: string,
+	signal?: AbortSignal,
+): Promise<ClaimSnapshot[]> {
 	// No `--with-tokens`: claim tokens stay in the 0600 session file and are
 	// resolved by the CLI itself. A token must never enter a prompt, a child
 	// argv, or a tool result.
-	const result = await callApm(ctx, [
-		"claims",
-		"--session",
-		sessionId,
-		"--include-expired",
-		"--json",
-	]);
+	const result = await callApm(
+		ctx,
+		["claims", "--session", sessionId, "--include-expired", "--json"],
+		{ signal },
+	);
 	if (!result.ok) return [];
 	return parseClaimListing(result.data);
 }
@@ -301,6 +372,8 @@ interface SideRunReport {
 	ran: boolean;
 	mode: "side-run" | "abort-sync" | "skip";
 	reason: string;
+	/** True when the session shut down and the side-run was cancelled on purpose. */
+	aborted?: boolean;
 	runId: string | null;
 	sessionId: string | null;
 	items: string[];
@@ -333,6 +406,8 @@ async function runSideRun(
 		timeoutMs: number;
 		model?: string;
 		agent: string;
+		/** Aborted when the session shuts down: the child must not outlive it. */
+		signal?: AbortSignal;
 	},
 ): Promise<SideRunOutput> {
 	const systemPrompt = buildSideRunSystemPrompt();
@@ -406,6 +481,11 @@ async function runSideRun(
 		cwd: input.projectDir,
 		env,
 		timeoutMs: input.timeoutMs,
+		signal: input.signal,
+		// A detached child owns a process group, which is how cancellation reaches
+		// the `apm` grandchildren. Windows has no equivalent and would flash a new
+		// console, so it stays attached and relies on the direct kill.
+		detached: process.platform !== "win32",
 	});
 	try {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -413,6 +493,12 @@ async function runSideRun(
 		// best effort
 	}
 	const summary = summarizeSideRunOutput(result.stdout);
+	if (result.aborted) {
+		// The session is going away and the child was killed on purpose. Callers
+		// record this as a cancellation, never as a failure or a timeout.
+		summary.aborted = true;
+		return summary;
+	}
 	if (result.spawnError) summary.errors.push(result.spawnError);
 	if (result.timedOut) summary.errors.push(`side-run timed out after ${input.timeoutMs}ms`);
 	if (result.code !== null && result.code !== 0) {
@@ -438,18 +524,22 @@ async function applyAbortPlan(
 		reason: string;
 		agent: string;
 		meta: string[];
+		signal?: AbortSignal;
 	},
 ): Promise<{ calls: number; errors: string[] }> {
 	const plan = planAbortSync(input);
 	let calls = 0;
 	const errors: string[] = [];
 	for (const call of plan) {
+		if (input.signal?.aborted) break;
 		// Full metadata: the CLI resolves the claim token from this session's file,
 		// and the event carries the run id so reconciliation can see it.
 		const result = await callApm(ctx, [...call.args, ...input.meta], {
 			timeoutMs: 15_000,
+			signal: input.signal,
 		});
 		calls++;
+		if (result.error?.code === "cancelled") break;
 		if (!result.ok) {
 			errors.push(`${call.kind} ${call.identifier}: ${result.error?.code} ${result.error?.message}`);
 			// Best-effort project-level diagnostic: a failed abort sync is exactly
@@ -468,7 +558,7 @@ async function applyAbortPlan(
 					`${call.key}:failed`,
 					"--json",
 				],
-				{ timeoutMs: 15_000 },
+				{ timeoutMs: 15_000, signal: input.signal },
 			).catch(() => undefined);
 		}
 	}
@@ -500,11 +590,14 @@ async function reconcileRun(
 		meta: string[];
 		aborted: boolean;
 		childFailed: boolean;
+		signal?: AbortSignal;
 	},
 ): Promise<{ results: ReconResult[]; errors: string[] }> {
 	if (input.claims.length === 0) return { results: [], errors: [] };
 
-	const events = await callApm(ctx, ["events", "--limit", "1000", "--json", ...input.meta]);
+	const events = await callApm(ctx, ["events", "--limit", "1000", "--json", ...input.meta], {
+		signal: input.signal,
+	});
 	const covered = events.ok
 		? coveredItemIds(
 				((events.data as { events?: unknown[] }).events ?? []) as unknown[],
@@ -514,7 +607,7 @@ async function reconcileRun(
 
 	// Re-read claims so a lease that expired (or was released) during the child
 	// run is treated honestly.
-	const after = await loadClaims(ctx, input.sessionId);
+	const after = await loadClaims(ctx, input.sessionId, input.signal);
 	const afterById = new Map(after.map((claim) => [claim.itemId, claim]));
 	const items = input.claims.map((claim) => {
 		const current = afterById.get(claim.itemId);
@@ -540,17 +633,22 @@ async function reconcileRun(
 	const results: ReconResult[] = [];
 	const errors: string[] = [];
 	for (const step of steps) {
+		if (input.signal?.aborted) break;
 		if (step.action === "skip") {
 			results.push({ identifier: step.identifier, action: step.action, ok: true, code: null });
 			continue;
 		}
-		const result = await callApm(ctx, [...step.args, ...input.meta], { timeoutMs: 15_000 });
+		const result = await callApm(ctx, [...step.args, ...input.meta], {
+			timeoutMs: 15_000,
+			signal: input.signal,
+		});
 		results.push({
 			identifier: step.identifier,
 			action: step.action,
 			ok: result.ok,
 			code: result.ok ? null : (result.error?.code ?? "apm_error"),
 		});
+		if (result.error?.code === "cancelled") break;
 		if (!result.ok) {
 			errors.push(
 				`${step.action} ${step.identifier}: ${result.error?.code ?? "error"} ${result.error?.message ?? ""}`,
@@ -570,7 +668,7 @@ async function reconcileRun(
 					"--json",
 					...input.meta,
 				],
-				{ timeoutMs: 15_000 },
+				{ timeoutMs: 15_000, signal: input.signal },
 			).catch(() => undefined);
 		}
 	}
@@ -730,6 +828,11 @@ function metaArgs(
 	pi.on("agent_settled", async (event, ctx) => {
 		const run = activeRun;
 		activeRun = null;
+		// Declared before the try so every exit path (including the finally) can
+		// clear it. Shutdown aborts it and the signal reaches the child process
+		// group and every `apm` call made on this path.
+		const controller = new AbortController();
+		const signal = controller.signal;
 		try {
 			if (!run) return;
 			const sessionId = sessionIdOf(ctx);
@@ -738,7 +841,13 @@ function metaArgs(
 		// agent's own writes for the same session.
 		const agentFlag = flagString("apm-agent");
 		const agent = agentFlag ? `${agentFlag}-side-run` : "side-run";
-		const timeoutMs = Math.max(15, Number(pi.getFlag("apm-side-run-timeout") ?? "180") || 180) * 1000;
+		// A positive value in seconds; no hidden 15s floor, so
+		// `--apm-side-run-timeout 5` really means five seconds. Anything
+		// unusable falls back to the documented default of 180s.
+		const configuredSeconds = Number(pi.getFlag("apm-side-run-timeout") ?? "180");
+		const timeoutSeconds =
+			Number.isFinite(configuredSeconds) && configuredSeconds > 0 ? configuredSeconds : 180;
+		const timeoutMs = Math.round(timeoutSeconds * 1000);
 
 		// Cheap guards first: never touch the DB for a non-APM project, and never
 		// spawn a side-run from inside a side-run.
@@ -785,6 +894,7 @@ function metaArgs(
 		}
 
 		sideRunInFlight = true;
+		sideRunController = controller;
 		const started = Date.now();
 		const report: SideRunReport = {
 			ran: false,
@@ -802,7 +912,7 @@ function metaArgs(
 		};
 		try {
 			const safeCtx = withBin(ctx);
-			const claims = await loadClaims(safeCtx, sessionId);
+			const claims = await loadClaims(safeCtx, sessionId, signal);
 			const decision = decideRunMode({
 				disabled: pi.getFlag("apm-disabled") === true,
 				env: process.env as Record<string, string | undefined>,
@@ -829,6 +939,7 @@ function metaArgs(
 					sessionId,
 					agent,
 					meta,
+					signal,
 					reason: "run aborted by the user (Escape/interrupt); liveness only, no progress recorded",
 				});
 				// The abort plan is deterministic; reconciliation covers anything it
@@ -841,6 +952,7 @@ function metaArgs(
 					meta,
 					aborted: true,
 					childFailed: false,
+					signal,
 				});
 				report.ran = true;
 				report.calls = outcome.calls;
@@ -867,8 +979,21 @@ function metaArgs(
 				timeoutMs,
 				model: flagString("apm-side-run-model"),
 				agent,
+				signal,
 			});
 			const meta = metaArgs(safeCtx, { sessionId, runId: run.id, agent });
+			if (output.aborted || signal.aborted) {
+				// The session is shutting down and the child was killed on purpose.
+				// Record the truth (cancelled, not failed) and do not reconcile: every
+				// extra `apm` call would block the exit this cancellation exists for.
+				report.mode = "skip";
+				report.reason = "session shutdown: side-run cancelled";
+				report.aborted = true;
+				report.childEvents = output.events;
+				report.durationMs = Date.now() - started;
+				appendReport(pi, report);
+				return;
+			}
 			// Guarantee, not hope: every claimed item must carry an event for this
 			// run, even when the child did nothing or failed.
 			const recon = await reconcileRun(safeCtx, {
@@ -879,7 +1004,21 @@ function metaArgs(
 				meta,
 				aborted: false,
 				childFailed: output.errors.length > 0,
+				signal,
 			});
+			if (signal.aborted) {
+				// Shutdown landed while reconciliation was running: it stopped early, so
+				// this run did NOT sync. Reporting `ran: true` here would render as
+				// "run synced" for a run that wrote nothing — never read as success.
+				report.mode = "skip";
+				report.reason = "session shutdown: reconciliation cancelled";
+				report.aborted = true;
+				report.childEvents = output.events;
+				report.reconciled = recon.results;
+				report.durationMs = Date.now() - started;
+				appendReport(pi, report);
+				return;
+			}
 			report.ran = true;
 			report.childEvents = output.events;
 			report.output = output.text ? redactSecrets(truncateStderr(output.text)) : undefined;
@@ -901,7 +1040,7 @@ function metaArgs(
 						`sr:${sessionId}:${run.id}:project:diag`,
 						"--json",
 					],
-					{ timeoutMs: 15_000 },
+					{ timeoutMs: 15_000, signal },
 				).catch(() => undefined);
 				if (ctx.hasUI) {
 					ctx.ui.notify(
@@ -913,6 +1052,16 @@ function metaArgs(
 		} catch (error) {
 			report.errors.push(error instanceof Error ? error.message : String(error));
 			report.durationMs = Date.now() - started;
+			if (signal.aborted) {
+				// Aborting kills in-flight work, which can surface as an exception; it is
+				// still a cancellation, not a plugin failure.
+				report.mode = "skip";
+				report.reason = "session shutdown: side-run cancelled";
+				report.aborted = true;
+				report.errors = [];
+				appendReport(pi, report);
+				return;
+			}
 			appendReport(pi, report);
 			if (ctx.hasUI) {
 				ctx.ui.notify(
@@ -922,6 +1071,7 @@ function metaArgs(
 			}
 		}
 		} finally {
+			if (sideRunController === controller) sideRunController = null;
 			sideRunInFlight = false;
 			restoreInjectedEnv();
 		}
@@ -929,6 +1079,9 @@ function metaArgs(
 
 	pi.on("session_shutdown", async () => {
 		activeRun = null;
+		// Quitting must not wait for a slow or hung side-run, and the child must not
+		// outlive the session: abort reaches the process group and every apm call.
+		sideRunController?.abort();
 		restoreInjectedEnv();
 		if (pathShim) {
 			process.env.PATH = pathShim.originalPath;

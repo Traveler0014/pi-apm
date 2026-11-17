@@ -1032,3 +1032,226 @@ describe("side-run recovery", () => {
 		expect(detail.item.last_run?.outcome).toBe("completed");
 	});
 });
+
+// ---------------------------------------------------------------------------
+// APM-34: side-run lifecycle (cancellation, timeout, no failure noise)
+// ---------------------------------------------------------------------------
+
+/**
+ * A fake `pi` child that records its own pid and then hangs, ignoring SIGTERM.
+ * Ignoring SIGTERM is the point: only the SIGKILL escalation (and the process
+ * group kill) can end it, exactly like a wedged side-run.
+ */
+function writeWedgedPi(marker: string): string {
+	const dir = tmpdir();
+	const file = path.join(dir, "wedged-pi.cjs");
+	fs.writeFileSync(
+		file,
+		`#!/usr/bin/env node
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+process.on("SIGTERM", () => {});
+process.on("SIGINT", () => {});
+setInterval(() => {}, 1000);
+`,
+		{ mode: 0o755 },
+	);
+	return file;
+}
+
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitFor<T>(
+	what: string,
+	read: () => T | null | undefined,
+	timeoutMs = 10_000,
+): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const value = read();
+		if (value !== null && value !== undefined) return value;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	throw new Error(`timed out waiting for ${what}`);
+}
+
+function readPid(file: string): number | null {
+	try {
+		const raw = fs.readFileSync(file, "utf8").trim();
+		return raw ? Number(raw) : null;
+	} catch {
+		return null;
+	}
+}
+
+describe("side-run lifecycle", () => {
+	it("kills an in-flight side-run on shutdown instead of blocking the exit", { timeout: 60_000 }, async () => {
+		const p = project();
+		const marker = path.join(p.dir, "wedged.pid");
+		const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "120" });
+		extension(api as unknown as Parameters<typeof extension>[0]);
+		const ctx = fakeCtx(p.dir, p.sessionId);
+
+		await withEnv(
+			{
+				APM_BIN: apmBin,
+				APM_SIDE_RUN_PI: writeWedgedPi(marker),
+				APM_DB: path.join(p.dir, ".apm", "apm.db"),
+			},
+			async () => {
+				await fire(api, "agent_start", {}, ctx);
+				await fire(api, "agent_end", { messages: [{ role: "user", content: "hang please" }] }, ctx);
+				// Do not await: the side-run must still be in flight when shutdown runs.
+				const settled = fire(api, "agent_settled", { aborted: false }, ctx);
+				const pid = await waitFor("the side-run child to start", () => readPid(marker));
+				expect(isAlive(pid)).toBe(true);
+
+				await fire(api, "session_shutdown", {}, ctx);
+				const started = Date.now();
+				await settled;
+				const elapsed = Date.now() - started;
+
+				// The child ignores SIGTERM, and shutdown sends SIGKILL directly, so
+				// quitting is immediate rather than waiting for a 3s escalation. The
+				// bound is 5s (acceptance: settled within 5s) because the full suite
+				// runs several child processes in parallel and CPU contention can add
+				// scheduler latency; the 120s timeout it must never reach is the real
+				// failure this guards against.
+				expect(elapsed).toBeLessThan(5_000);
+				expect(isAlive(pid)).toBe(false);
+			},
+		);
+
+		const report = lastReport(api) as
+			| { mode: string; aborted?: boolean; errors: string[]; reason: string }
+			| undefined;
+		expect(report?.aborted).toBe(true);
+		expect(report?.mode).toBe("skip");
+		expect(report?.reason).toContain("shutdown");
+		expect(report?.errors).toEqual([]);
+		// Cancellation is not a failure: no diagnostic noise in the ledger.
+		const kinds = eventsOf(p.dir).map((event) => event.kind);
+		expect(kinds).not.toContain("diagnostic");
+	});
+
+	it("honours a small --apm-side-run-timeout instead of a hidden 15s floor", { timeout: 60_000 }, async () => {
+		const p = project();
+		const marker = path.join(p.dir, "timeout.pid");
+		const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "2" });
+		extension(api as unknown as Parameters<typeof extension>[0]);
+		const ctx = fakeCtx(p.dir, p.sessionId);
+
+		let elapsed = 0;
+		await withEnv(
+			{
+				APM_BIN: apmBin,
+				APM_SIDE_RUN_PI: writeWedgedPi(marker),
+				APM_DB: path.join(p.dir, ".apm", "apm.db"),
+			},
+			async () => {
+				await fire(api, "agent_start", {}, ctx);
+				await fire(api, "agent_end", { messages: [{ role: "user", content: "hang please" }] }, ctx);
+				const started = Date.now();
+				await fire(api, "agent_settled", { aborted: false }, ctx);
+				elapsed = Date.now() - started;
+				const pid = readPid(marker);
+				expect(pid).not.toBeNull();
+				expect(isAlive(pid as number)).toBe(false);
+			},
+		);
+
+		// 2s timeout + 3s SIGKILL escalation; a 15s floor would exceed this bound.
+		expect(elapsed).toBeLessThan(12_000);
+		expect(elapsed).toBeGreaterThanOrEqual(1_500);
+		const report = lastReport(api);
+		expect(report?.errors.some((error) => error.includes("timed out"))).toBe(true);
+	});
+});
+
+/**
+ * A fake `pi` child that first spawns a grandchild which leaves the process
+ * group (`setsid`) while inheriting stdout/stderr, then hangs itself.
+ *
+ * This is the failure mode a plain process-group kill cannot fix: the escaped
+ * grandchild keeps the pipe write ends open, so Node's `close` event (which
+ * waits for stdio EOF) never fires. Cancellation must therefore also drop our
+ * read ends and cap the wait, or quitting blocks forever.
+ */
+function writeEscapingPi(marker: string, escapeeMarker: string): string {
+	const dir = tmpdir();
+	const file = path.join(dir, "escaping-pi.sh");
+	fs.writeFileSync(
+		file,
+		`#!/bin/sh
+setsid sh -c 'echo $$ > ${escapeeMarker}; exec sleep 300' &
+echo $$ > ${marker}
+exec sleep 300
+`,
+		{ mode: 0o755 },
+	);
+	return file;
+}
+
+function killPid(pid: number): void {
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		// already gone
+	}
+}
+
+describe("side-run cancellation with an escaped grandchild", () => {
+	it.skipIf(process.platform === "win32")(
+		"returns promptly when a grandchild outside the process group holds the pipes",
+		{ timeout: 60_000 },
+		async () => {
+			const p = project();
+			const marker = path.join(p.dir, "escaping.pid");
+			const escapeeMarker = path.join(p.dir, "escapee.pid");
+			const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "120" });
+			extension(api as unknown as Parameters<typeof extension>[0]);
+			const ctx = fakeCtx(p.dir, p.sessionId);
+			let escapee: number | null = null;
+
+			try {
+				await withEnv(
+					{
+						APM_BIN: apmBin,
+						APM_SIDE_RUN_PI: writeEscapingPi(marker, escapeeMarker),
+						APM_DB: path.join(p.dir, ".apm", "apm.db"),
+					},
+					async () => {
+						await fire(api, "agent_start", {}, ctx);
+						await fire(api, "agent_end", { messages: [{ role: "user", content: "escape" }] }, ctx);
+						const settled = fire(api, "agent_settled", { aborted: false }, ctx);
+						await waitFor("the side-run child to start", () => readPid(marker));
+						escapee = await waitFor("the escaped grandchild to start", () => readPid(escapeeMarker));
+						// The grandchild is outside the killed process group, so only the
+						// pipe destroy + fallback timer can unblock `close`.
+						expect(isAlive(escapee)).toBe(true);
+
+						await fire(api, "session_shutdown", {}, ctx);
+						const started = Date.now();
+						await settled;
+						// Same 5s acceptance bound as the wedged-child test: an escaped
+				// grandchild must not hold `close` until the 120s timeout.
+				expect(Date.now() - started).toBeLessThan(5_000);
+					},
+				);
+			} finally {
+				if (escapee !== null) killPid(escapee);
+			}
+
+			const report = lastReport(api) as { mode: string; aborted?: boolean } | undefined;
+			expect(report?.aborted).toBe(true);
+			expect(report?.mode).toBe("skip");
+		},
+	);
+});

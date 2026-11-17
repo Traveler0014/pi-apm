@@ -660,6 +660,8 @@ export interface SideRunOutput {
 	text: string;
 	errors: string[];
 	events: number;
+	/** The child was killed because the session shut down, not because it failed. */
+	aborted?: boolean;
 }
 
 /**

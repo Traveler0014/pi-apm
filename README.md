@@ -505,7 +505,7 @@ session file, and the tools just add `--session`.
 | `--apm-bin <path>` | `$APM_BIN` or `apm` | CLI binary |
 | `--apm-agent <name>` | `pi` | actor name for tool writes (the side-run appends `-side-run`) |
 | `--apm-disabled` | false | keep the tools, disable the run-end side-run |
-| `--apm-side-run-timeout <s>` | `180` | hard timeout for the child |
+| `--apm-side-run-timeout <s>` | `180` | hard timeout for the child (exact: no hidden minimum, so `5` really means 5s) |
 | `--apm-side-run-model <m>` | inherit | cheaper/faster model for the side-run |
 
 Environment: `APM_BIN`, `APM_SIDE_RUN=1` (set by the plugin for the child;
@@ -580,6 +580,16 @@ broken plugin cannot break the main reply.
   batching across sessions.
 - A side-run that hangs is killed after the timeout, and the partial writes it
   already made remain (they are idempotent, not transactional across CLI calls).
+- **Quitting never waits for a side-run.** `session_shutdown` aborts the in-flight
+  side-run: the child is killed through its own process group with SIGKILL
+  immediately (a wedged child ignores SIGTERM, and waiting 3s would stall every
+  `/quit`), so `apm` grandchildren cannot escape either. The ordinary timeout path
+  still escalates politely (SIGTERM, SIGKILL after 3s). In-flight `apm` calls are
+  cancelled too. The run-sync entry is recorded as `skipped` + `aborted: true`
+  (reason "session shutdown"), including when the shutdown lands during
+  reconciliation — a run that wrote nothing must never render as `run synced`.
+  Cancellation is not a failure, so no `side_run_failed` diagnostic is written and
+  no warning is shown.
 - The main agent's tools do not retry `version_conflict` automatically; they
   return the structured conflict so the model can re-read and retry.
 - `apm-run-sync` entries are rendered as a compact TUI card (mode, items,
@@ -634,7 +644,7 @@ reconciled items, six errors, six output lines and the metadata line:
 | `[apm] run synced` | the side-run ran and reconciled the session's claims |
 | `[apm] run synced with N issue(s)` | it ran, but the child reported N errors (see `!` lines) |
 | `[apm] run not synced` / `… with N issue(s)` | it did **not** sync: ran=false, e.g. a timeout. Never reads as success |
-| `[apm] skipped (…)` + reason | nothing was claimed, recursion guard, or the side-run is disabled |
+| `[apm] skipped (…)` + reason | nothing was claimed, recursion guard, the side-run is disabled, or the session shut down before it finished (`aborted: true`, including a shutdown during reconciliation) |
 | `aborted run · liveness only` | the run was aborted; only a liveness sync was recorded, never progress |
 | `duration · N item(s) · run …` | wall time, how many claims were in play, short run id |
 | `items: …` | the item identifiers this run touched (`+N more` beyond six) |
