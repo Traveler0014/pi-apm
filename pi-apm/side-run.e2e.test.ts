@@ -1041,8 +1041,13 @@ describe("side-run recovery", () => {
  * A fake `pi` child that records its own pid and then hangs, ignoring SIGTERM.
  * Ignoring SIGTERM is the point: only the SIGKILL escalation (and the process
  * group kill) can end it, exactly like a wedged side-run.
+ *
+ * Every SIGTERM it receives is recorded in `termMarker`. Cancellation kills it
+ * with SIGKILL directly, so the marker must stay absent: that is a mechanism
+ * assertion ("no graceful escalation happened"), not a wall-clock threshold, and
+ * it cannot be shaken by CPU contention.
  */
-function writeWedgedPi(marker: string): string {
+function writeWedgedPi(marker: string, termMarker: string): string {
 	const dir = tmpdir();
 	const file = path.join(dir, "wedged-pi.cjs");
 	fs.writeFileSync(
@@ -1050,7 +1055,9 @@ function writeWedgedPi(marker: string): string {
 		`#!/usr/bin/env node
 const fs = require("node:fs");
 fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));
-process.on("SIGTERM", () => {});
+process.on("SIGTERM", () => {
+	fs.writeFileSync(${JSON.stringify(termMarker)}, "sigterm");
+});
 process.on("SIGINT", () => {});
 setInterval(() => {}, 1000);
 `,
@@ -1095,6 +1102,7 @@ describe("side-run lifecycle", () => {
 	it("kills an in-flight side-run on shutdown instead of blocking the exit", { timeout: 60_000 }, async () => {
 		const p = project();
 		const marker = path.join(p.dir, "wedged.pid");
+		const termMarker = path.join(p.dir, "wedged.sigterm");
 		const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "120" });
 		extension(api as unknown as Parameters<typeof extension>[0]);
 		const ctx = fakeCtx(p.dir, p.sessionId);
@@ -1102,7 +1110,7 @@ describe("side-run lifecycle", () => {
 		await withEnv(
 			{
 				APM_BIN: apmBin,
-				APM_SIDE_RUN_PI: writeWedgedPi(marker),
+				APM_SIDE_RUN_PI: writeWedgedPi(marker, termMarker),
 				APM_DB: path.join(p.dir, ".apm", "apm.db"),
 			},
 			async () => {
@@ -1118,14 +1126,19 @@ describe("side-run lifecycle", () => {
 				await settled;
 				const elapsed = Date.now() - started;
 
-				// The child ignores SIGTERM, and shutdown sends SIGKILL directly, so
-				// quitting is immediate rather than waiting for a 3s escalation. The
-				// bound is 5s (acceptance: settled within 5s) because the full suite
-				// runs several child processes in parallel and CPU contention can add
-				// scheduler latency; the 120s timeout it must never reach is the real
-				// failure this guards against.
-				expect(elapsed).toBeLessThan(5_000);
+				// Mechanism assertion first: the abort path must kill with SIGKILL and
+				// never send the graceful SIGTERM of the 3s escalation. The child records
+				// any SIGTERM it receives, so an absent marker proves the escalation path
+				// was not taken. This is what a timing bound cannot prove: SIGTERM + 3s +
+				// SIGKILL would still settle in ~3s and pass a 5s wall-clock check.
+				expect(fs.existsSync(termMarker)).toBe(false);
 				expect(isAlive(pid)).toBe(false);
+
+				// Then the coarse "must not hang" upper bound. It stays at 5s because the
+				// full suite runs several child processes in parallel and CPU contention
+				// can add scheduler latency; the real regression it guards against is
+				// waiting for the 120s timeout (or forever).
+				expect(elapsed).toBeLessThan(5_000);
 			},
 		);
 
@@ -1152,7 +1165,7 @@ describe("side-run lifecycle", () => {
 		await withEnv(
 			{
 				APM_BIN: apmBin,
-				APM_SIDE_RUN_PI: writeWedgedPi(marker),
+				APM_SIDE_RUN_PI: writeWedgedPi(marker, path.join(p.dir, "timeout.sigterm")),
 				APM_DB: path.join(p.dir, ".apm", "apm.db"),
 			},
 			async () => {
@@ -1183,16 +1196,20 @@ describe("side-run lifecycle", () => {
  * grandchild keeps the pipe write ends open, so Node's `close` event (which
  * waits for stdio EOF) never fires. Cancellation must therefore also drop our
  * read ends and cap the wait, or quitting blocks forever.
+ *
+ * A SIGTERM trap records a marker, so the test can also prove that cancellation
+ * killed this child with SIGKILL instead of descending the graceful escalation.
  */
-function writeEscapingPi(marker: string, escapeeMarker: string): string {
+function writeEscapingPi(marker: string, escapeeMarker: string, termMarker: string): string {
 	const dir = tmpdir();
 	const file = path.join(dir, "escaping-pi.sh");
 	fs.writeFileSync(
 		file,
 		`#!/bin/sh
+trap 'echo sigterm > ${termMarker}; exit 0' TERM
 setsid sh -c 'echo $$ > ${escapeeMarker}; exec sleep 300' &
 echo $$ > ${marker}
-exec sleep 300
+sleep 300 & wait
 `,
 		{ mode: 0o755 },
 	);
@@ -1215,6 +1232,7 @@ describe("side-run cancellation with an escaped grandchild", () => {
 			const p = project();
 			const marker = path.join(p.dir, "escaping.pid");
 			const escapeeMarker = path.join(p.dir, "escapee.pid");
+			const termMarker = path.join(p.dir, "escaping.sigterm");
 			const api = fakeApi({ "apm-agent": "agent-a", "apm-side-run-timeout": "120" });
 			extension(api as unknown as Parameters<typeof extension>[0]);
 			const ctx = fakeCtx(p.dir, p.sessionId);
@@ -1224,7 +1242,7 @@ describe("side-run cancellation with an escaped grandchild", () => {
 				await withEnv(
 					{
 						APM_BIN: apmBin,
-						APM_SIDE_RUN_PI: writeEscapingPi(marker, escapeeMarker),
+						APM_SIDE_RUN_PI: writeEscapingPi(marker, escapeeMarker, termMarker),
 						APM_DB: path.join(p.dir, ".apm", "apm.db"),
 					},
 					async () => {
@@ -1240,9 +1258,23 @@ describe("side-run cancellation with an escaped grandchild", () => {
 						await fire(api, "session_shutdown", {}, ctx);
 						const started = Date.now();
 						await settled;
-						// Same 5s acceptance bound as the wedged-child test: an escaped
-				// grandchild must not hold `close` until the 120s timeout.
-				expect(Date.now() - started).toBeLessThan(5_000);
+						const elapsed = Date.now() - started;
+
+						// Mechanism assertions (APM-36). Reaching this line at all means
+						// `settle` resolved; the two facts below say *why*:
+						//
+						// 1. No SIGTERM reached the child: cancellation used SIGKILL directly,
+						//    it did not enter the 3s graceful escalation.
+						expect(fs.existsSync(termMarker)).toBe(false);
+						// 2. The escapee is still running. `close` was therefore unblocked by
+						//    destroying our pipe read ends plus the 500ms abort fallback, not
+						//    by the escapee exiting (it would `sleep 300`). This is what a
+						//    timing bound alone cannot prove.
+						expect(isAlive(escapee as number)).toBe(true);
+
+						// Then the coarse "must not hang" bound: an escaped grandchild must
+						// not hold `close` until the 120s timeout.
+						expect(elapsed).toBeLessThan(5_000);
 					},
 				);
 			} finally {
