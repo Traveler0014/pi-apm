@@ -52,6 +52,10 @@ pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// the largest thing a caller sends.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the browser has to exchange its startup ticket. A minute is enough
+/// for a slow browser to cold-start, and short enough that a stale URL in a
+/// terminal scrollback or CI log is useless.
+pub const DEFAULT_BOOTSTRAP_TTL: Duration = Duration::from_secs(60);
 const SESSION_HEADER: &str = "x-apm-session";
 
 // ---------------------------------------------------------------------------
@@ -78,6 +82,15 @@ pub struct RestConfig {
     /// Injected clock for tests/demos (same seam as the CLI's hidden `--now`):
     /// lets a lease expire deterministically instead of by sleeping.
     pub now: Option<i64>,
+    /// Serve the embedded dashboard (`/ui`) and the `/api/*` aliases.
+    /// `apm-serve` leaves it off; `apm ui` turns it on.
+    pub ui: bool,
+    /// One-time bootstrap ticket handed to the browser in the URL fragment.
+    /// It is exchanged for [`RestConfig::token`] at `POST /api/bootstrap` and
+    /// then burned; the real token never appears in a URL or a log line.
+    pub bootstrap_ticket: Option<String>,
+    /// Lifetime of the bootstrap ticket from server start.
+    pub bootstrap_ttl: Duration,
 }
 
 impl RestConfig {
@@ -93,6 +106,9 @@ impl RestConfig {
             token: String::new(),
             read_timeout: DEFAULT_TIMEOUT,
             now: None,
+            ui: false,
+            bootstrap_ticket: None,
+            bootstrap_ttl: DEFAULT_BOOTSTRAP_TTL,
         }
     }
 }
@@ -264,6 +280,15 @@ struct State {
     /// another caller's write (the audit trail would silently blame the wrong
     /// session).
     held_tokens: Mutex<BTreeMap<(String, String), String>>,
+    /// The one-time dashboard bootstrap ticket: handed out in the URL fragment,
+    /// exchanged once for the bearer token, then dead.
+    bootstrap: Mutex<Bootstrap>,
+}
+
+struct Bootstrap {
+    ticket: String,
+    expires_at: i64,
+    consumed: bool,
 }
 
 impl RestServer {
@@ -288,6 +313,13 @@ impl RestServer {
         let tokens = TokenStore::new(store.data_dir());
         let listener = TcpListener::bind(addr)
             .map_err(|e| Error::Internal(format!("cannot bind {addr}: {e}")))?;
+        let expires_at =
+            config.now.unwrap_or_else(now_ms) + config.bootstrap_ttl.as_millis() as i64;
+        let bootstrap = Bootstrap {
+            ticket: config.bootstrap_ticket.clone().unwrap_or_default(),
+            expires_at,
+            consumed: false,
+        };
         Ok(RestServer {
             listener,
             state: Arc::new(State {
@@ -295,6 +327,7 @@ impl RestServer {
                 tokens,
                 config,
                 held_tokens: Mutex::new(BTreeMap::new()),
+                bootstrap: Mutex::new(bootstrap),
             }),
         })
     }
@@ -340,29 +373,95 @@ struct Request {
 
 struct Response {
     status: u16,
-    body: Value,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// Cache policy for a response body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cache {
+    NoStore,
+    /// Content-hashed bundle assets: safe to cache for a year.
+    Immutable,
 }
 
 impl Response {
     fn ok(body: Value) -> Response {
-        Response { status: 200, body }
+        Response::json(200, body)
+    }
+
+    fn json(status: u16, body: Value) -> Response {
+        let bytes = serde_json::to_vec_pretty(&body).unwrap_or_else(|_| b"{}".to_vec());
+        Response::bytes(
+            status,
+            "application/json; charset=utf-8",
+            Cache::NoStore,
+            bytes,
+        )
+    }
+
+    fn bytes(status: u16, mime: &str, cache: Cache, body: Vec<u8>) -> Response {
+        let cache_header = match cache {
+            Cache::NoStore => "no-store",
+            Cache::Immutable => "public, max-age=31536000, immutable",
+        };
+        Response {
+            status,
+            headers: vec![
+                ("Content-Type".to_string(), mime.to_string()),
+                ("Cache-Control".to_string(), cache_header.to_string()),
+                ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+                ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+            ],
+            body,
+        }
+    }
+
+    /// A static (or redirect) response that carries the dashboard security
+    /// headers. Only `/ui` responses need the CSP, but sending it everywhere is
+    /// harmless and means a misrouted asset can never be rendered as a document.
+    fn ui_bytes(status: u16, mime: &str, cache: Cache, body: Vec<u8>) -> Response {
+        let mut response = Response::bytes(status, mime, cache, body);
+        response.headers.push((
+            "Content-Security-Policy".to_string(),
+            crate::ui::CSP.to_string(),
+        ));
+        response.headers.push((
+            "Cross-Origin-Resource-Policy".to_string(),
+            "same-origin".to_string(),
+        ));
+        response.headers.push((
+            "Cross-Origin-Opener-Policy".to_string(),
+            "same-origin".to_string(),
+        ));
+        response
+    }
+
+    fn redirect(status: u16, location: &str) -> Response {
+        let mut response = Response::ui_bytes(
+            status,
+            "text/plain; charset=utf-8",
+            Cache::NoStore,
+            Vec::new(),
+        );
+        response
+            .headers
+            .push(("Location".to_string(), location.to_string()));
+        response
     }
 
     fn error(status: u16, code: &str, message: impl Into<String>) -> Response {
-        Response {
+        Response::json(
             status,
-            body: json!({
+            json!({
                 "ok": false,
                 "error": { "code": code, "message": message.into(), "status": status }
             }),
-        }
+        )
     }
 
     fn domain(err: &Error) -> Response {
-        Response {
-            status: status_for(err),
-            body: err.to_json(),
-        }
+        Response::json(status_for(err), err.to_json())
     }
 }
 
@@ -498,17 +597,18 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, RouteErr
 }
 
 fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
-    let body = serde_json::to_vec_pretty(&response.body)?;
     let reason = reason_phrase(response.status);
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-        response.status,
-        reason,
-        body.len()
-    );
+    let mut head = format!("HTTP/1.1 {} {reason}\r\n", response.status);
+    for (name, value) in &response.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        response.body.len()
+    ));
     stream
         .write_all(head.as_bytes())
-        .and_then(|()| stream.write_all(&body))
+        .and_then(|()| stream.write_all(&response.body))
         .and_then(|()| stream.flush())
         .map_err(|e| Error::Internal(format!("cannot write the response: {e}")))
 }
@@ -516,6 +616,9 @@ fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -575,8 +678,9 @@ fn route(request: &Request, state: &State) -> Response {
         .collect();
 
     // Health is the only unauthenticated endpoint, and it says nothing about the
-    // ledger: it exists so a supervisor can tell "up" from "down".
-    if segments.as_slice() == ["health"] && request.method == "GET" {
+    // ledger: it exists so a supervisor can tell "up" from "down". `/api/health`
+    // is the same thing under the UI's prefix.
+    if matches!(segments.as_slice(), ["health"] | ["api", "health"]) && request.method == "GET" {
         return Response::ok(json!({
             "ok": true,
             "service": "apm-rest",
@@ -584,25 +688,30 @@ fn route(request: &Request, state: &State) -> Response {
         }));
     }
 
+    // Browsers request a favicon for every page. Answer it without auth (it is
+    // not ledger data) so the console stays clean; 204 means "no icon".
+    if request.path == "/favicon.ico" && request.method == "GET" {
+        return Response::bytes(204, "image/x-icon", Cache::NoStore, Vec::new());
+    }
+
     // Local-access protection. Order matters: host/origin checks explain *why* a
     // request from a browser is refused before the token check hides it.
-    if let Some(origin) = request.headers.get("origin") {
-        return Response::error(
-            403,
-            "forbidden_origin",
-            format!(
-                "browser-origin requests are refused (Origin: {origin}); this is a local, non-browser API"
-            ),
-        );
+    if let Some(response) = guard_local(request) {
+        return response;
     }
-    if let Some(host) = request.headers.get("host")
-        && !host_names_loopback(host)
-    {
-        return Response::error(
-            403,
-            "forbidden_host",
-            format!("Host {host} is not loopback; refusing to serve it"),
-        );
+
+    // The dashboard: static assets embedded at compile time. No bearer token —
+    // the page has to load before it can read the fragment token — but the same
+    // Host/Origin guards and a strict CSP apply. Only enabled by `apm ui`.
+    if segments.is_empty() || segments.first() == Some(&"ui") {
+        return serve_ui(request, state, &segments);
+    }
+
+    // One-time exchange of the URL-fragment ticket for the bearer token. The
+    // ticket is not a session: it works once, within its TTL, and only from a
+    // same-origin caller (the guard above already ran).
+    if segments.as_slice() == ["api", "bootstrap"] {
+        return bootstrap(request, state);
     }
     let Some(auth) = request.headers.get("authorization") else {
         return Response::error(
@@ -629,11 +738,28 @@ fn route(request: &Request, state: &State) -> Response {
         .or_else(|| state.config.session.clone())
         .unwrap_or_else(|| "rest".to_string());
 
+    // `/api/*` is a 1:1 alias of the REST routes below: the frontend fetches
+    // absolute `/api/items` paths so its own mount point (`/ui/`) never leaks
+    // into the API layer.
+    let api: &[&str] = if segments.first() == Some(&"api") {
+        &segments[1..]
+    } else {
+        &segments[..]
+    };
+    if api.is_empty() {
+        return Response::error(
+            404,
+            "not_found",
+            format!("no route for {} {}", request.method, request.path),
+        );
+    }
+
     // Method check first, so a wrong verb on a real path is 405 (not 404) and a
     // genuinely unknown path is 404 regardless of the verb.
-    let allowed: &[&str] = match segments.as_slice() {
+    let allowed: &[&str] = match api {
         ["dashboard"] | ["items"] | ["claims"] => &["GET"],
         ["items", _] => &["GET"],
+        ["items", _, "events"] => &["GET"],
         ["items", _, "claim" | "release" | "progress" | "status"] => &["POST"],
         _ => {
             return Response::error(
@@ -656,10 +782,11 @@ fn route(request: &Request, state: &State) -> Response {
         );
     }
 
-    let outcome = match (request.method.as_str(), segments.as_slice()) {
+    let outcome = match (request.method.as_str(), api) {
         ("GET", ["dashboard"]) => dashboard(request, state),
         ("GET", ["items"]) => list_items(request, state),
         ("GET", ["items", id]) => get_item(id, state),
+        ("GET", ["items", id, "events"]) => item_events(id, request, state),
         ("GET", ["claims"]) => claims(request, state, &session),
         ("POST", ["items", id, "claim"]) => claim(id, request, state, &session),
         ("POST", ["items", id, "release"]) => release(id, request, state, &session),
@@ -678,6 +805,187 @@ fn route(request: &Request, state: &State) -> Response {
         Ok(response) => response,
         Err(err) => Response::domain(&err),
     }
+}
+
+/// Host/Origin guards shared by the API and the dashboard.
+///
+/// Browsers omit `Origin` on same-origin GETs, so a read-only dashboard works
+/// unchanged; a request that *does* carry one must come from this very server
+/// (scheme `http` plus the same authority). That blocks cross-site requests and
+/// DNS-rebinding pages while still allowing the UI's own future writes.
+fn guard_local(request: &Request) -> Option<Response> {
+    if let Some(origin) = request.headers.get("origin") {
+        let host = request
+            .headers
+            .get("host")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !origin_matches_host(origin, host) {
+            return Some(Response::error(
+                403,
+                "forbidden_origin",
+                format!(
+                    "origin {origin} is not this server ({host}); cross-origin browser                      requests are refused"
+                ),
+            ));
+        }
+    }
+    if let Some(host) = request.headers.get("host")
+        && !host_names_loopback(host)
+    {
+        return Some(Response::error(
+            403,
+            "forbidden_host",
+            format!("Host {host} is not loopback; refusing to serve it"),
+        ));
+    }
+    None
+}
+
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let authority = authority.trim_end_matches('/');
+    scheme.eq_ignore_ascii_case("http") && !host.is_empty() && authority.eq_ignore_ascii_case(host)
+}
+
+/// Serve the embedded dashboard: `GET /` redirects to `/ui/`, assets come from
+/// the compile-time table, and extension-less paths fall back to the index so a
+/// client-side route reload still works. The table lookup is by exact name, so
+/// path traversal cannot escape: there is no file system access at all.
+fn serve_ui(request: &Request, state: &State, segments: &[&str]) -> Response {
+    if !state.config.ui {
+        return Response::error(
+            404,
+            "not_found",
+            format!(
+                "no route for {} {} (start `apm ui` to serve the dashboard)",
+                request.method, request.path
+            ),
+        );
+    }
+    if request.method != "GET" {
+        return Response::error(
+            405,
+            "method_not_allowed",
+            format!(
+                "the dashboard is read-only; {} is not allowed",
+                request.method
+            ),
+        );
+    }
+    if segments.is_empty() {
+        return Response::redirect(302, "/ui/");
+    }
+    // Canonical trailing slash: relative URLs in the document resolve under
+    // `/ui/`, not at the server root.
+    if request.path == "/ui" {
+        return Response::redirect(301, "/ui/");
+    }
+    let rest = &segments[1..];
+    if rest.is_empty() {
+        return index_response();
+    }
+    if rest.iter().any(|segment| {
+        matches!(*segment, "." | "..") || segment.contains('\\') || segment.contains('\0')
+    }) {
+        return Response::error(400, "bad_path", "invalid path segment");
+    }
+    let joined = rest.join("/");
+    if let Some(asset) = crate::ui::find(&joined) {
+        let cache = if joined.starts_with("assets/") {
+            Cache::Immutable
+        } else {
+            Cache::NoStore
+        };
+        return Response::ui_bytes(200, asset.mime, cache, asset.bytes.to_vec());
+    }
+    // Client-side route (no extension) → index; a missing asset → 404.
+    if !rest.last().is_some_and(|last| last.contains('.')) {
+        return index_response();
+    }
+    Response::error(404, "not_found", format!("no embedded asset {joined}"))
+}
+
+/// Exchange the one-time bootstrap ticket for the process-scoped bearer token.
+///
+/// The ticket arrives in the JSON body (`{"ticket":"…"}`) or, for scripts, as
+/// `Authorization: Bearer <ticket>`. It is burned on success, so replaying a URL
+/// from a log or a terminal scrollback cannot mint another token.
+fn bootstrap(request: &Request, state: &State) -> Response {
+    if !state.config.ui {
+        return Response::error(
+            404,
+            "not_found",
+            "the dashboard bootstrap endpoint requires `apm ui`",
+        );
+    }
+    if request.method != "POST" {
+        return Response::error(
+            405,
+            "method_not_allowed",
+            format!(
+                "{} is not allowed on /api/bootstrap (use POST)",
+                request.method
+            ),
+        );
+    }
+    let from_body = serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|body| {
+            body.get("ticket")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let from_header = request
+        .headers
+        .get("authorization")
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .map(|token| token.trim().to_string());
+    let Some(ticket) = from_body.or(from_header) else {
+        return Response::error(
+            401,
+            "invalid_ticket",
+            "missing bootstrap ticket (send {\"ticket\": \"…\"})",
+        );
+    };
+
+    let mut guard = match state.bootstrap.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.ticket.is_empty() || !constant_time_eq(ticket.as_bytes(), guard.ticket.as_bytes()) {
+        return Response::error(401, "invalid_ticket", "unknown bootstrap ticket");
+    }
+    if guard.consumed {
+        return Response::error(
+            409,
+            "ticket_consumed",
+            "this bootstrap ticket was already exchanged; re-run `apm ui` for a new URL",
+        );
+    }
+    if state.now() >= guard.expires_at {
+        return Response::error(
+            401,
+            "ticket_expired",
+            "this bootstrap ticket expired; re-run `apm ui` for a new URL",
+        );
+    }
+    guard.consumed = true;
+    Response::json(
+        200,
+        json!({
+            "ok": true,
+            "token": state.config.token,
+            "token_type": "Bearer",
+        }),
+    )
+}
+
+fn index_response() -> Response {
+    let index = crate::ui::index();
+    Response::ui_bytes(200, index.mime, Cache::NoStore, index.bytes.to_vec())
 }
 
 fn host_names_loopback(host: &str) -> bool {
@@ -776,6 +1084,21 @@ fn get_item(id: &str, state: &State) -> Result<Response> {
     let at = state.now();
     let detail = with_store(state, |store| store.get_item(id, at))?;
     Ok(Response::ok(json!({ "ok": true, "item": detail })))
+}
+
+/// Recent audit entries for one item. Read-only, newest window last (the same
+/// order `apm events <item>` prints), capped so a UI refresh cannot pull the
+/// whole history.
+fn item_events(id: &str, request: &Request, state: &State) -> Result<Response> {
+    let limit = int_param(&request.query, "limit")?
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let events = with_store(state, |store| store.item_events(id, limit))?;
+    Ok(Response::ok(json!({
+        "ok": true,
+        "count": events.len(),
+        "events": events,
+    })))
 }
 
 fn claims(request: &Request, state: &State, default_session: &str) -> Result<Response> {
@@ -1177,7 +1500,8 @@ mod tests {
         assert_eq!(status_for(&Error::invalid("bad")), 400);
         let response = Response::domain(&Error::invalid("bad"));
         assert_eq!(response.status, 400);
-        assert_eq!(response.body["error"]["code"], json!("invalid_input"));
+        let body: Value = serde_json::from_slice(&response.body).expect("json body");
+        assert_eq!(body["error"]["code"], json!("invalid_input"));
     }
 
     #[test]

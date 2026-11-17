@@ -794,6 +794,53 @@ bash scripts/stress.sh 10        # CLI-only baseline
 
 ---
 
+### 8.6 Local dashboard: `apm ui` (optional)
+
+`apm ui` serves a read-only dashboard from the same loopback REST process. It is
+a convenience shell, not a second service: the page reads `/api/*` (the REST
+handlers), nothing is cached in a database of its own, and the CLI/MCP paths
+keep working while it is closed.
+
+```bash
+apm ui                      # random loopback port, opens your browser
+apm ui --port 7717          # fixed port
+apm ui --no-open            # print the URL instead of opening a browser
+# Ctrl-C stops it; nothing is left running and no state is written
+```
+
+The printed `ui:` URL carries a **one-time bootstrap ticket** (`#ticket=…`,
+60 s, single use), never the bearer token. The page exchanges it at
+`POST /api/bootstrap`, keeps the token in memory only, and strips the fragment
+immediately. Reloading the consumed URL therefore fails on purpose — rerun
+`apm ui` for a fresh one. Static assets are compiled into the binary
+(`ui/dist`, built with `just ui-build`), so users never need Node.
+
+Security boundaries: loopback only unless `--allow-remote`; `Host` must be
+loopback; an `Origin` header must match this server exactly (`http` + same
+authority); the token never appears in HTML, static assets, the URL query,
+`localStorage`, `sessionStorage`, cookies or the startup logs; every `/ui`
+response carries a strict CSP (`default-src 'none'`, `'self'` only, no inline
+scripts or styles, no remote resources).
+
+Refreshing: the dashboard polls every 4 s (well under the 5 s budget), `R` or
+the **Refresh** button forces an immediate refresh, the **Recently done** fold
+stays folded until opened, and filters/sort/search survive both refreshes and
+temporary disconnects. When a poll fails, the header switches to
+`offline · cached <time>` while keeping the last good data; the next successful
+poll clears it. A restarted server mints a new token, so the page shows a
+"session expired — rerun `apm ui`" state instead of retrying forever.
+
+Troubleshooting and the full protocol live in [`docs/ui.md`](docs/ui.md)
+(ticket lifecycle, error codes, CSP, embedded assets, route table). Verify the
+whole path with:
+
+```bash
+just verify        # Rust + extension + frontend typecheck/tests
+just ui-check      # frontend typecheck + vitest for ui/
+just ui-browser    # real Chromium run: ticket, live data, filters, drawer,
+                   # refresh, offline cache, XSS, storage and console hygiene
+```
+
 ## 9. Data model
 
 ```
@@ -964,8 +1011,9 @@ ms|RFC3339>` is a hidden clock override used by tests and demos.
 just verify                # everything below that runs without a model
 just stress                # scripts/stress.sh 10
 
-cargo test                 # 123 tests: 45 lib unit + 17 CLI + 32 core invariants
-                           #   + 9 workflow-CLI + 4 MCP + 7 REST + 9 REST concurrency
+cargo test                 # 136 tests: 48 lib unit + 17 CLI + 32 core invariants
+                           #   + 9 workflow-CLI + 4 MCP + 7 REST + 9 REST
+                           #   concurrency + 10 UI (real apm ui process over TCP)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 bash scripts/stress.sh 10  # cross-process claim/write race (10 real CLI processes)
@@ -973,7 +1021,11 @@ bash scripts/stress-rest.sh 10  # same race over HTTP + mixed HTTP/CLI writers
 
 npm install
 npx tsc -p tsconfig.json   # plugin type check
-npx vitest run             # 51 tests: 29 plugin unit + 5 tool-schema + 4 real MCP client + 13 e2e
+npm run ui:typecheck       # dashboard (ui/) type check
+npx vitest run             # 138 tests across 12 files: extension unit/schema/
+                           #   MCP/e2e plus the ui/ renderer, api and poller suites
+npm run ui:browser         # real Chromium against a throwaway ledger (needs
+                           #   Chromium; prints SKIP when none is installed)
 
 npm run verify             # all of the above that can run non-interactively
 ```
@@ -1124,6 +1176,7 @@ docs/agent-protocol.md   copy-paste AGENTS.md contract for repos using apm
 docs/mcp.md              MCP client guide: config, tools, errors, tokens
 docs/rest.md             REST guide: routes, protections, error mapping
 docs/rest-ops.md         REST operations: limits, multi-instance, backup, triage
+docs/ui.md               `apm ui`: ticket-to-token flow, CSP, embedded assets
 ```
 
 ## 14. Design notes and boundaries

@@ -1,0 +1,31 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+body {
+  margin: 0;
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+}
+main {
+  max-width: 42rem;
+  padding: 2rem;
+}
+h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+}
+.hint {
+  opacity: 0.75;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+code {
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  background: rgb(127 127 127 / 15%);
+}
+#status {
+  font-weight: 600;
+}

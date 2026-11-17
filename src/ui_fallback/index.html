@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>apm ui — assets not built</title>
+    <link rel="stylesheet" href="/ui/assets/app.css" />
+  </head>
+  <body>
+    <main>
+      <h1>apm ui</h1>
+      <p id="status">Checking the local ledger…</p>
+      <p class="hint">
+        This is the built-in fallback page: <code>ui/dist</code> was not present when
+        this binary was compiled. Run <code>npm run ui:build</code> (or
+        <code>just ui-build</code>) and rebuild to embed the real dashboard.
+      </p>
+      <ul id="summary"></ul>
+    </main>
+    <script src="/ui/assets/app.js"></script>
+  </body>
+</html>

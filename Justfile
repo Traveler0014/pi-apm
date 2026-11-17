@@ -1,8 +1,10 @@
 # AgentPM (apm) — local-first agent work ledger.
 #
-#   just build          cargo build --release
+#   just build          cargo build --release (embeds ui/dist, no Node needed)
 #   just install        install the release binaries (apm, apm-mcp, apm-serve) into $BINDIR
-#   just verify         fmt + clippy + Rust tests + extension typecheck/tests
+#   just ui-build       rebuild ui/dist with Vite (needs Node; committed after each build)
+#   just verify         fmt + clippy + Rust tests + extension/UI typecheck + tests
+#   just ui-check       frontend typecheck + vitest for the ui/ workspace
 #   just stress         multi-process claim/write contention check (CLI + REST)
 
 CARGO := env_var_or_default("CARGO", "cargo")
@@ -19,8 +21,26 @@ default:
     @just --list
 
 # Compile the release binaries (apm, apm-mcp, apm-serve).
+#
+# `ui/dist` is committed and embedded at compile time (see build.rs), so this
+# never needs Node. Run `just ui-build` after changing the frontend.
 build:
     {{ CARGO }} build --release
+
+# Rebuild the dashboard bundle into ui/dist (Vite root: ui/). Requires Node and
+# an `npm install` in the repository root. Commit ui/dist with the source.
+ui-build:
+    npm run ui:build
+
+# Frontend checks: TS typecheck plus the ui/**/*.test.ts suite.
+ui-check:
+    npm run ui:typecheck
+    npm run ui:test
+
+# Real-browser smoke of `apm ui` (needs Chromium and a release build).
+# Set APM_CHROME=/path/to/chrome when it is not in Playwright's cache or PATH.
+ui-browser: build
+    node scripts/ui-browser-check.mjs
 
 # Install all three release binaries into $BINDIR (default: ~/.local/bin).
 install: build
@@ -36,6 +56,7 @@ verify:
     cargo clippy --all-targets -- -D warnings
     cargo test --all-targets
     npx tsc -p tsconfig.json
+    npm run ui:typecheck
     npx vitest run
 
 # Cross-process contention checks: CLI-only, then the REST adapter variant

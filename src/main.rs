@@ -139,6 +139,34 @@ enum Cmd {
     Doctor,
     /// Append a diagnostic note (no claim required; never changes item state).
     Diag(DiagArgs),
+    /// Serve the embedded read-only dashboard on loopback and open a browser.
+    ///
+    /// Same process and same guards as `apm-serve`, plus `/ui` assets, a strict
+    /// CSP and a token delivered in the URL fragment (never written to disk,
+    /// the HTML or a log file).
+    Ui(UiArgs),
+}
+
+#[derive(Args, Debug)]
+struct UiArgs {
+    /// Loopback port. 0 (the default) picks a free one.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+    /// Full bind address, overriding --port.
+    #[arg(long)]
+    listen: Option<String>,
+    /// Do not open a browser; print the URL instead.
+    #[arg(long)]
+    no_open: bool,
+    /// Bind a non-loopback address. Read docs/rest.md before using this.
+    #[arg(long)]
+    allow_remote: bool,
+    /// Per-connection read/write timeout in seconds.
+    #[arg(long, default_value_t = 10)]
+    timeout: u64,
+    /// Seconds the one-time bootstrap ticket in the URL stays valid.
+    #[arg(long, default_value_t = 60, hide = true)]
+    ticket_ttl: u64,
 }
 
 #[derive(Args, Debug)]
@@ -694,6 +722,11 @@ fn run(cli: Cli) -> Result<()> {
     {
         return cmd_workflow_validate(args, cli.g.json);
     }
+    // `apm ui` runs its own loopback server; it does not need a `Store` handle in
+    // this process (the server opens one, exactly like `apm-serve`).
+    if let Cmd::Ui(args) = &cli.cmd {
+        return cmd_ui(&cli.g, args);
+    }
     let at = match &cli.g.now {
         Some(raw) => parse_now(raw)?,
         None => now_ms(),
@@ -811,12 +844,44 @@ fn dispatch(app: App, cmd: Cmd) -> Result<()> {
         Cmd::Expire => cmd_expire(app),
         Cmd::Doctor => cmd_doctor(app),
         Cmd::Diag(args) => cmd_diag(app, args),
+        // Handled before the Store is opened (see `run`).
+        Cmd::Ui(_) => unreachable!("apm ui is dispatched before any Store is opened"),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+fn cmd_ui(g: &Globals, args: &UiArgs) -> Result<()> {
+    let db = resolve_db(g.db.as_deref(), false)?;
+    let listen = args
+        .listen
+        .clone()
+        .unwrap_or_else(|| format!("127.0.0.1:{}", args.port));
+    let agent = g
+        .agent
+        .clone()
+        .or_else(|| std::env::var("APM_AGENT").ok())
+        .unwrap_or_else(|| "agent".to_string());
+    let now = match g.now.as_deref() {
+        Some(raw) => Some(parse_now(raw)?),
+        None => None,
+    };
+    apm::ui::serve(apm::ui::UiOptions {
+        db,
+        project: g.project.clone(),
+        agent,
+        listen,
+        allow_remote: args.allow_remote,
+        session: g.session.clone(),
+        run: g.run.clone(),
+        now,
+        timeout: std::time::Duration::from_secs(args.timeout.max(1)),
+        ticket_ttl: std::time::Duration::from_secs(args.ticket_ttl),
+        open: !args.no_open,
+    })
+}
 
 fn cmd_init(mut app: App, args: InitArgs) -> Result<()> {
     let settings = Settings {

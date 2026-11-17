@@ -17,6 +17,7 @@ pub mod model;
 pub mod rest;
 pub mod session_store;
 pub mod store;
+pub mod ui;
 pub mod workflow;
 
 pub use dashboard::{DashboardOptions, DoctorReport};

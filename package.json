@@ -30,22 +30,30 @@
     "test:rust": "cargo test --all-targets",
     "test:stress": "bash scripts/stress.sh 10",
     "typecheck": "tsc -p tsconfig.json",
-    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && tsc -p tsconfig.json && vitest run"
+    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && tsc -p tsconfig.json && vitest run",
+    "ui:dev": "vite --config ui/vite.config.ts",
+    "ui:build": "vite build --config ui/vite.config.ts",
+    "ui:test": "vitest run ui",
+    "ui:typecheck": "tsc -p ui/tsconfig.json",
+    "ui:browser": "node scripts/ui-browser-check.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^1.5.2",
     "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@earendil-works/pi-tui": "^1.5.2",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@types/node": "^22.10.0",
+    "happy-dom": "^21.0.4",
+    "playwright-core": "^1.65.1",
     "typebox": "^1.4.7",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "@earendil-works/pi-tui": "^1.5.2"
+    "vite": "^6.4.6",
+    "vitest": "^2.1.0"
   }
 }

@@ -117,6 +117,9 @@ fn run(cli: Cli) -> apm::Result<()> {
             Some(raw) => Some(parse_clock(raw)?),
             None => None,
         },
+        ui: false,
+        bootstrap_ticket: None,
+        bootstrap_ttl: apm::rest::DEFAULT_BOOTSTRAP_TTL,
     };
     let server = RestServer::bind(config)?;
     let addr = server.local_addr()?;
