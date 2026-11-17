@@ -78,8 +78,73 @@ sha256_file() {
     sha256sum "$@"
   elif command -v shasum >/dev/null; then
     shasum -a 256 "$@"
+  elif command -v certutil >/dev/null; then
+    # Git Bash on Windows normally ships sha256sum; certutil is the native
+    # fallback if a stripped PATH hides it. Output matches `sha256sum` format
+    # so the packaged SHA256SUMS stays portable.
+    local file hash
+    for file in "$@"; do
+      hash="$(certutil -hashfile "$file" SHA256 | sed -n '2p' | tr -d ' \r')"
+      if [[ ${#hash} -ne 64 ]]; then
+        echo "package-release: certutil did not return a SHA256 for $file" >&2
+        exit 1
+      fi
+      printf '%s  %s\n' "$hash" "$file"
+    done
   else
-    echo "package-release: no sha256sum/shasum available" >&2
+    echo "package-release: no sha256sum/shasum/certutil available for checksums" >&2
+    exit 1
+  fi
+}
+
+# A native Windows tool (7z.exe, bsdtar, python.exe) cannot open the POSIX
+# `/d/a/...` paths Git Bash uses. Convert only when cygpath is present; on Linux
+# and macOS this is the identity, which keeps the regression test meaningful.
+native_path() {
+  if command -v cygpath >/dev/null; then
+    cygpath -w "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+build_windows_zip() {
+  local archive="$1" native
+  native="$(native_path "$archive")"
+  if command -v 7z >/dev/null; then
+    (cd "$STAGE" && 7z a -tzip "$native" "$PKG" >/dev/null)
+  elif [[ -x "/c/Program Files/7-Zip/7z.exe" ]]; then
+    (cd "$STAGE" && "/c/Program Files/7-Zip/7z.exe" a -tzip "$native" "$PKG" >/dev/null)
+  elif command -v bsdtar >/dev/null; then
+    (cd "$STAGE" && bsdtar -a -c -f "$native" "$PKG")
+  elif command -v tar >/dev/null && tar --version 2>/dev/null | head -1 | grep -qi bsdtar; then
+    (cd "$STAGE" && tar -a -c -f "$native" "$PKG")
+  elif command -v python3 >/dev/null; then
+    (cd "$STAGE" && python3 - "$native" "$PKG" <<'PY'
+import os, sys, zipfile
+archive, package = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+    for directory, _, files in os.walk(package):
+        for name in sorted(files):
+            full = os.path.join(directory, name)
+            bundle.write(full, os.path.relpath(full, "."))
+PY
+    )
+  elif command -v python >/dev/null; then
+    (cd "$STAGE" && python - "$native" "$PKG" <<'PY'
+import os, sys, zipfile
+archive, package = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+    for directory, _, files in os.walk(package):
+        for name in sorted(files):
+            full = os.path.join(directory, name)
+            bundle.write(full, os.path.relpath(full, "."))
+PY
+    )
+  elif command -v zip >/dev/null; then
+    (cd "$STAGE" && zip -qr "$archive" "$PKG")
+  else
+    echo "package-release: cannot build the Windows zip: install 7-Zip, or provide bsdtar, Python 3 or zip on PATH" >&2
     exit 1
   fi
 }
@@ -98,16 +163,7 @@ case "$TARGET" in
   *windows*)
     ARCHIVE="$OUT_DIR/$PKG.zip"
     rm -f "$ARCHIVE"
-    if command -v 7z >/dev/null; then
-      (cd "$STAGE" && 7z a -tzip "$ARCHIVE" "$PKG" >/dev/null)
-    elif [[ -x "/c/Program Files/7-Zip/7z.exe" ]]; then
-      (cd "$STAGE" && "/c/Program Files/7-Zip/7z.exe" a -tzip "$ARCHIVE" "$PKG" >/dev/null)
-    elif command -v zip >/dev/null; then
-      (cd "$STAGE" && zip -qr "$ARCHIVE" "$PKG")
-    else
-      echo "package-release: need 7z or zip to build a Windows archive" >&2
-      exit 1
-    fi
+    build_windows_zip "$ARCHIVE"
     ;;
   *)
     ARCHIVE="$OUT_DIR/$PKG.tar.gz"

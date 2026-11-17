@@ -65,6 +65,9 @@ jobs:
       - name: Stress (REST + mixed writers)
         run: bash scripts/stress-rest.sh 3
 
-      # No network, no token: a fake `gh` on PATH exercises both publish paths.
+      # No network, no token: fake `gh`/`cygpath`/`7z` on PATH exercise the
+      # publish create/update paths and the Windows packaging branch.
       - name: Release script tests
-        run: bash scripts/test-release-scripts.sh
+        run: |
+          bash scripts/test-release-scripts.sh
+          bash scripts/test-package-windows.sh

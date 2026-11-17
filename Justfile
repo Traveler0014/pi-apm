@@ -63,15 +63,18 @@ verify:
     npm run ui:typecheck
     npx vitest run
     bash scripts/test-release-scripts.sh
+    bash scripts/test-package-windows.sh
 
 # Static validation of the GitHub Actions YAML. Install actionlint with
 # `go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7`.
 lint-workflows:
     actionlint .github/workflows/*.yml
 
-# Offline tests for scripts/publish-release.sh (fake gh; create vs --clobber).
+# Offline tests for the release scripts: publish create/update paths (fake gh)
+# and the Windows zip branch (fake cygpath/7z, no tools).
 test-release-scripts:
     bash scripts/test-release-scripts.sh
+    bash scripts/test-package-windows.sh
 
 # Build a distributable archive for the host target into dist/ (no tag, no
 # publish). CI builds the full platform matrix; see docs/release.md.

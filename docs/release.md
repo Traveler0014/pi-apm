@@ -53,7 +53,15 @@ Cross-compilation notes:
   `cross` needs Docker, which is present on Linux runners.
 - **Windows** is built natively with MSVC. SQLite is compiled from the bundled
   `rusqlite` amalgamation, so no system SQLite or vcpkg is required. Archives
-  are `.zip` built with 7-Zip (preinstalled on the runner).
+  are `.zip`; the packager converts the Git Bash `/d/a/...` path with `cygpath -w`
+  before handing it to native tools (7-Zip, bsdtar, Python). Fallback chain:
+  `7z` → default 7-Zip install → `bsdtar` → Windows `tar -a` → `python3`/`python`
+  zipfile → MSYS `zip`; if none exists the step fails with an explicit message.
+  Checksums fall back from `sha256sum`/`shasum` to Windows `certutil`, still
+  emitting the standard `<hash>  <file>` format.
+  `scripts/test-package-windows.sh` covers this branch on Linux with fake
+  `cygpath`/`7z`: the archive path must be Windows-style, the six files and the
+  checksums must be unchanged, and a missing toolchain must fail clearly.
 - Rust **edition 2024** requires a recent stable toolchain. The version is
   **pinned**: `rust-toolchain.toml` at the repository root selects `1.100.0`
   with `rustfmt` and `clippy`, and both workflows pass `toolchain: 1.100.0`.
