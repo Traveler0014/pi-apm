@@ -23,49 +23,46 @@ listening on 127.0.0.1:49152
 The `listening on` line never contains a secret; scripts can parse it. The `ui:`
 line is the only delivery channel for the one-time ticket.
 
-## Credentials: ticket → token
+## Credentials: ticket → HttpOnly session cookie
 
-The dashboard needs the REST bearer token, but printing a long-lived token puts
-it in shell history, CI logs and terminal scrollback. `apm ui` therefore mints
-two process-local values:
+`apm ui` prints one URL and it is the only credential delivery channel:
 
-| Value | Prefix | Lifetime | Where it goes |
-|---|---|---|---|
-| bootstrap ticket | `apm_boot_` | 60 s, single use | URL fragment, printed once |
-| API token | `apm_ui_` | process lifetime | memory only |
-
-The browser (or the fallback page) reads `#ticket=…`, immediately strips the
-fragment with `history.replaceState`, and exchanges the ticket:
-
-```http
-POST /api/bootstrap
-Content-Type: application/json
-
-{"ticket": "apm_boot_…"}
+```
+ui: http://127.0.0.1:PORT/ui/#ticket=apm_boot_<uuid>    # single use, 60 s TTL
 ```
 
-```json
-{"ok": true, "token": "apm_ui_…", "token_type": "Bearer"}
-```
+1. The page reads `#ticket=…`, removes it from the address bar immediately and
+   posts it to `POST /api/bootstrap` (body `{"ticket": …}`; the bearer header form
+   is accepted for curl).
+2. On success the server answers `{"ok":true,"token_type":"cookie"}` **without a
+   token** and sets:
 
-`Authorization: Bearer <ticket>` is accepted instead of the JSON body for
-scripts. Failure modes are deliberately distinct so the UI can explain them:
+   ```
+   Set-Cookie: apm_ui_session=<process-token>; HttpOnly; SameSite=Strict; Path=/api
+   ```
 
-| Status | `error.code` | Meaning |
-|---|---|---|
-| 401 | `invalid_ticket` | missing, unknown or mismatched ticket |
-| 401 | `ticket_expired` | older than the TTL (default 60 s) |
-| 409 | `ticket_consumed` | already exchanged (replay) |
+   No `Expires`/`Max-Age`, so it is a browser-session cookie; `Secure` is omitted
+   because the dashboard is served over loopback **HTTP** (a `Secure` cookie would
+   be dropped by the browser). If the UI is ever put behind TLS, add `Secure`.
+3. The browser replays that cookie on every `/api/*` request, which is why a
+   **page reload keeps working** without a new ticket. JavaScript never sees the
+   token: it is not in the body, the URL, `localStorage`/`sessionStorage`, the DOM
+   or any readable cookie.
+4. The ticket stays single-use: replaying it returns `409 ticket_consumed`
+   (`401 invalid_ticket` / `401 ticket_expired` for the other cases). Re-opening
+   the original link while the cookie session is still live keeps the session and
+   shows no error; a *reload* does not even re-post the ticket because it was
+   stripped on first use.
+5. The cookie value **is** the process token: it is generated per `apm ui`
+   process and never persisted. Restarting `apm ui` therefore invalidates both the
+   old cookie and the old ticket — a long-lived tab stops working and needs the
+   freshly printed URL.
+6. `apm-serve` (non-UI mode) never sets or accepts this cookie; it keeps the pure
+   `Authorization: Bearer <token>` contract for CLI and scripts, which is also
+   still accepted by `apm ui`.
 
-After a successful exchange the ticket is burned: reloading an old URL cannot
-mint another token. Restarting `apm ui` mints a new ticket *and* a new token, so
-both old values stop working. Neither value is written to disk, the HTML, the
-audit trail, a cookie, `localStorage` or `sessionStorage`, and the bearer token
-is never printed.
-
-The exchange endpoint only exists in `apm ui` mode (`apm-serve` returns 404) and
-is subject to the same loopback `Host` and same-origin `Origin` checks as the
-rest of the server. Responses are `Cache-Control: no-store`.
+There is no logout endpoint in the first version: stop the process (the cookie
+dies with it) or clear cookies for the origin to end the session early.
 
 ## Security headers
 

@@ -136,6 +136,36 @@ impl Reply {
     }
 }
 
+/// Like [`request`] but without the bearer header, so credential tests can prove
+/// that a cookie alone authenticates — or is refused.
+fn request_anonymous(addr: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> Reply {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, body) = text.split_once("\r\n\r\n").expect("complete response");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    Reply {
+        status,
+        body: serde_json::from_str(body.trim()).unwrap_or(Value::Null),
+    }
+}
+
 fn request(
     addr: &str,
     method: &str,
@@ -510,6 +540,21 @@ fn list_filters_and_dashboard_query_parameters_are_honoured() {
             .len(),
         2
     );
+}
+
+#[test]
+fn the_ui_session_cookie_is_not_accepted_outside_ui_mode() {
+    // `apm-serve` keeps the pure Bearer contract: a cookie that a browser would
+    // send must not authenticate anything there.
+    let ledger = Ledger::new();
+    let server = Server::start(&ledger, &[]);
+    let cookie = format!("apm_ui_session={TOKEN}");
+    let reply = request_anonymous(&server.addr, "GET", "/dashboard", &[("Cookie", &cookie)]);
+    assert_eq!(reply.status, 401, "{}", reply.body);
+    assert_eq!(reply.error_code(), "unauthorized");
+    // Bearer still works, of course.
+    let bearer = request(&server.addr, "GET", "/dashboard", None, &[]);
+    assert_eq!(bearer.status, 200);
 }
 
 #[test]

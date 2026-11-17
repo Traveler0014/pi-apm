@@ -260,6 +260,8 @@ export interface FetcherInit {
 	headers: Record<string, string>;
 	body?: string;
 	cache?: "no-store";
+	/** The UI authenticates with an HttpOnly cookie, so same-origin credentials. */
+	credentials?: "same-origin";
 	signal?: AbortSignal;
 }
 

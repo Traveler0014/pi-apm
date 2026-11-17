@@ -57,6 +57,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// terminal scrollback or CI log is useless.
 pub const DEFAULT_BOOTSTRAP_TTL: Duration = Duration::from_secs(60);
 const SESSION_HEADER: &str = "x-apm-session";
+/// Browser session cookie created by `POST /api/bootstrap` (UI mode only).
+pub const UI_SESSION_COOKIE: &str = "apm_ui_session";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -399,6 +401,12 @@ enum Cache {
 impl Response {
     fn ok(body: Value) -> Response {
         Response::json(200, body)
+    }
+
+    /// Attach a response header (used for the UI session cookie).
+    fn with_header(mut self, name: &str, value: impl Into<String>) -> Response {
+        self.headers.push((name.to_string(), value.into()));
+        self
     }
 
     fn json(status: u16, body: Value) -> Response {
@@ -768,22 +776,42 @@ fn route(request: &Request, state: &State) -> Response {
     if segments.as_slice() == ["api", "bootstrap"] {
         return bootstrap(request, state);
     }
-    let Some(auth) = request.headers.get("authorization") else {
-        return Response::error(
-            401,
-            "unauthorized",
-            "missing Authorization header (use: Authorization: Bearer <token>)",
-        );
-    };
-    let Some(token) = auth.strip_prefix("Bearer ").map(str::trim) else {
-        return Response::error(
-            401,
-            "unauthorized",
-            "Authorization must be `Bearer <token>`",
-        );
+    // Two credentials are accepted: `Authorization: Bearer <token>` for CLI and
+    // scripts, and — only in `apm ui` mode — the HttpOnly session cookie the
+    // bootstrap exchange set. The cookie is never readable by JavaScript, so a
+    // browser session survives a reload without putting a token anywhere the page
+    // can leak it.
+    let bearer = request
+        .headers
+        .get("authorization")
+        .map(|raw| {
+            raw.strip_prefix("Bearer ")
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .filter(|token| !token.is_empty());
+    let token = match bearer.or_else(|| session_cookie(request, state)) {
+        Some(token) => token,
+        None => {
+            let hint = if state.config.ui {
+                "missing credentials (open the URL printed by `apm ui`, or send Authorization: Bearer <token>)"
+            } else {
+                "missing Authorization header (use: Authorization: Bearer <token>)"
+            };
+            return Response::error(401, "unauthorized", hint);
+        }
     };
     if !constant_time_eq(token.as_bytes(), state.config.token.as_bytes()) {
-        return Response::error(401, "unauthorized", "invalid REST token");
+        return Response::error(
+            401,
+            "unauthorized",
+            if state.config.ui {
+                "invalid session cookie or REST token; re-run `apm ui` for a fresh link"
+            } else {
+                "invalid REST token"
+            },
+        );
     }
 
     let session = request
@@ -1037,14 +1065,45 @@ fn bootstrap(request: &Request, state: &State) -> Response {
         );
     }
     guard.consumed = true;
+    // The browser never receives the bearer token: it gets an HttpOnly session
+    // cookie scoped to /api, so a page reload keeps working without a new ticket
+    // and JavaScript (or a stored copy) can never read the credential. No
+    // `Expires`/`Max-Age` on purpose: it is a browser-session cookie. `Secure`
+    // is omitted because the dashboard is served over loopback HTTP; see
+    // docs/ui.md for the trade-off.
+    let cookie = format!(
+        "{UI_SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/api",
+        state.config.token
+    );
     Response::json(
         200,
         json!({
             "ok": true,
-            "token": state.config.token,
-            "token_type": "Bearer",
+            "token": serde_json::Value::Null,
+            "token_type": "cookie",
+            "session": "cookie",
         }),
     )
+    .with_header("set-cookie", cookie)
+}
+
+/// Read the UI session cookie (only in `apm ui` mode; `apm-serve` keeps the
+/// pure Bearer contract).
+fn session_cookie(request: &Request, state: &State) -> Option<String> {
+    if !state.config.ui {
+        return None;
+    }
+    let raw = request.headers.get("cookie")?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix(UI_SESSION_COOKIE) {
+            let value = value.trim_start_matches('=').trim_matches('"').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn index_response() -> Response {

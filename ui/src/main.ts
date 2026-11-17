@@ -17,8 +17,9 @@ import {
 	type Api,
 	bootstrapTokenFromFragment,
 	createApi,
-	hasToken,
+	stripTicketFragment,
 	ticketErrorMessage,
+	ticketFromFragment,
 } from "./api";
 import { createDrawer } from "./detail";
 import { createMockFetcher } from "./fixtures";
@@ -379,17 +380,25 @@ async function init(): Promise<void> {
 		void openDeepLink();
 	});
 	if (!useMock) {
-		try {
-			await bootstrapTokenFromFragment(window.location, window.history);
-		} catch (cause) {
-			renderSessionError(ticketErrorMessage(cause));
-			return;
-		}
-		if (!hasToken()) {
-			renderSessionError(
-				"No dashboard session: open the URL printed by `apm ui` (the link carries a one-time ticket), or run `apm ui` again.",
-			);
-			return;
+		// The session is an HttpOnly cookie the browser replays on every request.
+		// The ticket is only exchanged when the address bar actually carries one —
+		// the first load after `apm ui` prints the URL. A reload has no ticket (it
+		// was stripped on first use), so it never re-posts a consumed ticket.
+		if (ticketFromFragment(window.location)) {
+			try {
+				await bootstrapTokenFromFragment(window.location, window.history);
+			} catch (cause) {
+				// Rare path: the link was reopened while a live cookie session exists.
+				// Keep the session if the API still answers; otherwise it is terminal.
+				const live = await api
+					.getDashboard()
+					.then(() => true)
+					.catch(() => false);
+				if (!live) {
+					renderSessionError(ticketErrorMessage(cause));
+					return;
+				}
+			}
 		}
 	}
 	render();

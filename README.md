@@ -831,18 +831,23 @@ apm ui --no-open            # print the URL instead of opening a browser
 ```
 
 The printed `ui:` URL carries a **one-time bootstrap ticket** (`#ticket=…`,
-60 s, single use), never the bearer token. The page exchanges it at
-`POST /api/bootstrap`, keeps the token in memory only, and strips the fragment
-immediately. Reloading the consumed URL therefore fails on purpose — rerun
-`apm ui` for a fresh one. Static assets are compiled into the binary
-(`ui/dist`, built with `just ui-build`), so users never need Node.
+60 s, single use), never the bearer token. The page strips the fragment
+immediately and exchanges the ticket at `POST /api/bootstrap`, which answers with
+an **HttpOnly, SameSite=Strict session cookie scoped to `/api`** — the token is
+never handed to JavaScript. A page **reload therefore keeps working**, while the
+ticket stays single-use (replaying it is `409 ticket_consumed`) and a restarted
+`apm ui` process invalidates both the old cookie and the old ticket. Static assets
+are compiled into the binary (`ui/dist`, built with `just ui-build`), so users
+never need Node.
 
 Security boundaries: loopback only unless `--allow-remote`; `Host` must be
 loopback; an `Origin` header must match this server exactly (`http` + same
 authority); the token never appears in HTML, static assets, the URL query,
-`localStorage`, `sessionStorage`, cookies or the startup logs; every `/ui`
-response carries a strict CSP (`default-src 'none'`, `'self'` only, no inline
-scripts or styles, no remote resources).
+`localStorage`, `sessionStorage`, JavaScript or the startup logs — it lives in an
+**HttpOnly** cookie that the browser sends but scripts cannot read. `apm-serve`
+keeps the pure `Authorization: Bearer` contract. Every `/ui` response carries a
+strict CSP (`default-src 'none'`, `'self'` only, no inline scripts or styles, no
+remote resources).
 
 Refreshing: the dashboard polls every 4 s (well under the 5 s budget), `R` or
 the **Refresh** button forces an immediate refresh, the **Recently done** fold

@@ -150,17 +150,18 @@ impl Ui {
         self.token.as_deref().expect("no exchanged token")
     }
 
-    /// POST /api/bootstrap with a JSON ticket body. Returns the body on 200.
+    /// POST /api/bootstrap with a JSON ticket body.
+    ///
+    /// The session token is delivered as an HttpOnly cookie, never in the body,
+    /// so the test reads it from `Set-Cookie` (which is what a browser receives).
     fn exchange(&self, ticket: &str) -> Result<String, Reply> {
         let body = json!({ "ticket": ticket }).to_string();
         let reply = self.request("POST", "/api/bootstrap", &[], Some(&body));
         if reply.status == 200 {
-            let token = reply.json()["token"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            assert!(token.starts_with("apm_ui_"), "unexpected token: {token}");
-            Ok(token)
+            let cookie = reply
+                .header("set-cookie")
+                .unwrap_or_else(|| panic!("bootstrap without Set-Cookie: {}", reply.text()));
+            Ok(session_token(cookie))
         } else {
             Err(reply)
         }
@@ -259,6 +260,20 @@ impl Reply {
 
 /// The bundle's entry script, as referenced by the index document (the hash
 /// changes on every frontend build, so never hard-code it).
+/// Extract the session token from a `Set-Cookie` header value.
+fn session_token(set_cookie: &str) -> String {
+    let first = set_cookie.split(';').next().unwrap_or_default().trim();
+    let token = first
+        .strip_prefix("apm_ui_session=")
+        .unwrap_or_else(|| panic!("unexpected session cookie: {set_cookie}"));
+    assert!(token.starts_with("apm_ui_"), "unexpected token: {token}");
+    token.to_string()
+}
+
+fn session_cookie_header(token: &str) -> String {
+    format!("apm_ui_session={token}")
+}
+
 fn first_js_asset(html: &str) -> String {
     for part in html.split('"') {
         let relative = part.strip_prefix("./").unwrap_or(part);
@@ -454,7 +469,8 @@ fn ui_exchanges_a_one_time_ticket_for_the_token() {
     );
     assert_eq!(denied.status, 401);
 
-    // Bearer form of the exchange also works (script/curl convenience).
+    // Bearer form of the exchange also works (script/curl convenience), and the
+    // token is still delivered only through the cookie header.
     let second = Ui::spawn(&ledger, &[], &[], true);
     let header = format!("Bearer {}", second.ticket);
     let via_header = second.request(
@@ -464,12 +480,72 @@ fn ui_exchanges_a_one_time_ticket_for_the_token() {
         None,
     );
     assert_eq!(via_header.status, 200);
+    assert_eq!(via_header.json()["token"], Value::Null);
+    assert_eq!(via_header.json()["token_type"], json!("cookie"));
+    assert!(via_header.header("set-cookie").is_some());
+}
+
+#[test]
+fn ui_sets_a_scoped_httponly_session_cookie_instead_of_returning_the_token() {
+    let ledger = Ledger::new();
+    let ui = Ui::spawn(&ledger, &[], &[], true);
+    let body = json!({ "ticket": ui.ticket }).to_string();
+    let reply = ui.request("POST", "/api/bootstrap", &[], Some(&body));
+    assert_eq!(reply.status, 200, "{}", reply.text());
+
+    // 1. The body never carries the credential.
+    assert_eq!(reply.json()["token"], Value::Null);
+    assert_eq!(reply.json()["token_type"], json!("cookie"));
+    let raw_body = reply.text();
     assert!(
-        via_header.json()["token"]
-            .as_str()
-            .unwrap()
-            .starts_with("apm_ui_")
+        !raw_body.contains("apm_ui_"),
+        "token leaked into the body: {raw_body}"
     );
+
+    // 2. The cookie is HttpOnly, SameSite=Strict, scoped to /api, and has no
+    //    Expires/Max-Age (browser-session cookie).
+    let cookie = reply.header("set-cookie").expect("Set-Cookie").to_string();
+    let token = session_token(&cookie);
+    assert!(cookie.contains("HttpOnly"), "cookie: {cookie}");
+    assert!(cookie.contains("SameSite=Strict"), "cookie: {cookie}");
+    assert!(cookie.contains("Path=/api"), "cookie: {cookie}");
+    assert!(
+        !cookie.to_ascii_lowercase().contains("max-age="),
+        "cookie: {cookie}"
+    );
+    assert!(
+        !cookie.to_ascii_lowercase().contains("expires="),
+        "cookie: {cookie}"
+    );
+
+    // 3. The cookie alone authenticates API calls (this is what a page reload
+    //    relies on), and a wrong cookie does not.
+    let header = session_cookie_header(&token);
+    let dashboard = ui.request("GET", "/api/dashboard", &[("Cookie", &header)], None);
+    assert_eq!(dashboard.status, 200, "{}", dashboard.text());
+    let wrong = ui.request(
+        "GET",
+        "/api/dashboard",
+        &[("Cookie", "apm_ui_session=apm_ui_wrong")],
+        None,
+    );
+    assert_eq!(wrong.status, 401);
+    assert_eq!(wrong.error_code(), "unauthorized");
+
+    // 4. Bearer keeps working for CLI/scripts (unchanged contract).
+    let bearer = format!("Bearer {token}");
+    let via_bearer = ui.request("GET", "/api/dashboard", &[("Authorization", &bearer)], None);
+    assert_eq!(via_bearer.status, 200);
+
+    // 5. The cookie is not a ticket: it cannot bootstrap another exchange.
+    let again = ui.request(
+        "POST",
+        "/api/bootstrap",
+        &[("Cookie", &header)],
+        Some(&json!({ "ticket": "apm_boot_unknown" }).to_string()),
+    );
+    assert_eq!(again.status, 401);
+    assert_eq!(again.error_code(), "invalid_ticket");
 }
 
 #[test]
@@ -500,6 +576,12 @@ fn ui_ticket_expires_and_restart_invalidates_ticket_and_token() {
         None,
     );
     assert_eq!(stale.status, 401);
+    // The HttpOnly cookie from the old process is just as dead: a restart needs a
+    // fresh ticket, so a long-lived browser tab cannot keep reading the ledger.
+    let old_cookie = session_cookie_header(&old_token);
+    let stale_cookie = second.request("GET", "/api/dashboard", &[("Cookie", &old_cookie)], None);
+    assert_eq!(stale_cookie.status, 401);
+    assert_eq!(stale_cookie.error_code(), "unauthorized");
 }
 
 #[test]
