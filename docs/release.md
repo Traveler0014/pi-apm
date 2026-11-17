@@ -54,8 +54,11 @@ Cross-compilation notes:
 - **Windows** is built natively with MSVC. SQLite is compiled from the bundled
   `rusqlite` amalgamation, so no system SQLite or vcpkg is required. Archives
   are `.zip` built with 7-Zip (preinstalled on the runner).
-- Rust **edition 2024** requires a recent stable toolchain; the workflow tracks
-  `stable` at the pinned action revision.
+- Rust **edition 2024** requires a recent stable toolchain. The version is
+  **pinned**: `rust-toolchain.toml` at the repository root selects `1.100.0`
+  with `rustfmt` and `clippy`, and both workflows pass `toolchain: 1.100.0`.
+  Bump both places together; `cargo`/`rustup` then use the same compiler
+  locally, which avoids "green locally, red in CI" clippy drift.
 
 ## Packages
 

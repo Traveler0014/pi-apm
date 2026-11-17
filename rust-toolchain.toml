@@ -1,0 +1,6 @@
+# Pin the toolchain so CI and local runs agree. GitHub's `stable` moves; a
+# newer clippy can fail a tree that passed yesterday (APM-27). Update this
+# file deliberately and run `cargo fmt/clippy/test` before pushing.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]

@@ -250,8 +250,8 @@ impl Store {
                 let _ = i;
             }
 
-            for seq in 0..new.acceptance.len() {
-                let text = new.acceptance[seq].trim();
+            for (seq, criterion) in new.acceptance.iter().enumerate() {
+                let text = criterion.trim();
                 if text.is_empty() {
                     return Err(Error::invalid("acceptance criteria must be non-empty"));
                 }
@@ -687,7 +687,6 @@ impl Store {
     /// Record a *substantive* progress update. Bumps the item version, moves
     /// `last_progress_at`, and is the only operation (besides completion) that
     /// may claim something actually advanced.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_progress(
         &mut self,
