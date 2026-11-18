@@ -870,10 +870,18 @@ poll clears it. A restarted server mints a new token, so the page shows a
 Two views share the same data: a **list** (deduplicated rows with the item's own
 workflow stage bar and acceptance progress) and a **topology** view grouping
 *Ready to start* vs *Waiting on upstream*, with direct blockers, transitive
-blocker counts and how many items each one would unlock. Selecting an item draws
-its local dependency graph — dependency edges solid and arrowed, parent/child
-edges dashed — with scope switches (blocking chain / upstream / downstream) and a
-text view that carries the same relations for keyboard and screen-reader users.
+blocker counts and how many items each one would unlock. Topology is a
+master/detail workspace: the list scrolls in its own column while a pinned column
+keeps the graph on top and the selection summary under it, so a long queue never
+needs a page scroll to reach the picture. Selecting an item draws its local graph
+in one of two relation sub-views — **Dependencies** (solid, arrowed, with
+blocking-chain / upstream / downstream scopes) or **Hierarchy** (parent/children,
+dashed) — laid out by dagre in a zoomable, pannable viewport (`Fit`, 100 %,
+wheel/drag, keyboard) plus a text view that carries the same relations for
+keyboard and screen-reader users. The graph column takes ~55 % of the workspace,
+and titles are measured in Unicode width units (a CJK glyph counts as two Latin
+letters, so Chinese titles wrap over two lines instead of overflowing). Below 900 px the inline graph collapses into a
+full-screen overlay.
 Closed work is first-class too: the `Closed items` fold holds `done`,
 `cancelled`, `aborted` and any custom closed state, and each opens the full
 detail drawer from the fold, a search hit or a `#item=` deep link. An explicit

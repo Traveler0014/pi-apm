@@ -344,6 +344,47 @@ export function localDag(graph: TopologyGraph, id: string, hops = 2): LocalDag {
 	return { selectedId: id, nodes, edges, upstream, downstream, parents, children };
 }
 
+export type DagRelation = "dependencies" | "hierarchy";
+
+/**
+ * Relation-specific neighbourhood (APM-45): dependencies and hierarchy are
+ * never mixed in the same picture, so a parent and a dependent cannot share a
+ * rank and produce a reversed same-column edge. Both views keep the selected
+ * item; `localDag` remains the legacy combined view.
+ */
+export function localDagFor(
+	graph: TopologyGraph,
+	id: string,
+	hops = 2,
+	relation: DagRelation = "dependencies",
+): LocalDag {
+	const base = localDag(graph, id, hops);
+	const selected = base.nodes.find((node) => node.role === "selected")?.item;
+	if (!selected) return base;
+	if (relation === "dependencies") {
+		const ids = new Set([selected.id, ...base.upstream.map((item) => item.id), ...base.downstream.map((item) => item.id)]);
+		const nodes: LocalDag["nodes"] = [];
+		for (const item of [selected, ...base.upstream, ...base.downstream]) {
+			if (nodes.some((node) => node.item.id === item.id)) continue;
+			const role = item.id === selected.id ? "selected" : base.upstream.some((row) => row.id === item.id) ? "upstream" : "downstream";
+			nodes.push({ item, role, depth: role === "upstream" ? -1 : role === "downstream" ? 1 : 0 });
+		}
+		const edges = graph.edges.filter(
+			(edge) => edge.kind === "dependency" && ids.has(edge.from) && ids.has(edge.to),
+		);
+		return { selectedId: id, nodes, edges, upstream: base.upstream, downstream: base.downstream, parents: [], children: [] };
+	}
+	const ids = new Set([selected.id, ...base.parents.map((item) => item.id), ...base.children.map((item) => item.id)]);
+	const nodes: LocalDag["nodes"] = [];
+	for (const item of [selected, ...base.parents, ...base.children]) {
+		if (nodes.some((node) => node.item.id === item.id)) continue;
+		const role = item.id === selected.id ? "selected" : base.parents.some((row) => row.id === item.id) ? "parent" : "child";
+		nodes.push({ item, role, depth: 0 });
+	}
+	const edges = graph.edges.filter((edge) => edge.kind === "parent" && ids.has(edge.from) && ids.has(edge.to));
+	return { selectedId: id, nodes, edges, upstream: [], downstream: [], parents: base.parents, children: base.children };
+}
+
 /**
  * Text equivalent of the local graph: one line per relation, ordered so a screen
  * reader hears "upstream → selected → downstream" like the picture reads.

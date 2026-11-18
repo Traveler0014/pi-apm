@@ -678,6 +678,12 @@ body.drawer-open {
 	gap: 8px;
 }
 
+/* The topology groups are hidden programmatically (status scope = closed, or a
+   group with no rows); `display: flex` would otherwise win over `[hidden]`. */
+.topo-group[hidden] {
+	display: none;
+}
+
 .field {
 	display: flex;
 	flex-direction: column;
@@ -978,21 +984,49 @@ pre.field-value {
 	display: none;
 }
 
+/* Master/detail workspace (APM-46): the list scrolls on its own, the graph and
+   the selected-item summary stay put beside it. Neither column may push the page
+   sideways, so both get min-width: 0 and their own overflow. */
 .topology-view {
 	display: grid;
-	grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr);
+	/* The graph column is the point of this view: give it ~55% so a two-node
+	   Chinese chain fits at a readable zoom instead of being shrunk to ~74%. */
+	grid-template-columns: minmax(0, 1fr) minmax(420px, 55%);
 	gap: 16px;
 	align-items: start;
 }
 
-.topology-view > .selection-summary {
+.topo-list {
+	grid-column: 1;
+	grid-row: 1;
+	min-width: 0;
+	/* --topo-top is measured at render time (applyWorkspaceHeight): the chrome above
+	   the workspace grows with the banner and wrapped controls. */
+	max-height: calc(100dvh - var(--topo-top, 148px) - var(--topo-bottom, 20px));
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	/* Room for the focus ring on the last card, and a stable scrollbar gutter so
+	   the cards do not shift when it appears. */
+	padding: 2px 6px 8px 2px;
+	scrollbar-gutter: stable;
+}
+
+.topo-aside {
 	grid-column: 2;
 	grid-row: 1;
+	min-width: 0;
+	position: sticky;
+	top: 12px;
+	align-self: start;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	max-height: calc(100dvh - var(--topo-top, 148px) - var(--topo-bottom, 20px));
+	overflow-y: auto;
+	overscroll-behavior: contain;
 }
 
 .dag-panel {
-	grid-column: 1;
-	grid-row: 2;
 	display: flex;
 	flex-direction: column;
 	gap: 6px;
@@ -1002,20 +1036,73 @@ pre.field-value {
 	padding: 10px 12px;
 }
 
+.dag-panel-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-2);
+}
+
+.dag-panel-head .topo-title {
+	margin: 0;
+}
+
+.dag-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+}
+
+.dag-relations {
+	display: flex;
+	gap: 4px;
+}
+
+.dag-relation {
+	font-size: 12px;
+	padding: 3px 8px;
+}
+
+.dag-relation[aria-pressed="true"] {
+	border-color: var(--accent);
+	color: var(--text);
+	background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+}
+
+.dag-dialog-controls {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
 .topology-groups {
-	grid-column: 1;
-	grid-row: 1;
 	display: flex;
 	flex-direction: column;
 	gap: 14px;
 }
 
-@media (max-width: 860px) {
-	.topology-view > .selection-summary,
-	.dag-panel,
-	.topology-groups {
+@media (max-width: 900px) {
+	/* Narrow screens: one column, and the list stops being a nested scroller —
+	   the page itself scrolls, which is what touch users expect. */
+	.topology-view {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.topo-list {
 		grid-column: 1;
-		grid-row: auto;
+		grid-row: 2;
+		max-height: none;
+		overflow: visible;
+		padding-right: 2px;
+	}
+
+	.topo-aside {
+		grid-column: 1;
+		grid-row: 1;
+		position: static;
+		max-height: none;
+		overflow: visible;
 	}
 }
 
@@ -1108,8 +1195,9 @@ pre.field-value {
 	display: flex;
 	flex-direction: column;
 	gap: 8px;
-	position: sticky;
-	top: 12px;
+	/* Sticky is the aside's job now (APM-46); a second sticky here would fight it. */
+	position: static;
+	min-width: 0;
 }
 
 .summary-head {
@@ -1192,6 +1280,13 @@ pre.field-value {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 4px;
+}
+
+/* Same cascade trap as the empty state: `display: flex` would beat the UA
+   `[hidden] { display: none }`, leaving the dependency scopes visible (and
+   clickable) inside the Hierarchy view. Repeat the rule with the attribute. */
+.dag-scopes[hidden] {
+	display: none;
 }
 
 .dag-scope {
@@ -1486,6 +1581,40 @@ pre.field-value {
 	overflow: auto;
 }
 
+@media (max-width: 900px) {
+	/* The inline picture cannot be read at 390px; the full-screen overlay can.
+	   Keep the toolbar (relation switch + Expand) so the graph stays one tap
+	   away, and let the dialog fill the viewport with Esc/focus-return intact. */
+	.dag-panel > .dag.dag-viewport,
+	.dag-panel .dag-legend {
+		display: none;
+	}
+
+	.dag-expand {
+		font-weight: 600;
+	}
+
+	.dag-dialog {
+		width: 100vw;
+		max-width: 100vw;
+		height: 100dvh;
+		max-height: 100dvh;
+		margin: 0;
+		border-radius: 0;
+		border: 0;
+	}
+
+	.dag-dialog-body {
+		height: 100%;
+		max-height: 100dvh;
+		padding: var(--space-3);
+	}
+
+	.dag-dialog .dag.dag-viewport {
+		height: clamp(320px, 62vh, 100%);
+	}
+}
+
 @media (max-width: 720px) {
 	.dag-dialog {
 		width: 100%;
@@ -1553,4 +1682,104 @@ pre.field-value {
 .status-scope .scope:focus-visible {
 	outline: 2px solid var(--accent);
 	outline-offset: -2px;
+}
+
+/* --- dagre viewport (APM-45) ----------------------------------------- */
+
+.dag.dag-viewport {
+	position: relative;
+	width: 100%;
+	/* Inline picture: shorter than before (APM-46 review) so the selection summary
+	   stays visible below it; the dialog keeps the large view. */
+	height: clamp(240px, 32vh, 440px);
+	overflow: hidden;
+	padding: 0;
+	cursor: grab;
+	touch-action: none;
+}
+
+.dag.dag-viewport:active {
+	cursor: grabbing;
+}
+
+.dag.dag-viewport:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+
+.dag-viewport-toolbar {
+	position: absolute;
+	right: var(--space-2);
+	top: var(--space-2);
+	z-index: 2;
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+	background: color-mix(in srgb, var(--surface) 92%, transparent);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 2px 4px;
+}
+
+.dag-viewport-toolbar button {
+	min-height: 26px;
+	padding: 0 var(--space-2);
+	font-size: var(--font-xs);
+}
+
+.dag-zoom-level {
+	font-family: var(--mono);
+	font-size: var(--font-xs);
+	color: var(--muted);
+	min-width: 3.5em;
+	text-align: center;
+}
+
+.dag-canvas {
+	position: absolute;
+	left: 0;
+	top: 0;
+	transform-origin: 0 0;
+	will-change: transform;
+}
+
+.dag-nodes {
+	position: absolute;
+	inset: 0;
+}
+
+.dag-viewport .dag-edges {
+	position: absolute;
+	left: 0;
+	top: 0;
+	overflow: visible;
+}
+
+.dag-viewport[data-zoom="far"] .dag-node-meta,
+.dag-viewport[data-zoom="far"] .dag-node-title-line:nth-child(2) {
+	display: none;
+}
+
+.dag-viewport[data-empty="true"] .dag-canvas,
+.dag-viewport[data-empty="true"] .dag-viewport-toolbar {
+	display: none;
+}
+
+.dag-viewport .dag-empty {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	margin: 0;
+}
+
+/* An author `display` beats the UA `[hidden] { display: none }`, so the empty
+   state stayed painted on top of a graph that had nodes. Repeat the rule with the
+   attribute so "hidden" really hides (APM-46 review). */
+.dag-viewport .dag-empty[hidden] {
+	display: none;
+}
+
+.dag-dialog .dag.dag-viewport {
+	height: min(72vh, 680px);
 }

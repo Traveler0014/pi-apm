@@ -17,7 +17,6 @@ import {
 	type Api,
 	bootstrapTokenFromFragment,
 	createApi,
-	stripTicketFragment,
 	ticketErrorMessage,
 	ticketFromFragment,
 } from "./api";
@@ -32,6 +31,8 @@ import {
 	updateMetrics,
 	updateProject,
 	updateDagPanel,
+	type DagPanelState,
+	applyWorkspaceHeight,
 	updateQueue,
 	updateStatusScope,
 	updateSelectionSummary,
@@ -71,6 +72,8 @@ const state: ViewState = defaultViewState();
 let view: ViewMode = "list";
 let selectedId: string | null = null;
 let dagScope: DagScope = "all";
+/** Relation sub-view + the viewport the user left behind (APM-46). */
+const dagPanel: DagPanelState = { relation: "dependencies", view: null, key: null };
 let snapshot: Snapshot | null = null;
 let connection: ConnectionView = connectionView({ lastSuccessAt: null, lastError: null, refreshing: false, now: Date.now() });
 
@@ -154,11 +157,20 @@ function render(): void {
 	updateTopology(shell, topologySummary(graph), ctx, state.statusScope === "open" ? undefined : queue.closed);
 	const selected = selectedId ? (snapshot?.items.find((item) => item.id === selectedId) ?? null) : null;
 	updateSelectionSummary(shell, ctx, selected, selected ? details.get(selected.id)?.detail : undefined);
-	updateDagPanel(shell, ctx, selected, graph, dagScope, (id) => {
-		selectedId = id;
-		updateHash();
-		render();
-	});
+	applyWorkspaceHeight(shell);
+	updateDagPanel(
+		shell,
+		ctx,
+		selected,
+		graph,
+		dagScope,
+		(id) => {
+			selectedId = id;
+			updateHash();
+			render();
+		},
+		dagPanel,
+	);
 
 	restoreFocus(focus);
 }
@@ -175,23 +187,57 @@ function renderClock(): void {
 	updateBanner(shell, connection);
 }
 
+interface FocusSnapshot {
+	itemId?: string;
+	action?: string;
+	bucket?: string;
+	view?: string;
+	relation?: string;
+	scope?: string;
+	/** Fit / zoom / expand live inside the graph, which is rebuilt each render. */
+	dagControl?: "fit" | "zoom-in" | "zoom-out" | "reset" | "expand";
+}
+
+const DAG_CONTROLS: Array<[FocusSnapshot["dagControl"], string]> = [
+	["fit", "dag-fit"],
+	["reset", "dag-zoom-reset"],
+	["zoom-in", "dag-zoom-in"],
+	["zoom-out", "dag-zoom-out"],
+	["expand", "dag-expand"],
+];
+
 /** Remember what had focus so a data refresh cannot steal it from the keyboard user. */
-function captureFocus(): { itemId?: string; action?: string; bucket?: string; view?: string } | null {
+function captureFocus(): FocusSnapshot | null {
 	const active = document.activeElement as HTMLElement | null;
 	if (!active) return null;
 	const row = active.closest<HTMLElement>("[data-item-id]");
-	return { itemId: row?.dataset.itemId, action: active.dataset.action, bucket: active.dataset.bucket, view: active.dataset.view };
+	const control = DAG_CONTROLS.find(([, className]) => active.classList.contains(className))?.[0];
+	return {
+		itemId: row?.dataset.itemId,
+		action: active.dataset.action,
+		bucket: active.dataset.bucket,
+		view: active.dataset.view,
+		relation: active.dataset.relation,
+		scope: active.classList.contains("dag-scope") ? active.dataset.scope : undefined,
+		dagControl: control,
+	};
 }
 
-function restoreFocus(saved: ReturnType<typeof captureFocus>): void {
+function restoreFocus(saved: FocusSnapshot | null): void {
 	if (!saved) return;
 	const selector = saved.bucket
 		? `[data-bucket="${saved.bucket}"]`
 		: saved.view
 			? `[data-view="${saved.view}"]`
-			: saved.itemId
-				? `[data-item-id="${saved.itemId}"]${saved.action ? ` [data-action="${saved.action}"]` : ""}`
-				: null;
+			: saved.relation
+				? `.dag-panel button[data-relation="${saved.relation}"]`
+				: saved.scope
+					? `.dag-panel .dag-scope[data-scope="${saved.scope}"]`
+					: saved.dagControl
+						? `.dag-panel .dag-${saved.dagControl}`
+						: saved.itemId
+							? `[data-item-id="${saved.itemId}"]${saved.action ? ` [data-action="${saved.action}"]` : ""}`
+							: null;
 	if (!selector) return;
 	document.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
 }
@@ -281,6 +327,16 @@ shell.onDagScope((scope) => {
 	render();
 });
 
+shell.onDagRelation((relation) => {
+	dagPanel.relation = relation;
+	// The other relation is a different picture: fit it instead of reusing a
+	// viewport that was chosen for the previous one.
+	dagPanel.view = null;
+	dagPanel.key = null;
+	updateHash();
+	render();
+});
+
 shell.onStatusScopeChange((scope) => {
 	state.statusScope = scope;
 	// Closed work folds by default; promoting it into a group means the user asked
@@ -335,6 +391,7 @@ function updateHash(extra: { item?: string | null } = {}): void {
 	const hash = new URLSearchParams();
 	if (view !== "list") hash.set("view", view);
 	if (dagScope !== "all") hash.set("scope", dagScope);
+	if (dagPanel.relation !== "dependencies") hash.set("relation", dagPanel.relation);
 	if (state.statusScope !== "open") hash.set("status", state.statusScope);
 	const item = extra.item !== undefined ? extra.item : selectedId ? identifierOf(selectedId) : null;
 	if (item) hash.set("item", item);
@@ -363,6 +420,12 @@ async function openDeepLink(): Promise<void> {
 	if (wantedStatus === "open" || wantedStatus === "closed" || wantedStatus === "all") {
 		state.statusScope = wantedStatus;
 		state.showRecentlyDone = wantedStatus !== "open";
+	}
+	const wantedRelation = hash.get("relation");
+	if (wantedRelation === "hierarchy" || wantedRelation === "dependencies") {
+		dagPanel.relation = wantedRelation;
+		dagPanel.view = null;
+		dagPanel.key = null;
 	}
 	const wantedScope = hash.get("scope");
 	if (wantedScope === "all" || wantedScope === "blocking" || wantedScope === "upstream" || wantedScope === "downstream") dagScope = wantedScope;

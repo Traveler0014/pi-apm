@@ -225,6 +225,37 @@ async function main() {
 		"create", "--title", "Third item behind a chain", "--goal", "verify transitive blockers",
 		"--current-state", "fixture ready",
 	]);
+	// A long open list is a precondition for the master/detail checks (APM-46):
+	// the left column must scroll on its own.
+	for (const title of [
+		"Filler item one",
+		"Filler item two",
+		"Filler item three",
+		"Filler item four",
+		"Filler item five",
+		"Filler item six",
+	]) {
+		run(
+			BIN,
+			["--human", "create", "--title", title, "--goal", "verify the long list", "--current-state", "filler", "--json"],
+			env,
+		);
+	}
+	// CJK titles (APM-46 review): a short two-node chain must fit at a readable
+	// zoom, and a long Chinese title must wrap inside its box instead of overflowing.
+	const cjkBlocker = identifier([
+		"create", "--title", "分片回收", "--goal", "验证中文标题", "--current-state", "fixture ready",
+	]);
+	const cjkChain = identifier([
+		"create", "--title", "映射表修复", "--goal", "验证中文标题", "--current-state", "fixture ready",
+	]);
+	run(BIN, ["claim", cjkChain, "--session", "browser", "--json"], env);
+	run(BIN, ["dep", "add", cjkChain, cjkBlocker, "--session", "browser", "--json"], env);
+	run(BIN, ["release", cjkChain, "--session", "browser", "--json"], env);
+	const cjkLong = identifier([
+		"create", "--title", "修复分片映射表在并发回收阶段偶发死锁并补充长时间回归用例",
+		"--goal", "验证中文长标题换行", "--current-state", "fixture ready",
+	]);
 	run(BIN, ["claim", chain, "--session", "browser", "--json"], env);
 	run(BIN, ["dep", "add", chain, dependent, "--session", "browser", "--json"], env);
 	run(BIN, ["release", chain, "--session", "browser", "--json"], env);
@@ -508,7 +539,8 @@ async function main() {
 		`custom workflow branches show their guards (${branches.join(" | ")})`,
 	);
 
-	// Local dependency graph (APM-21): roles, both edge kinds, text view, scopes.
+	// Local graph (APM-46): dependencies is the product default; hierarchy is the
+	// other sub-view. The legacy combined picture is never exposed.
 	await page.evaluate((id) => {
 		[...document.querySelectorAll('.topology-view [data-item-id]')]
 			.find((node) => node.querySelector(".identifier")?.textContent === id)
@@ -518,39 +550,126 @@ async function main() {
 	const graph = await page.evaluate(() => {
 		const dag = document.querySelector(".dag");
 		return {
+			relation: dag.dataset.relation,
 			roles: [...dag.querySelectorAll(".dag-node")].map((node) => node.dataset.role),
 			kinds: [...new Set([...dag.querySelectorAll(".dag-edge")].map((edge) => edge.dataset.kind))],
 			arrow: [...dag.querySelectorAll(".dag-edge-dependency")].every((edge) => edge.getAttribute("marker-end")),
-			dashed: [...dag.querySelectorAll(".dag-edge-parent")].every((edge) => !edge.getAttribute("marker-end")),
+			parentEdges: dag.querySelectorAll(".dag-edge-parent").length,
 			text: document.querySelector(".dag-text")?.textContent ?? "",
+			hash: location.hash,
+			relations: [...document.querySelectorAll(".dag-panel button[data-relation]")].map(
+				(button) => `${button.dataset.relation}:${button.getAttribute("aria-pressed")}`,
+			),
+			combined: document.querySelectorAll('[data-relation="combined"], button[data-relation="combined"]').length,
+		};
+	});
+	assert(
+		graph.relation === "dependencies" && graph.relations.join(",") === "dependencies:true,hierarchy:false",
+		`dependencies is the default relation (${graph.relations.join(",")})`,
+	);
+	assert(graph.combined === 0, "the legacy combined relation is not exposed");
+	assert(
+		["upstream", "selected", "downstream"].every((role) => graph.roles.includes(role)),
+		`dependency roles: ${graph.roles.join(",")}`,
+	);
+	assert(
+		graph.kinds.length === 1 && graph.kinds[0] === "dependency" && graph.arrow && graph.parentEdges === 0,
+		`dependency edges are solid+arrowed and no hierarchy edge leaks in (${graph.kinds.join(",")})`,
+	);
+	assert(
+		/← blocks/.test(graph.text) && /● selected/.test(graph.text) && graph.hash.includes(`item=${dependent}`),
+		"the text view mirrors the relations and the selection is in the URL",
+	);
+
+	// Scope narrows a dependency chain (and is hidden in the hierarchy view).
+	const allNodes = graph.roles.length;
+	await page.click('.dag-panel [data-scope="blocking"]');
+	await page.waitForTimeout(250);
+	const blocking = await page.evaluate(() => ({
+		nodes: document.querySelectorAll(".dag-panel .dag .dag-node").length,
+		parentEdges: document.querySelectorAll(".dag-panel .dag-edge-parent").length,
+		hash: location.hash,
+	}));
+	assert(
+		blocking.parentEdges === 0 && blocking.nodes <= allNodes,
+		`the blocking-chain scope keeps only dependencies (${blocking.nodes}/${allNodes})`,
+	);
+	assert(blocking.hash.includes("scope=blocking"), "graph scope is reflected in the URL");
+	await page.click('.dag-panel [data-scope="all"]');
+	await page.waitForTimeout(200);
+
+	// Hierarchy sub-view: parent/children only, no dependency edge, no scopes.
+	await page.click('.dag-panel button[data-relation="hierarchy"]');
+	await page.waitForSelector('.dag[data-relation="hierarchy"] .dag-node');
+	const hierarchy = await page.evaluate(() => {
+		const dag = document.querySelector('.dag[data-relation="hierarchy"]');
+		return {
+			roles: [...dag.querySelectorAll(".dag-node")].map((node) => node.dataset.role),
+			kinds: [...new Set([...dag.querySelectorAll(".dag-edge")].map((edge) => edge.dataset.kind))],
+			dashed: [...dag.querySelectorAll(".dag-edge-parent")].every((edge) => !edge.getAttribute("marker-end")),
+			scopesHidden: document.querySelector(".dag-panel .dag-scopes")?.hidden,
+			scopesDisplay: (() => {
+				const scopes = document.querySelector(".dag-panel .dag-scopes");
+				return scopes ? getComputedStyle(scopes).display : null;
+			})(),
+			scopesArea: (() => {
+				const scopes = document.querySelector(".dag-panel .dag-scopes");
+				if (!scopes) return null;
+				const rect = scopes.getBoundingClientRect();
+				return Math.round(rect.width * rect.height);
+			})(),
+			scopeButtonsVisible: [...document.querySelectorAll(".dag-panel .dag-scope")].filter((button) => {
+				const rect = button.getBoundingClientRect();
+				return rect.width > 0 && rect.height > 0;
+			}).length,
 			hash: location.hash,
 		};
 	});
 	assert(
-		["upstream", "parent", "selected"].every((role) => graph.roles.includes(role)),
-		`local graph roles: ${graph.roles.join(",")}`,
+		hierarchy.roles.includes("selected") && hierarchy.roles.some((role) => role === "parent" || role === "child"),
+		`hierarchy roles: ${hierarchy.roles.join(",")}`,
 	);
+	assert(hierarchy.kinds.length === 1 && hierarchy.kinds[0] === "parent", "hierarchy shows parent edges only");
+	assert(hierarchy.dashed, "parent edges stay dashed without an arrow");
 	assert(
-		graph.kinds.includes("dependency") && graph.kinds.includes("parent") && graph.arrow && graph.dashed,
-		"dependency edges are solid+arrowed, parent edges dashed without an arrow",
+		hierarchy.scopesHidden === true &&
+			hierarchy.scopesDisplay === "none" &&
+			hierarchy.scopesArea === 0 &&
+			hierarchy.scopeButtonsVisible === 0,
+		`the dependency scopes take no space in the hierarchy view (display ${hierarchy.scopesDisplay}, area ${hierarchy.scopesArea}, visible buttons ${hierarchy.scopeButtonsVisible})`,
 	);
+	assert(hierarchy.hash.includes("relation=hierarchy"), "the relation is reflected in the URL");
+	await page.click('.dag-panel button[data-relation="dependencies"]');
+	await page.waitForSelector('.dag[data-relation="dependencies"] .dag-node');
+	await page.waitForTimeout(200);
+	// Coming back, the scopes are visible and clickable again — the guard must not
+	// hide them permanently.
+	const scopesBack = await page.evaluate(() => {
+		const scopes = document.querySelector(".dag-panel .dag-scopes");
+		const rect = scopes.getBoundingClientRect();
+		const first = scopes.querySelector(".dag-scope").getBoundingClientRect();
+		return {
+			hidden: scopes.hidden,
+			display: getComputedStyle(scopes).display,
+			area: Math.round(rect.width * rect.height),
+			buttonArea: Math.round(first.width * first.height),
+		};
+	});
 	assert(
-		/blocks/.test(graph.text) && /parent/.test(graph.text) && /selected/.test(graph.text),
-		"the text view mirrors the graph relations",
+		scopesBack.hidden === false && scopesBack.display === "flex" && scopesBack.area > 0 && scopesBack.buttonArea > 0,
+		`the scopes come back in the dependencies view (display ${scopesBack.display}, area ${scopesBack.area}, button ${scopesBack.buttonArea})`,
 	);
-	assert(graph.hash.includes(`item=${dependent}`), "selection is reflected in the URL");
-	await page.click('[data-scope="blocking"]');
-	await page.waitForTimeout(250);
-	const blocking = await page.evaluate(() => ({
-		parentEdges: document.querySelectorAll(".dag-edge-parent").length,
-		hash: location.hash,
-	}));
-	assert(blocking.parentEdges === 0, "the blocking-chain scope hides hierarchy edges");
-	assert(blocking.hash.includes("scope=blocking"), "graph scope is reflected in the URL");
-	await page.click('[data-scope="all"]');
+	await page.click('.dag-panel [data-scope="upstream"]');
+	await page.waitForTimeout(200);
+	assert(
+		(await page.getAttribute('.dag-panel [data-scope="upstream"]', "aria-pressed")) === "true",
+		"a restored scope button is clickable",
+	);
+	await page.click('.dag-panel [data-scope="all"]');
+	await page.waitForTimeout(200);
 
-	// Expanded graph (APM-29): same relations at a larger size, Esc restores focus,
-	// scope switches and the text view stay available in the overlay.
+	// Expanded graph: same picture at a larger size, Esc restores focus, and the
+	// scope/relation controls stay in sync with the panel.
 	const expandTrigger = page.locator(".dag-expand");
 	await expandTrigger.click();
 	await page.waitForSelector('.dag-dialog[open] .dag .dag-node');
@@ -558,11 +677,12 @@ async function main() {
 		const dialog = document.querySelector(".dag-dialog");
 		const dag = dialog.querySelector(".dag");
 		const rect = dialog.getBoundingClientRect();
-		const inline = document.querySelector(".dag-panel > .dag") ?? document.querySelector(".dag-panel .dag");
+		const inline = document.querySelector(".dag-panel .dag");
 		return {
 			open: dialog.hasAttribute("open") || dialog.open,
 			nodes: dag.querySelectorAll(".dag-node").length,
 			inlineNodes: inline ? inline.querySelectorAll(".dag-node").length : 0,
+			relation: dag.dataset.relation,
 			text: dialog.querySelector(".dag-text")?.textContent ?? "",
 			viewport: innerWidth,
 			width: Math.round(rect.width),
@@ -571,10 +691,10 @@ async function main() {
 		};
 	});
 	assert(overlay.open && overlay.focusedInside, "the expanded graph opens as a focused dialog");
-	assert(overlay.nodes === graph.roles.length, `the overlay keeps every relation (${overlay.nodes}/${graph.roles.length})`);
-	assert(overlay.nodes === overlay.inlineNodes, "the overlay is the same graph, not a different one");
+	assert(overlay.nodes === overlay.inlineNodes, `the overlay is the same picture (${overlay.nodes}/${overlay.inlineNodes})`);
+	assert(overlay.relation === "dependencies", "the overlay keeps the current relation");
 	assert(overlay.width <= overlay.viewport, `the overlay fits the viewport (${overlay.width}/${overlay.viewport})`);
-	assert(/blocks/.test(overlay.text) && /parent/.test(overlay.text), "the overlay keeps the text view");
+	assert(/blocks/.test(overlay.text), "the overlay keeps the text view");
 	assert(overlay.overflowX === 0, "the expanded graph adds no horizontal page overflow");
 	await page.click('.dag-dialog [data-scope="upstream"]');
 	await page.waitForTimeout(250);
@@ -609,14 +729,23 @@ async function main() {
 	const single = await page.evaluate(() => {
 		const node = document.querySelector(".dag-panel .dag .dag-node");
 		const rect = node.getBoundingClientRect();
-		return { width: Math.round(rect.width), height: Math.round(rect.height), title: node.querySelector(".dag-node-title")?.textContent ?? "" };
+		const root = document.querySelector(".dag-panel .dag");
+		const canvas = root.querySelector(".dag-canvas");
+		return {
+			width: Math.round(rect.width),
+			height: Math.round(rect.height),
+			title: node.querySelector(".dag-node-title")?.textContent ?? "",
+			root: [root.clientWidth, root.clientHeight],
+			transform: canvas.style.transform,
+			level: root.querySelector(".dag-zoom-level")?.textContent,
+			aside: document.querySelector(".topo-aside")?.getBoundingClientRect().width,
+		};
 	});
+
 	assert(single.width >= 180 && single.height >= 60, `a single node keeps a readable box (${single.width}x${single.height})`);
 	assert(single.title.length > 0, "a single node still shows its title");
 	await page.click(".dag-expand");
 	await page.waitForSelector(".dag-dialog[open] .dag .dag-node");
-	const singleOverlay = await page.evaluate(() => document.querySelectorAll(".dag-dialog .dag .dag-node").length);
-	assert(singleOverlay === 1, "the single-node graph expands too");
 	await page.keyboard.press("Escape");
 	await page.waitForTimeout(150);
 
@@ -911,6 +1040,318 @@ async function main() {
 	await page.setViewportSize({ width: 1280, height: 900 });
 	await page.click('.status-scope [data-status-scope="open"]');
 	await page.waitForTimeout(200);
+
+	// 8d. Master/detail workspace (APM-46): the list scrolls on its own, the graph
+	// and summary stay pinned beside it.
+	await page.click('[data-view="topology"]');
+	await page.waitForSelector(".topo-list .topo-card");
+	const workspace = await page.evaluate(() => {
+		const list = document.querySelector(".topo-list");
+		const aside = document.querySelector(".topo-aside");
+		const panel = document.querySelector(".dag-panel");
+		const summary = document.querySelector(".selection-summary");
+		return {
+			listScrolls: list.scrollHeight > list.clientHeight + 20,
+			pageScrolls: document.documentElement.scrollHeight - document.documentElement.clientHeight > 2,
+			asideRightOfList: aside.getBoundingClientRect().left >= list.getBoundingClientRect().right - 1,
+			asideOrder: [...aside.children].map((node) => node.className).join(","),
+			asideHoldsPanel: aside.contains(panel) && aside.contains(summary),
+			inlineGraph: Boolean(panel.querySelector(".dag.dag-viewport")),
+			overflow: document.documentElement.scrollHeight - document.documentElement.clientHeight,
+			listH: Math.round(list.getBoundingClientRect().height),
+			clientH: document.documentElement.clientHeight,
+			topoTop: document.querySelector(".topology-view").style.getPropertyValue("--topo-top"),
+			bottom: Math.round(document.querySelector(".content").getBoundingClientRect().bottom),
+		};
+	});
+	assert(workspace.listScrolls, "the item list scrolls without the page scrolling");
+	assert(!workspace.pageScrolls, `the topology workspace fits the viewport height (overflow ${workspace.overflow}px)`);
+	assert(workspace.asideRightOfList, "the graph column sits to the right of the list");
+	assert(
+		workspace.asideHoldsPanel && workspace.asideOrder === "dag-panel,selection-summary",
+		`the sticky column is graph-on-top, summary-below (${workspace.asideOrder})`,
+	);
+	assert(workspace.inlineGraph, "the graph is rendered inline on a desktop viewport");
+
+	// Scroll the list to the end: the page must not move and the graph must stay
+	// pinned, which is what makes a long queue usable.
+	const asideBefore = await page.evaluate(() =>
+		Math.round(document.querySelector(".topo-aside").getBoundingClientRect().top),
+	);
+	await page.evaluate(() => {
+		const list = document.querySelector(".topo-list");
+		list.scrollTop = list.scrollHeight;
+	});
+	await page.waitForTimeout(150);
+	const pinned = await page.evaluate(() => ({
+		listScroll: document.querySelector(".topo-list").scrollTop,
+		pageY: window.scrollY,
+		asideTop: Math.round(document.querySelector(".topo-aside").getBoundingClientRect().top),
+		asideBottom: Math.round(document.querySelector(".topo-aside").getBoundingClientRect().bottom),
+		viewport: innerHeight,
+	}));
+	assert(pinned.listScroll > 100, `the list scrolled on its own (${pinned.listScroll})`);
+	assert(pinned.pageY === 0, "scrolling the list never scrolls the page");
+	assert(
+		pinned.asideTop === asideBefore && pinned.asideTop >= 0 && pinned.asideBottom <= pinned.viewport + 1,
+		`the graph stays put and fully visible while the list scrolls (${pinned.asideTop}px, bottom ${pinned.asideBottom}/${pinned.viewport})`,
+	);
+
+	// Selecting the last card needs no page scroll to reach the picture.
+	await page.evaluate(() => {
+		const cards = [...document.querySelectorAll(".topo-list .topo-card")];
+		cards[cards.length - 1].click();
+	});
+	await page.waitForTimeout(300);
+	const lastPick = await page.evaluate(() => {
+		const graph = document.querySelector(".dag-panel .dag").getBoundingClientRect();
+		return {
+			pageY: window.scrollY,
+			top: Math.round(graph.top),
+			bottom: Math.round(graph.bottom),
+			viewport: innerHeight,
+			nodes: document.querySelectorAll(".dag-panel .dag .dag-node").length,
+			selectedInList: Boolean(document.querySelector(".topo-list .topo-card[aria-current='true'], .topo-list .topo-card[data-selected='true']")),
+			listScroll: document.querySelector(".topo-list").scrollTop,
+		};
+	});
+	assert(lastPick.pageY === 0, "selecting the last item does not scroll the page");
+	assert(
+		lastPick.top >= 0 && lastPick.bottom <= lastPick.viewport + 1,
+		`the graph is fully visible without a page scroll (${lastPick.top}-${lastPick.bottom}/${lastPick.viewport})`,
+	);
+	assert(lastPick.nodes >= 1, "the graph renders the new selection");
+
+	// Column budget (APM-46 review): the graph column gets ~55% of the workspace and
+	// the inline picture is shorter, so a simple Chinese chain is readable.
+	const columns = await page.evaluate(() => {
+		const view = document.querySelector(".topology-view").getBoundingClientRect();
+		const aside = document.querySelector(".topo-aside").getBoundingClientRect();
+		const graph = document.querySelector(".dag-panel .dag.dag-viewport").getBoundingClientRect();
+		return {
+			ratio: aside.width / view.width,
+			graphHeight: Math.round(graph.height),
+			viewportHeight: innerHeight,
+		};
+	});
+	assert(
+		columns.ratio >= 0.5 && columns.ratio <= 0.6,
+		`the graph column takes ~55% of the workspace (${Math.round(columns.ratio * 100)}%)`,
+	);
+	assert(
+		columns.graphHeight < Math.round(columns.viewportHeight * 0.4),
+		`the inline graph is shorter than 40vh (${columns.graphHeight}px of ${columns.viewportHeight})`,
+	);
+
+	// A two-node Chinese chain must fit at >= 85% zoom, not be shrunk to ~74%.
+	await page.evaluate((id) => {
+		[...document.querySelectorAll('.topology-view [data-item-id]')]
+			.find((node) => node.querySelector(".identifier")?.textContent === id)
+			?.click();
+	}, cjkChain);
+	await page.waitForFunction(
+		(id) =>
+			document.querySelectorAll(".dag-panel .dag .dag-node").length === 2 &&
+			[...document.querySelectorAll(".dag-panel .dag .dag-node")].some(
+				(node) => node.querySelector(".dag-node-id")?.textContent === id,
+			),
+		cjkChain,
+	);
+	await page.waitForTimeout(200);
+	const cjkFit = await page.evaluate(() => ({
+		level: Number.parseInt(document.querySelector(".dag-panel .dag-zoom-level")?.textContent ?? "0", 10),
+		nodes: document.querySelectorAll(".dag-panel .dag .dag-node").length,
+	}));
+	assert(cjkFit.nodes === 2, `the Chinese chain renders both nodes (${cjkFit.nodes})`);
+	assert(cjkFit.level >= 85, `a two-node Chinese chain fits at >= 85% (${cjkFit.level}%)`);
+
+	// A long Chinese title wraps into two lines inside the box: no overflow, and the
+	// full text stays available through the title/aria attributes.
+	await page.evaluate((id) => {
+		[...document.querySelectorAll('.topology-view [data-item-id]')]
+			.find((node) => node.querySelector(".identifier")?.textContent === id)
+			?.click();
+	}, cjkLong);
+	await page.waitForFunction(
+		(id) =>
+			[...document.querySelectorAll(".dag-panel .dag .dag-node")].some(
+				(node) =>
+					node.querySelector(".dag-node-id")?.textContent === id &&
+					node.querySelectorAll(".dag-node-title-line").length >= 2,
+			),
+		cjkLong,
+	);
+	await page.waitForTimeout(200);
+	const cjkWrap = await page.evaluate((id) => {
+		const node = [...document.querySelectorAll(".dag-panel .dag .dag-node")].find(
+			(candidate) => candidate.querySelector(".dag-node-id")?.textContent === id,
+		);
+		const lines = [...node.querySelectorAll(".dag-node-title-line")];
+		const title = node.querySelector(".dag-node-title");
+		return {
+			lines: lines.map((line) => line.textContent ?? ""),
+			overflow: lines.map((line) => line.scrollWidth - line.clientWidth),
+			nodeOverflow: node.scrollWidth - node.clientWidth,
+			tooltip: title?.getAttribute("title") ?? "",
+			aria: node.getAttribute("aria-label") ?? "",
+			box: [Math.round(node.getBoundingClientRect().width), Math.round(node.getBoundingClientRect().height)],
+		};
+	}, cjkLong);
+	assert(cjkWrap.lines.length >= 2, `a long Chinese title uses both lines (${cjkWrap.lines.join(" | ")})`);
+	assert(
+		cjkWrap.overflow.every((gap) => gap <= 1) && cjkWrap.nodeOverflow <= 1,
+		`the Chinese title does not overflow its box (${cjkWrap.overflow.join(",")} / ${cjkWrap.nodeOverflow})`,
+	);
+	assert(cjkWrap.tooltip.length > 5 && cjkWrap.aria.includes("修复分片映射表"), "the full Chinese title stays available");
+	assert(cjkWrap.box[0] >= 180 && cjkWrap.box[1] >= 60, `the Chinese node keeps a readable box (${cjkWrap.box.join("x")})`);
+
+	// The empty state must be really hidden on a non-empty graph (APM-46 review): an
+	// author `display: grid` used to override `[hidden]`, painting the hint text on
+	// top of the edges. Check both directions: non-empty hides it, and a genuinely
+	// empty relation shows it.
+	const emptyState = await page.evaluate(() => {
+		const root = document.querySelector(".dag-panel .dag");
+		const empty = root.querySelector(".dag-empty");
+		const style = getComputedStyle(empty);
+		const rect = empty.getBoundingClientRect();
+		return {
+			nodes: root.querySelectorAll(".dag-node").length,
+			hiddenAttr: empty.hasAttribute("hidden"),
+			display: style.display,
+			visibility: style.visibility,
+			area: Math.round(rect.width * rect.height),
+		};
+	});
+	assert(emptyState.nodes > 0, "the graph has nodes for the empty-state check");
+	assert(
+		emptyState.display === "none" && emptyState.area === 0,
+		`the empty state is not painted on a non-empty graph (display ${emptyState.display}, area ${emptyState.area})`,
+	);
+
+	// The rule itself, in both directions: inside a real viewport, a hidden hint is
+	// display:none and an unhidden one is painted. (A selected item always keeps one
+	// node, so `data-empty="true"` is not reachable from the product UI — this
+	// asserts the cascade that the bug report was about.)
+	const emptyCascade = await page.evaluate(() => {
+		const root = document.querySelector(".dag-panel .dag");
+		const probe = document.createElement("p");
+		probe.className = "muted dag-empty";
+		probe.textContent = "probe";
+		probe.hidden = true;
+		root.append(probe);
+		const hiddenDisplay = getComputedStyle(probe).display;
+		probe.hidden = false;
+		const shownDisplay = getComputedStyle(probe).display;
+		probe.remove();
+		const real = root.querySelector(".dag-empty");
+		return {
+			hiddenDisplay,
+			shownDisplay,
+			realHidden: real?.hasAttribute("hidden") ?? null,
+			rootEmpty: root.dataset.empty,
+			canvasHidden: root.querySelector(".dag-canvas")?.hidden ?? null,
+		};
+	});
+	assert(
+		emptyCascade.hiddenDisplay === "none",
+		`a hidden empty state is display:none, not grid (${emptyCascade.hiddenDisplay})`,
+	);
+	assert(
+		emptyCascade.shownDisplay !== "none",
+		`an unhidden empty state is still painted (${emptyCascade.shownDisplay})`,
+	);
+	assert(
+		emptyCascade.realHidden === (emptyCascade.rootEmpty === "false") &&
+			emptyCascade.canvasHidden === (emptyCascade.rootEmpty === "true"),
+		`the empty hint and canvas visibility follow data-empty (${emptyCascade.rootEmpty})`,
+	);
+
+	// A 4s poll refresh keeps the list scroll, the zoom, the search and focus.
+	await page.evaluate(() => {
+		document.querySelector(".topo-list").scrollTop = 320;
+	});
+	await page.click(".dag-panel .dag-zoom-in");
+	await page.focus(".dag-panel button[data-relation='dependencies']");
+	await page.waitForTimeout(200);
+	const beforeRefresh = await page.evaluate(() => ({
+		scroll: document.querySelector(".topo-list").scrollTop,
+		level: document.querySelector(".dag-panel .dag-zoom-level")?.textContent,
+		search: document.querySelector('input[aria-label="Search work items"]').value,
+		focusRelation: document.activeElement?.getAttribute("data-relation"),
+		selected: document.querySelector('.dag-panel .dag .dag-node[data-selected="true"]')?.dataset.itemId,
+	}));
+	await page.waitForTimeout(5000);
+	const afterRefresh = await page.evaluate(() => ({
+		scroll: document.querySelector(".topo-list").scrollTop,
+		level: document.querySelector(".dag-panel .dag-zoom-level")?.textContent,
+		search: document.querySelector('input[aria-label="Search work items"]').value,
+		focusRelation: document.activeElement?.getAttribute("data-relation"),
+		selected: document.querySelector('.dag-panel .dag .dag-node[data-selected="true"]')?.dataset.itemId,
+	}));
+	assert(afterRefresh.scroll === beforeRefresh.scroll, `the list keeps its scroll across a refresh (${afterRefresh.scroll})`);
+	assert(afterRefresh.level === beforeRefresh.level, `the graph keeps its zoom across a refresh (${afterRefresh.level})`);
+	assert(afterRefresh.search === beforeRefresh.search, "the search text survives a refresh");
+	assert(afterRefresh.selected === beforeRefresh.selected, "the selection survives a refresh");
+	assert(
+		afterRefresh.focusRelation === beforeRefresh.focusRelation && beforeRefresh.focusRelation === "dependencies",
+		`focus stays on the relation control across a refresh (${afterRefresh.focusRelation})`,
+	);
+
+	// Narrow screen: the inline picture collapses into the full-screen overlay.
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.waitForTimeout(400);
+	const narrowGraph = await page.evaluate(() => ({
+		inlineHidden: getComputedStyle(document.querySelector(".dag-panel .dag.dag-viewport")).display === "none",
+		expandVisible: (() => {
+			const rect = document.querySelector(".dag-expand").getBoundingClientRect();
+			return rect.width > 0 && rect.height > 0;
+		})(),
+		overflow: Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth),
+	}));
+	assert(narrowGraph.inlineHidden, "the inline graph collapses on a narrow screen");
+	assert(narrowGraph.expandVisible, "the Expand control stays reachable at 390px");
+	assert(narrowGraph.overflow === 0, "the narrow topology workspace has no horizontal overflow");
+	await page.click(".dag-expand");
+	await page.waitForSelector(".dag-dialog[open] .dag .dag-node", { state: "visible" });
+	const fullscreen = await page.evaluate(() => {
+		const rect = document.querySelector(".dag-dialog").getBoundingClientRect();
+		return {
+			width: Math.round(rect.width),
+			height: Math.round(rect.height),
+			viewportWidth: innerWidth,
+			viewportHeight: innerHeight,
+			nodes: document.querySelectorAll(".dag-dialog .dag .dag-node").length,
+			overflow: Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth),
+		};
+	});
+	assert(
+		fullscreen.width >= fullscreen.viewportWidth - 1 && fullscreen.height >= fullscreen.viewportHeight - 1,
+		`the graph fills the viewport at 390px (${fullscreen.width}x${fullscreen.height})`,
+	);
+	assert(fullscreen.nodes >= 1, "the full-screen graph renders the neighbourhood");
+	assert(fullscreen.overflow === 0, "the full-screen graph adds no horizontal overflow");
+	await page.keyboard.press("Escape");
+	await page.waitForTimeout(250);
+	const narrowFocus = await page.evaluate(() => ({
+		open: document.querySelector(".dag-dialog")?.hasAttribute("open") ?? false,
+		focus: document.activeElement?.getAttribute("aria-label"),
+	}));
+	assert(!narrowFocus.open, "Escape closes the full-screen graph");
+	assert(narrowFocus.focus === "Expand local dependency graph", "focus returns to Expand after the full-screen graph closes");
+	await page.setViewportSize({ width: 1280, height: 900 });
+	await page.waitForTimeout(300);
+
+	// The plain list view is untouched by the workspace work.
+	await page.click('[data-view="list"]');
+	const plainList = await page.evaluate(() => ({
+		rows: document.querySelectorAll(".list-view .queue-group .row").length,
+		nested: document.querySelectorAll(".list-view .topo-list, .list-view .topo-aside").length,
+		listScrolls: document.querySelector(".list-view").scrollHeight > document.documentElement.clientHeight,
+	}));
+	assert(plainList.rows > 0 && plainList.nested === 0, "the plain list view keeps its own layout");
+	assert(plainList.listScrolls, "the list view still scrolls the page as before");
+	await page.click('[data-view="topology"]');
+	await page.waitForSelector(".topo-list .topo-card");
 
 	// 9. XSS payloads stay text.
 	const xss = identifier([

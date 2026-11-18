@@ -169,16 +169,44 @@ curl -H "Authorization: Bearer $(cat .apm/rest-token)" \
   state the workflow does not declare renders an explicit unknown-stage warning —
   the UI never guesses the default six states.
 
-**Local dependency graph** (below the groups, for the selected item): only the
-neighbourhood is drawn (two hops), with dependency edges solid + arrowed and
-parent/child edges dashed without an arrow, plus a legend. Scope buttons switch
-between **All**, **Blocking chain**, **Upstream** and **Downstream**; the scope
-is reflected in the URL (`#scope=upstream`). Every node is a real `<button>`
+**Topology workspace (master/detail).** The topology view is a two-column
+workspace (list column + ~55 % graph column, single column below 900 px): the
+item groups scroll in their own left column, and the right column is pinned — the
+graph sits on top (32 vh, so the summary stays visible), the selected-item
+summary below. The columns
+are sized from the measured chrome height (`--topo-top` / `--topo-bottom`), so
+the page itself does not scroll in this view and picking an item near the end of
+a long list never requires scrolling to find the picture. The list keeps its
+scroll offset, the graph keeps its zoom/pan, and focus stays where it was across
+the 4 s refresh.
+
+**Local graph: two relation sub-views.** The product default is
+**Dependencies** — work order, left-to-right, dependency edges solid + arrowed,
+with scope buttons for **All**, **Blocking chain**, **Upstream** and
+**Downstream** (reflected in `#scope=upstream`). **Hierarchy** is the other
+sub-view: parent and children, top-down, dashed edges without arrows, and no
+scope buttons (a tree has nothing to narrow). The relation lives in the URL
+(`#relation=hierarchy`); the legacy *combined* picture is not offered, because a
+parent and a dependent ranked together produced reversed same-column edges.
+Layout comes from dagre (`ui/src/graph/layout.ts`): nodes are real `<button>`s
 (`aria-label` carries identifier, title, status and health; `aria-current` marks
-the selection), and the **Text view** disclosure below the graph lists the same
-relations in reading order (`← blocks`, `↑ parent`, `● selected`,
-`↓ child`, `→ unblocks`) with *Select* buttons that drive the same selection —
-that list is the keyboard and screen-reader equivalent of the picture.
+the selection) and the SVG edge layer is `aria-hidden`. A **Fit** control, 100 %,
+zoom in/out, wheel zoom, drag-to-pan and `+ - 0 f` / arrow keys work without a
+mouse. The viewport is fitted only when the picture changes (selection, relation
+or scope); a refresh never re-fits under the user's hands. The **Text view**
+disclosure below the graph lists the same relations in reading order
+(`← blocks`, `↑ parent`, `● selected`, `↓ child`, `→ unblocks`) with *Select*
+buttons that drive the same selection — that list is the keyboard and
+screen-reader equivalent of the picture.
+
+**Titles are measured in Unicode width units, not characters.** A CJK glyph is
+worth two Latin letters, so node width comes from the widest *wrapped* line
+(`titleUnits`, `MAX_LINE_UNITS = 26` ≈ 184 px of the 208 px minimum box).
+Chinese/Japanese/Korean titles break between grapheme clusters (no spaces
+needed), Latin titles still never split a word, and a truncated title ends with
+`…` while the full text stays in `title=` and in the node's `aria-label`. Pasting
+a long Chinese title therefore produces two readable lines instead of one
+overflowing line.
 
 **Status scope (Open / Closed / All).** The segmented control next to the view
 switch decides which lifecycle half the queue shows, and is kept in the URL
@@ -206,7 +234,9 @@ just ui-browser    # real Chromium via playwright-core, throwaway ledger:
                    # ticket exchange, first paint vs `apm dashboard --json`,
                    # dedup, filters/search/sort, drawer + events + focus + copy,
                    # topology groups + blockers/unlocks + stage bars (custom
-                   # workflow) + local graph (both edge kinds, scopes, text view)
+                   # workflow) + workspace geometry (own list scroll, pinned
+                   # graph, no page scroll) + relation sub-views + refresh
+                   # state preservation + full-screen overlay at 390 px
                    # + closed-category drawer, 5 s auto refresh, manual refresh,
                    # offline cache + recovery, XSS escaping, 390 px overflow,
                    # storage/HTML/CSP/console hygiene
@@ -283,10 +313,14 @@ Rules that are exercised by the browser checks:
   Enter/Space. The drawer and the expanded graph are native dialogs with a
   focus trap; `Escape` closes them and returns focus to the trigger. Copy
   buttons announce through `aria-live`.
-- **Expanded graph.** `Expand graph` renders the same layout with larger boxes
-  and keeps dependency/parent edges, scope switches and the text view. On a
-  narrow screen the dialog fills the viewport, scrolls inside, and the page
-  itself never scrolls sideways.
+- **Expanded graph.** `Expand graph` renders the same relation and scope with
+  larger boxes and keeps the text view; the overlay stays in sync with the
+  panel. Below 900 px the inline picture collapses and the overlay becomes the
+  graph experience: it fills the viewport, scrolls inside, closes with `Escape`,
+  and returns focus to the *Expand* trigger. The page never scrolls sideways.
+- **Workspace.** Topology is master/detail: list column (own scroll, offset
+  preserved on refresh), pinned graph column with the summary underneath.
+  Selecting the last item of a long list needs no page scroll.
 - **Status scope.** `Open / Closed / All` narrows the queue; closed work is a
   real group with the same rows/cards (searchable, deep-linkable via `#item=`)
   and is reflected in `#status=`, so a reload keeps it. When closed is a group,
@@ -295,9 +329,10 @@ Rules that are exercised by the browser checks:
   outage keeps the cached rows under `offline · cached <time>` and recovers
   automatically. Filters, sort, scope and the expanded selection survive a
   refresh.
-- **Narrow screens.** One column below 860 px; grid/flex children set
+- **Narrow screens.** One column below 900 px (the topology list stops being a
+  nested scroller and the page scrolls again); grid/flex children set
   `min-width: 0` so long titles wrap instead of widening the page; the graph
-  dialog is full-screen below 720 px.
+  dialog is full-screen below 900 px.
 
 ## Routes
 

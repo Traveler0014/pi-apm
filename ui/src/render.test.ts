@@ -19,6 +19,7 @@ import {
 	updateHeader,
 	updateMetrics,
 	updateDagPanel,
+	type DagPanelState,
 	updateQueue,
 	updateStatusScope,
 	updateSelectionSummary,
@@ -49,11 +50,16 @@ function mount() {
 	const state: ViewState = defaultViewState();
 	const items = allItems();
 	const dashboard = mockDashboard(new Date(NOW).toISOString());
-	const view: { mode: ViewMode; selected: string | null; scope: "all" | "blocking" | "upstream" | "downstream" } = {
+	const view: {
+		mode: ViewMode;
+		selected: string | null;
+		scope: "all" | "blocking" | "upstream" | "downstream";
+	} = {
 		mode: "list",
 		selected: null,
 		scope: "all",
 	};
+	const panel: DagPanelState = { relation: "dependencies", view: null, key: null };
 	const ctx = (): RenderContext => ({
 		state,
 		view: view.mode,
@@ -77,12 +83,20 @@ function mount() {
 		updateTopology(shell, topologySummary(graph), ctx(), state.statusScope === "open" ? undefined : queue.closed);
 		const selected = view.selected ? (items.find((item) => item.id === view.selected) ?? null) : null;
 		updateSelectionSummary(shell, ctx(), selected, { acceptance: [{ status: "met" }, { status: "open" }] });
-		updateDagPanel(shell, ctx(), selected, buildGraph(items, NOW), view.scope, (id) => {
-			view.selected = id;
-		});
+		updateDagPanel(
+			shell,
+			ctx(),
+			selected,
+			buildGraph(items, NOW),
+			view.scope,
+			(id) => {
+				view.selected = id;
+			},
+			panel,
+		);
 	};
 	render();
-	return { root, shell, dashboard, state, view, items, render };
+	return { root, shell, dashboard, state, view, panel, items, render };
 }
 
 beforeEach(() => {
@@ -352,20 +366,62 @@ describe("dashboard shell: local dependency graph (APM-21)", () => {
 		expect(shell.dagDialog.open || shell.dagDialog.hasAttribute("open")).toBe(false);
 	});
 
-	it("renders the neighbourhood with dependency and parent edges kept apart", () => {
+	it("defaults to the dependencies relation and never mixes in hierarchy edges", () => {
 		const { shell, view, render } = mount();
 		view.mode = "topology";
 		view.selected = "i-17";
 		render();
 		const dag = shell.dagPanel.querySelector<HTMLElement>(".dag")!;
 		expect(dag).not.toBeNull();
-		// APM-17 is blocked by APM-14/15/16 and its story is APM-13.
+		// APM-17 is blocked by APM-14/15/16; its story APM-13 is hierarchy, not order.
 		const nodes = [...dag.querySelectorAll<HTMLElement>(".dag-node")].map((node) => node.dataset.role);
 		expect(nodes).toContain("selected");
-		expect(nodes.some((role) => role === "upstream" || role === "parent" || role === "child")).toBe(true);
+		expect(nodes).toContain("upstream");
+		expect(nodes).not.toContain("parent");
+		expect(nodes).not.toContain("child");
 		const kinds = [...dag.querySelectorAll(".dag-edge")].map((edge) => edge.getAttribute("data-kind"));
-		expect(new Set(kinds)).toContain("dependency");
-		expect(shell.dagPanel.querySelector(".dag-edge-parent")).not.toBeNull();
+		expect(new Set(kinds)).toEqual(new Set(["dependency"]));
+		expect(shell.dagPanel.querySelector(".dag-edge-parent")).toBeNull();
+		expect(dag.dataset.relation).toBe("dependencies");
+	});
+
+	it("switches to a hierarchy-only picture with its own control", () => {
+		const { shell, view, panel, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		const relations = [...shell.dagPanel.querySelectorAll<HTMLButtonElement>("button[data-relation]")];
+		expect(relations.map((button) => button.dataset.relation)).toEqual(["dependencies", "hierarchy"]);
+		expect(relations[0]!.getAttribute("aria-pressed")).toBe("true");
+		// The legacy combined picture is not offered to the product UI.
+		expect(shell.dagPanel.querySelector('button[data-relation="combined"]')).toBeNull();
+
+		let requested: string | null = null;
+		shell.onDagRelation((relation) => {
+			requested = relation;
+		});
+		relations[1]!.click();
+		expect(requested).toBe("hierarchy");
+
+		panel.relation = "hierarchy";
+		render();
+		const dag = shell.dagPanel.querySelector<HTMLElement>(".dag")!;
+		expect(dag.dataset.relation).toBe("hierarchy");
+		const nodes = [...dag.querySelectorAll<HTMLElement>(".dag-node")].map((node) => node.dataset.role);
+		expect(nodes).toContain("selected");
+		expect(nodes.some((role) => role === "parent" || role === "child")).toBe(true);
+		expect(nodes).not.toContain("upstream");
+		const kinds = [...dag.querySelectorAll(".dag-edge")].map((edge) => edge.getAttribute("data-kind"));
+		expect(new Set(kinds)).toEqual(new Set(["parent"]));
+		// Scope narrows a dependency chain only, so it is not offered here.
+		expect(shell.dagPanel.querySelector<HTMLElement>(".dag-scopes")!.hidden).toBe(true);
+		// ...and the guard is not permanent: switching back re-shows the scopes.
+		panel.relation = "dependencies";
+		panel.view = null;
+		panel.key = null;
+		render();
+		expect(shell.dagPanel.querySelector<HTMLElement>(".dag-scopes")!.hidden).toBe(false);
+		expect(shell.dagPanel.querySelector('.dag-scope[data-scope="all"]')).not.toBeNull();
 	});
 
 	it("offers scope switches and re-renders the graph and text view together", () => {
@@ -529,5 +585,69 @@ describe("dashboard shell: status scope and closed group (APM-30)", () => {
 		const card = shell.topologyGroups.querySelector<HTMLElement>('[data-group="closed"] [data-item-id]')!;
 		card.querySelector<HTMLElement>('[data-action="open-detail"]')!.click();
 		expect(opened).toHaveLength(1);
+	});
+});
+
+describe("topology master/detail workspace (APM-46)", () => {
+	it("puts the list in its own scroll region and the graph + summary in a sticky column", () => {
+		const { shell, view, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		// Left column: the list, on its own.
+		expect(shell.topoList.contains(shell.topologyGroups)).toBe(true);
+		expect(shell.topoList.getAttribute("role")).toBe("region");
+		expect(shell.topoList.getAttribute("aria-label")).toBe("Work items");
+		// Right column: graph on top, summary below, nothing else.
+		expect(shell.topoAside.contains(shell.dagPanel)).toBe(true);
+		expect(shell.topoAside.contains(shell.summary)).toBe(true);
+		expect([...shell.topoAside.children].map((node) => node.className)).toEqual([
+			"dag-panel",
+			"selection-summary",
+		]);
+		// The two columns are siblings, so CSS can pin the right one.
+		expect([...shell.topologyView.children].map((node) => node.className)).toEqual([
+			"topo-list",
+			"topo-aside",
+			"dag-dialog",
+		]);
+	});
+
+	it("keeps the list scroll offset across a refresh", () => {
+		const { shell, view, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		shell.topoList.scrollTop = 480;
+		render();
+		expect(shell.topoList.scrollTop).toBe(480);
+	});
+
+	it("fits a new picture but preserves the user's viewport when nothing changed", () => {
+		const { shell, view, panel, render } = mount();
+		view.mode = "topology";
+		view.selected = "i-17";
+		render();
+		const level = () => shell.dagPanel.querySelector<HTMLElement>(".dag-zoom-level")!.textContent;
+		// The user zooms in; the stored view is what survives the next refresh.
+		shell.dagPanel.querySelector<HTMLButtonElement>(".dag-zoom-in")!.click();
+		const zoomed = level();
+		expect(zoomed).not.toBe("100%");
+		expect(panel.key).toContain("i-17");
+
+		render(); // 4s poll: same selection, same relation, same scope
+		expect(level()).toBe(zoomed);
+
+		// A different selection is a different picture: it is fitted again.
+		view.selected = "i-16";
+		render();
+		expect(level()).not.toBe(zoomed);
+
+		// Switching relation also re-fits instead of inheriting the old viewport.
+		panel.relation = "hierarchy";
+		panel.view = null;
+		panel.key = null;
+		render();
+		expect(shell.dagPanel.querySelector<HTMLElement>(".dag")!.dataset.relation).toBe("hierarchy");
 	});
 });

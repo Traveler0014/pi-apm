@@ -4,6 +4,7 @@ import {
 	findCycles,
 	isOpenItem,
 	localDag,
+	localDagFor,
 	localDagText,
 	openBlockers,
 	openDependents,
@@ -281,5 +282,42 @@ describe("numbers stay stable", () => {
 		const graph = buildGraph(items);
 		expect(byId(items, "a").number).toBeLessThan(byId(items, "b").number);
 		expect(topologySummary(graph).ready.map((item) => item.number)).toEqual([1, 2]);
+	});
+});
+
+describe("relation-specific neighbourhoods (APM-45)", () => {
+	const items = make([
+		{ id: "epic", category: "active", status: "doing" },
+		{ id: "up", category: "active", status: "doing", parent: "epic" },
+		{ id: "sel", category: "active", status: "doing", blockedBy: ["up"], parent: "epic" },
+		{ id: "down", category: "open", status: "ready", blockedBy: ["sel"] },
+		{ id: "child", category: "open", status: "ready", parent: "sel" },
+	]);
+	const graph = buildGraph(items);
+
+	it("keeps dependencies and hierarchy in separate neighbourhoods", () => {
+		const deps = localDagFor(graph, "sel", 2, "dependencies");
+		expect(deps.nodes.map((node) => node.item.id).sort()).toEqual(["down", "sel", "up"]);
+		expect(deps.edges.every((edge) => edge.kind === "dependency")).toBe(true);
+		expect(deps.parents).toEqual([]);
+		expect(deps.children).toEqual([]);
+
+		const hierarchy = localDagFor(graph, "sel", 2, "hierarchy");
+		expect(hierarchy.nodes.map((node) => node.item.id).sort()).toEqual(["child", "epic", "sel"]);
+		expect(hierarchy.edges.every((edge) => edge.kind === "parent")).toBe(true);
+		expect(hierarchy.upstream).toEqual([]);
+		expect(hierarchy.downstream).toEqual([]);
+	});
+
+	it("does not lose a parent that is also an upstream blocker in dependencies", () => {
+		const deps = localDagFor(graph, "sel", 2, "dependencies");
+		const up = deps.nodes.find((node) => node.item.id === "up");
+		expect(up?.role).toBe("upstream");
+	});
+
+	it("legacy localDag still combines both relations", () => {
+		const combined = localDag(graph, "sel", 2);
+		expect(combined.nodes.some((node) => node.role === "parent")).toBe(true);
+		expect(combined.edges.some((edge) => edge.kind === "dependency")).toBe(true);
 	});
 });

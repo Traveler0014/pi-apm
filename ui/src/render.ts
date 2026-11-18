@@ -26,9 +26,9 @@ import {
 	dataAge,
 	relativeTime,
 } from "./transform";
-import { renderDag, renderDagText } from "./dag";
+import { graphViewFor, localDagFor, renderDagText, type DagRelationMode, type GraphViewOptions } from "./dag";
 import { groupMeta } from "./groups";
-import { type DagScope, type LocalDag, localDag, type TopologyGraph, type TopologySummary } from "./topology";
+import { type DagScope, type LocalDag, type TopologyGraph, type TopologySummary } from "./topology";
 import type { BucketKey, Dashboard, WorkItem } from "./types";
 import { acceptanceProgress, categoryMark, stageBadge, type StageModel } from "./workflow";
 
@@ -58,7 +58,11 @@ export interface Shell {
 	sort: HTMLSelectElement;
 	listView: HTMLElement;
 	topologyView: HTMLElement;
+	/** Scrollable master column (left on desktop). */
+	topoList: HTMLElement;
 	topologyGroups: HTMLElement;
+	/** Sticky detail column: graph on top, selection summary below. */
+	topoAside: HTMLElement;
 	dagPanel: HTMLElement;
 	/** Modal overlay for the expanded local graph (APM-29). */
 	dagDialog: HTMLDialogElement;
@@ -76,6 +80,7 @@ export interface Shell {
 	onStatusScopeChange: (handler: (scope: StatusScope) => void) => void;
 	onSelect: (handler: (id: string | null) => void) => void;
 	onDagScope: (handler: (scope: DagScope) => void) => void;
+	onDagRelation: (handler: (relation: DagRelationMode) => void) => void;
 	onOpenItem: (handler: (id: string) => void) => void;
 }
 
@@ -188,10 +193,20 @@ export function createShell(root: HTMLElement): Shell {
 
 	// --- topology view ----------------------------------------------------
 	const topologyView = el("section", { className: "topology-view", attrs: { "aria-label": "Dependency topology" } });
+	// Master/detail: the list owns its own scrollbar, the graph and summary stay
+	// put beside it, so selecting an item near the end of a long list never needs
+	// a page scroll to reach the picture (APM-46).
+	const topoList = el("div", {
+		className: "topo-list",
+		attrs: { role: "region", "aria-label": "Work items", tabindex: "-1" },
+	});
 	const topologyGroups = el("div", { className: "topology-groups" });
+	topoList.append(topologyGroups);
+	const topoAside = el("aside", { className: "topo-aside", attrs: { "aria-label": "Graph and selected item" } });
 	const dagPanel = el("section", { className: "dag-panel", attrs: { "aria-label": "Local dependency graph" } });
-	const summary = el("aside", { className: "selection-summary", attrs: { "aria-label": "Selected item" } });
-	topologyView.append(topologyGroups, dagPanel, summary);
+	const summary = el("section", { className: "selection-summary", attrs: { "aria-label": "Selected item" } });
+	topoAside.append(dagPanel, summary);
+	topologyView.append(topoList, topoAside);
 
 	// Expanded graph overlay: native <dialog> gives focus trapping and Esc for
 	// free; the same layout runs with larger boxes. Rendered on demand.
@@ -230,7 +245,9 @@ export function createShell(root: HTMLElement): Shell {
 		sort,
 		listView,
 		topologyView,
+		topoList,
 		topologyGroups,
+		topoAside,
 		dagPanel,
 		dagDialog,
 		dagDialogBody,
@@ -295,6 +312,13 @@ export function createShell(root: HTMLElement): Shell {
 				if (button?.dataset.scope) handler(button.dataset.scope as DagScope);
 			});
 		},
+		onDagRelation(handler) {
+			topologyView.addEventListener("click", (event) => {
+				// `.dag` itself carries data-relation; only the buttons switch views.
+				const button = (event.target as HTMLElement).closest<HTMLElement>("button[data-relation]");
+				if (button?.dataset.relation) handler(button.dataset.relation as DagRelationMode);
+			});
+		},
 		onOpenItem(handler) {
 			const open = (event: Event): void => {
 				const target = event.target as HTMLElement;
@@ -313,6 +337,23 @@ export function createShell(root: HTMLElement): Shell {
 		},
 	};
 	return shell;
+}
+
+/**
+ * The workspace has to end at the viewport bottom, and how much chrome sits above
+ * it changes with the banner, metrics and wrapped controls. Measure it instead of
+ * guessing a constant, so a long queue scrolls inside its own column and the page
+ * itself never moves (APM-46).
+ */
+export function applyWorkspaceHeight(shell: Shell): void {
+	if (shell.topologyView.hidden) return;
+	const top = shell.topologyView.getBoundingClientRect().top + window.scrollY;
+	const parent = shell.root;
+	// The shell's own bottom padding is part of the page height, so the columns
+	// have to reserve it too or the page gains a few dozen pixels of scroll.
+	const bottom = parent ? Number.parseFloat(getComputedStyle(parent).paddingBottom || "0") || 0 : 0;
+	shell.topologyView.style.setProperty("--topo-top", `${Math.max(0, Math.round(top))}px`);
+	shell.topologyView.style.setProperty("--topo-bottom", `${Math.round(bottom)}px`);
 }
 
 export function updateProject(shell: Shell, project: string): void {
@@ -664,7 +705,11 @@ export function updateTopology(
 		groups.push(closed);
 	}
 
+	// The list owns its own scrollbar (APM-46): a poll refresh must not throw the
+	// user back to the top of a long queue.
+	const scrollTop = shell.topoList.scrollTop;
 	shell.topologyGroups.replaceChildren(...groups);
+	shell.topoList.scrollTop = scrollTop;
 }
 
 export interface CardExtra {
@@ -784,9 +829,58 @@ export function updateSelectionSummary(
 	shell.summary.replaceChildren(...nodes);
 }
 
+/** Relation sub-view state, owned by the caller so it survives re-renders. */
+export interface DagPanelState {
+	relation: DagRelationMode;
+	/** Last viewport the user left behind; reused while the picture is the same. */
+	view: GraphViewOptions["view"] | null;
+	/** `<selection>|<relation>|<scope>` of that view. */
+	key: string | null;
+}
+
+const RELATIONS: Array<[DagRelationMode, string, string]> = [
+	["dependencies", "Dependencies", "Work order: what blocks the selected item, and what it unblocks"],
+	["hierarchy", "Hierarchy", "Parent and children of the selected item"],
+];
+
+function relationButtons(current: DagRelationMode): HTMLElement {
+	const group = el("div", { className: "dag-relations", attrs: { role: "group", "aria-label": "Graph relation" } });
+	for (const [value, label, hint] of RELATIONS) {
+		const button = el("button", {
+			className: "ghost dag-relation",
+			text: label,
+			attrs: { type: "button", title: hint, "aria-pressed": String(current === value) },
+		});
+		button.dataset.relation = value;
+		group.append(button);
+	}
+	return group;
+}
+
+function scopeButtons(current: DagScope, relation: DagRelationMode): HTMLElement {
+	const scopes = el("div", { className: "dag-scopes", attrs: { role: "group", "aria-label": "Graph scope" } });
+	for (const [value, label] of [
+		["all", "All"],
+		["blocking", "Blocking chain"],
+		["upstream", "Upstream"],
+		["downstream", "Downstream"],
+	] as Array<[DagScope, string]>) {
+		const button = el("button", { className: "ghost dag-scope", text: label, attrs: { type: "button", "aria-pressed": String(current === value) } });
+		button.dataset.scope = value;
+		scopes.append(button);
+	}
+	// Scopes narrow a dependency chain; a hierarchy has nothing to narrow.
+	scopes.hidden = relation === "hierarchy";
+	return scopes;
+}
+
 /**
- * The local dependency graph lives in its own panel under the topology groups:
- * it needs the full width, and it must be readable without opening the drawer.
+ * The local graph lives in the sticky detail column beside the list (APM-46).
+ *
+ * Two relation sub-views share one component: `dependencies` (work order, the
+ * product default) and `hierarchy` (parent/children). The legacy combined
+ * picture is deliberately not offered — mixing a parent and a dependent in one
+ * rank produced reversed same-column edges.
  */
 export function updateDagPanel(
 	shell: Shell,
@@ -795,6 +889,7 @@ export function updateDagPanel(
 	graph: TopologyGraph | null,
 	scope: DagScope,
 	onSelect: (id: string) => void,
+	panel?: DagPanelState,
 ): void {
 	if (!ctx.selectedId || !item || !graph) {
 		shell.dagPanel.replaceChildren(
@@ -803,29 +898,25 @@ export function updateDagPanel(
 		if (shell.dagDialog.open) closeDagDialog(shell.dagDialog);
 		return;
 	}
-	const dag = localDag(graph, item.id, 2);
+	const relation: DagRelationMode = panel?.relation ?? "dependencies";
+	// A hierarchy is never scoped: the scope buttons do not apply there.
+	const effectiveScope: DagScope = relation === "hierarchy" ? "all" : scope;
+	const dag = localDagFor(graph, item.id, 2, relation);
+	const viewKey = `${item.id}|${relation}|${effectiveScope}`;
+	// Fit only when the picture changes (other selection, relation or scope); a
+	// poll refresh keeps the user's zoom and pan.
+	const keepView = panel && panel.key === viewKey ? (panel.view ?? undefined) : undefined;
+
 	const nodes: HTMLElement[] = [];
-	nodes.push(el("h3", { className: "topo-title", text: `Local graph · ${item.identifier}` }));
-	const toolbar = el("div", { className: "dag-toolbar" });
-	const scopes = el("div", { className: "dag-scopes", attrs: { role: "group", "aria-label": "Graph scope" } });
-	for (const [value, label] of [
-		["all", "All"],
-		["blocking", "Blocking chain"],
-		["upstream", "Upstream"],
-		["downstream", "Downstream"],
-	] as Array<[DagScope, string]>) {
-		const button = el("button", { className: "ghost dag-scope", text: label, attrs: { type: "button", "aria-pressed": String(scope === value) } });
-		button.dataset.scope = value;
-		scopes.append(button);
-	}
-	toolbar.append(scopes);
+	const head = el("div", { className: "dag-panel-head" });
+	head.append(el("h3", { className: "topo-title", text: `Local graph · ${item.identifier}` }));
 	const expand = el("button", {
 		className: "ghost dag-expand",
 		text: "Expand graph",
 		attrs: { type: "button", "aria-haspopup": "dialog", "aria-label": "Expand local dependency graph" },
 	});
 	expand.addEventListener("click", () => {
-		renderDagDialog(shell, dag, item, scope, onSelect);
+		renderDagDialog(shell, dag, item, effectiveScope, relation, onSelect);
 		openDagDialog(shell.dagDialog);
 		const close = shell.dagDialogBody.querySelector<HTMLButtonElement>("[data-action=close-graph]");
 		close?.focus();
@@ -833,22 +924,47 @@ export function updateDagPanel(
 	// Native dialog focus trap + Esc; returning focus to the trigger matters for
 	// keyboard users and is asserted in the browser checks.
 	shell.dagDialog.onclose = () => expand.focus();
-	toolbar.append(expand);
+	head.append(expand);
+	nodes.push(head);
+
+	const toolbar = el("div", { className: "dag-toolbar" });
+	toolbar.append(relationButtons(relation), scopeButtons(effectiveScope, relation));
 	nodes.push(toolbar);
-	nodes.push(renderDag(dag, { scope, onSelect }));
+
+	const handle = graphViewFor(dag, {
+		scope: effectiveScope,
+		relation,
+		onSelect,
+		view: keepView,
+		onViewChange: (view) => {
+			if (!panel) return;
+			panel.view = view;
+			panel.key = viewKey;
+		},
+	});
+	nodes.push(handle.element);
+
 	const legend = el("p", { className: "dag-legend" });
-	legend.append(el("span", { className: "legend solid", text: "── dependency (blocks)" }));
-	legend.append(el("span", { className: "legend dashed", text: "╌╌ parent / child" }));
+	if (relation === "hierarchy") {
+		legend.append(el("span", { className: "legend dashed", text: "╌╌ parent / child" }));
+	} else {
+		legend.append(el("span", { className: "legend solid", text: "── dependency (blocks)" }));
+	}
 	nodes.push(legend);
+
 	const details = el("details", { className: "dag-text-wrap" }) as HTMLDetailsElement;
 	details.append(el("summary", { text: "Text view (same relations)" }));
-	details.append(renderDagText(dag, { scope, onSelect }));
+	details.append(renderDagText(dag, { scope: effectiveScope, onSelect }));
 	nodes.push(details);
 	shell.dagPanel.replaceChildren(...nodes);
+	// The viewport is measured only once it is in the document: a fit computed
+	// while detached would shrink the picture to a thumbnail. Fit after mounting,
+	// and only for a new picture (a poll refresh keeps the user's zoom/pan).
+	if (!keepView) handle.fit();
 
-	// Changing scope inside the overlay goes through the normal delegated handler,
-	// which re-renders the panel; keep the open overlay in sync with it.
-	if (shell.dagDialog.open) renderDagDialog(shell, dag, item, scope, onSelect);
+	// Changing relation or scope inside the overlay goes through the normal
+	// delegated handler, which re-renders the panel; keep the open overlay in sync.
+	if (shell.dagDialog.open) renderDagDialog(shell, dag, item, effectiveScope, relation, onSelect);
 }
 
 function openDagDialog(dialog: HTMLDialogElement): void {
@@ -870,6 +986,7 @@ function renderDagDialog(
 	dag: LocalDag,
 	item: WorkItem,
 	scope: DagScope,
+	relation: DagRelationMode,
 	onSelect: (id: string) => void,
 ): void {
 	const body = shell.dagDialogBody;
@@ -882,27 +999,21 @@ function renderDagDialog(
 	});
 	close.addEventListener("click", () => closeDagDialog(shell.dagDialog));
 	head.append(close);
-	const scopes = el("div", { className: "dag-scopes", attrs: { role: "group", "aria-label": "Graph scope" } });
-	for (const [value, label] of [
-		["all", "All"],
-		["blocking", "Blocking chain"],
-		["upstream", "Upstream"],
-		["downstream", "Downstream"],
-	] as Array<[DagScope, string]>) {
-		const button = el("button", { className: "ghost dag-scope", text: label, attrs: { type: "button", "aria-pressed": String(scope === value) } });
-		button.dataset.scope = value;
-		scopes.append(button);
-	}
 	const selectAndClose = (id: string) => {
 		closeDagDialog(shell.dagDialog);
 		onSelect(id);
 	};
-	const graph = renderDag(dag, { scope, onSelect: selectAndClose, expanded: true });
+	const controls = el("div", { className: "dag-dialog-controls" });
+	controls.append(relationButtons(relation), scopeButtons(scope, relation));
+	const graphHandle = graphViewFor(dag, { scope, relation, onSelect: selectAndClose, expanded: true });
+	const graph = graphHandle.element;
 	const legend = el("p", { className: "dag-legend" });
-	legend.append(el("span", { className: "legend solid", text: "── dependency (blocks)" }));
-	legend.append(el("span", { className: "legend dashed", text: "╌╌ parent / child" }));
+	if (relation === "hierarchy") legend.append(el("span", { className: "legend dashed", text: "╌╌ parent / child" }));
+	else legend.append(el("span", { className: "legend solid", text: "── dependency (blocks)" }));
 	const text = renderDagText(dag, { scope, onSelect: selectAndClose });
-	body.replaceChildren(head, scopes, graph, legend, text);
+	body.replaceChildren(head, controls, graph, legend, text);
+	// Same reason as the inline panel: measure the viewport after it is mounted.
+	graphHandle.fit();
 	// Esc closes even where <dialog> semantics are emulated (tests, older engines).
 	shell.dagDialog.onkeydown = (event: KeyboardEvent) => {
 		if (event.key === "Escape") {
