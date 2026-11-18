@@ -14,8 +14,8 @@
 # release also publishes an aggregate SHA256SUMS.txt.
 #
 # Runner strategy: native runners where this account provides them
-# (ubuntu-24.04-arm, windows-2022, macos-13). The arm64 macOS runner is not
-# available here, so macOS x86_64 is built natively on the last Intel image and
+# (ubuntu-24.04-arm, windows-2022, macos-15-intel). The arm64 macOS runner is not
+# available here, so macOS x86_64 is built natively on the Intel image and
 # aarch64-apple-darwin is cross-compiled on the same runner: the macOS SDK is
 # universal, so `rustup target add aarch64-apple-darwin` plus `cargo build
 # --target` is enough — no extra toolchain or Docker. See docs/release.md for
@@ -81,14 +81,16 @@ jobs:
             target: aarch64-unknown-linux-gnu
             smoke: true
           # An x64 image is used because this account has no arm64 macOS
-          # runner. macos-13 is the last Intel image: `macos-15-intel` is not a
-          # real runner label (actionlint's list rejects it) and macos-14/15/
-          # latest resolve to arm64 here. x86_64 is native; aarch64 is
-          # cross-built on the same universal SDK.
-          - os: macos-13
+          # runner: `macos-15`/`macos-26`/`macos-latest` resolve to arm64 here.
+          # `macos-15-intel` is the official x64 (Intel) macOS 15 image, published
+          # in actions/runner-images and supported until 2027-08. actionlint's
+          # static runner-label list can lag and report it as unknown; the
+          # official image table wins. x86_64 is native; aarch64 is cross-built
+          # on the same universal SDK.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             smoke: true
-          - os: macos-13
+          - os: macos-15-intel
             target: aarch64-apple-darwin
             smoke: false
           - os: windows-2022

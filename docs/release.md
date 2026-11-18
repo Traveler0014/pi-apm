@@ -71,30 +71,43 @@ gh run watch
 |---|---|---|
 | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | native |
 | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | native arm64 hosted runner |
-| `macos-13` | `x86_64-apple-darwin` | native |
-| `macos-13` | `aarch64-apple-darwin` | cross-compile on x64: `rustup target add` only |
+| `macos-15-intel` | `x86_64-apple-darwin` | native |
+| `macos-15-intel` | `aarch64-apple-darwin` | cross-compile on x64: `rustup target add` only |
 | `windows-2022` | `x86_64-pc-windows-msvc` | native MSVC |
 
 Cross-compilation notes:
 
 - **macOS runs on an Intel runner.** This account (a personal, public-repo
-  owner) has no arm64 macOS runner: jobs on `macos-14` fail with
-  `The configuration 'macos-14-arm64-us-default' is not supported`, and
-  `macos-latest` resolves to arm64 as well. The matrix therefore uses
-  `macos-13` (the last x64 image): `x86_64-apple-darwin` is built natively and
-  executed for the smoke test, while `aarch64-apple-darwin` is cross-compiled on
-  the same runner. `macos-15-intel` is not a real label (actionlint rejects it),
-  and `macos-14`/`macos-15`/`macos-latest` resolve to arm64 on this account.
-  Apple's SDK is universal, so `rustup target add aarch64-apple-darwin` plus
+  owner) has no arm64 macOS runner: `macos-15`, `macos-26` and `macos-latest`
+  all resolve to arm64 here, and arm64 jobs fail with
+  `The configuration 'macos-14-arm64-us-default' is not supported`. The matrix
+  therefore uses `macos-15-intel`, the official x64 (Intel) macOS 15 image
+  published in `actions/runner-images` (supported until 2027-08):
+  `x86_64-apple-darwin` is built natively and executed for the smoke test, while
+  `aarch64-apple-darwin` is cross-compiled on the same runner. Apple's SDK is
+  universal, so `rustup target add aarch64-apple-darwin` plus
   `cargo build --target` is enough — no Docker, Zig or extra SDK. The arm64
   binary cannot run on the Intel host, so its smoke flag is `false`; verify it
   on an Apple Silicon machine (or through `scripts/verify-package.sh`).
-- **Label fallback:** if `macos-13` is retired, first check the
-  `macos-13-large`/`macos-13-xlarge` x64 tiers; otherwise use any new
-  `macos-*-intel` label GitHub publishes (verify it in the runner-label list and
-  with actionlint). Never use `macos-14`/`macos-15`/`macos-latest` here: they
-  resolve to arm64 and fail with
+- **Label history:** `macos-13` (the previous Intel image) was retired, which
+  left both macOS jobs queued forever — a job whose label matches no runner is
+  never picked up and does not consume its `timeout-minutes`
+  (see APM-43/APM-47). The migration is a two-line label swap; targets, smoke
+  flags and publish logic are unchanged.
+- **Label fallback:** if `macos-15-intel` is retired, move to the next
+  `macos-*-intel` x64 label (`macos-26-intel` is the current generation) and
+  verify it in the official `actions/runner-images` image table. Never use
+  `macos-15`/`macos-26`/`macos-latest` here: they resolve to arm64 and fail with
   `The configuration 'macos-14-arm64-us-default' is not supported`.
+  `actionlint` keeps a static runner-label list that can lag behind new labels
+  and then reports `unknown label` for a valid image; the official image table
+  takes precedence, so do not "fix" that warning by downgrading to an older or
+  retired label. `macos-15-intel` entered that list in `actionlint` v1.7.12
+  (checked in `rule_runner_label.go`), so `just lint-workflows` needs at least
+  that version — the binary used for this migration was v1.7.7 and reports one
+  `label "macos-15-intel" is unknown` warning while still accepting the retired
+  `macos-13`. CI does not run `actionlint` (`.github/workflows/verify.yml` runs
+  fmt/clippy/test/vitest/stress only), so the warning is local-tooling noise.
 - **Linux arm64** uses GitHub's arm64 hosted runner. If that label disappears,
   replace that matrix entry with a `cross` build on `ubuntu-24.04`
   (`cargo install cross`, `cross build --target aarch64-unknown-linux-gnu`);
