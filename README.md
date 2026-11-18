@@ -147,21 +147,44 @@ apm project show                      # resolved db path, settings
 existing project instead of failing. Databases can hold several projects; pass
 `--project <name>` (or `APM_PROJECT`) when they do.
 
-Version-control guidance:
+Version-control guidance — **the active ledger is never tracked**:
 
 ```gitignore
-# Default: keep the ledger local (the session token files are bearer secrets).
+# The whole runtime directory stays local: database, WAL/SHM, sessions and tokens.
+# There is no supported "commit .apm/apm.db" workflow: WAL/SHM are invisible to
+# git, and the token files are bearer credentials.
 .apm/
-
-# Sharing a ledger through git is possible but opt-in: un-ignore the database
-# only, and never commit the WAL/SHM or the token store.
-#   .apm/*
-#   !.apm/apm.db
 ```
 
-`.apm/sessions/` holds claim tokens with mode 0600. They are local credentials,
-not project data: never copy them into an artifact, a ticket, or a prompt that
-leaves the machine.
+What belongs in git is the *schema and configuration*, not the live database:
+workflow documents, fixtures, AGENTS.md and scripts. `.apm/sessions/` and
+`rest-token` hold 0600 credentials; never copy them into an artifact, a ticket or
+a prompt. To share a ledger across machines use [`apm-serve`](#85-rest-over-loopback-optional)
+(loopback + bearer token), not git sync.
+
+### Backup and redacted export
+
+```bash
+apm backup --out apm-backup-2026-11-18.db   # WAL-consistent snapshot, refuses overwrite
+apm export --out audit.ndjson               # redacted NDJSON, refuses overwrite (0600)
+apm export | jq -c .                        # or stream it to stdout
+```
+
+- **Backup** uses SQLite `VACUUM INTO`, so committed WAL frames are included and
+  the result is one self-contained file. It never overwrites an existing path.
+  Restore with every writer stopped: replace `.apm/apm.db`, delete stale
+  `apm.db-wal`/`apm.db-shm`, restart. Claim tokens from the old snapshot are
+  stale credentials and will be rejected.
+- **Export** is NDJSON with `schema_version: 1`: a `meta` line (project +
+  timestamp), then `item`, `context` (latest version), `acceptance`, `evidence`,
+  `dependency` and `event` records. Claims, sessions, run ids and token files are
+  excluded by construction; known session/run/token/idempotency keys are removed
+  recursively (including nested event payloads), and token-shaped strings are
+  redacted defensively. That replacement is **not** a general secret scanner:
+  review an export before publishing it. It is for audit and archival — there is
+  no importer and it is not a sync format. A file target is created exclusively
+  with mode 0600 and is never overwritten.
+
 
 ---
 

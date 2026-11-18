@@ -8,6 +8,7 @@ pub mod events;
 pub mod items;
 pub mod misc;
 pub mod project;
+pub mod transfer;
 pub mod workflows;
 
 use std::path::{Path, PathBuf};

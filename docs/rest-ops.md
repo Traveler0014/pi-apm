@@ -151,29 +151,35 @@ The REST adapter adds nothing to storage — you back up the ledger, not the
 server.
 
 ```bash
-# 1. safest: stop the server (or any writer), then copy the database
-apm-serve … &            # running
-# Ctrl-C / systemctl stop
-cp .apm/apm.db .apm/apm.db.bak
+# 1. Consistent snapshot without stopping the server (includes committed WAL):
+apm backup --out /var/backups/apm-$(date +%F).db
 
-# 2. online backup without stopping anything (WAL-aware)
-sqlite3 .apm/apm.db ".backup '.apm/apm.db.bak'"
-# or, without the sqlite3 CLI, ask the ledger for a consistent snapshot:
-apm get <item> --json >/dev/null   # any read forces a WAL checkpoint on open
-cp .apm/apm.db .apm/apm.db.bak && cp .apm/apm.db-wal .apm/apm.db-wal.bak 2>/dev/null || true
+# 2. Redacted audit copy (no claims/session tokens; refuse overwrite):
+apm export --out /var/backups/apm-$(date +%F).ndjson
 ```
 
-* **Restore**: stop the server, replace `.apm/apm.db` (and remove
-  `.apm/*-wal`/`*-shm` if you also restore them inconsistently), start again.
-  Claim tokens in `.apm/sessions/` belong to live leases; after a restore from an
-  older snapshot they are simply stale and will be rejected.
+`apm backup` uses SQLite `VACUUM INTO`; the destination must not exist. Treat the
+snapshot like the ledger itself: it is still private state, so never commit it or
+copy it to a shared ticket.
+
+* **Restore**: stop the server, replace `.apm/apm.db` with the snapshot, delete
+  stale `.apm/apm.db-wal`/`apm.db-shm`, start again. Claim tokens in
+  `.apm/sessions/` belong to live leases; after a restore they are stale and will
+  be rejected.
 * **Schema migration**: opening the database with any newer `apm`/`apm-serve`
   runs the transactional migration on first open (`db.rs`). There is no separate
   migrate command, and a failed migration rolls back — the file stays usable by
   the previous binary.
-* **Moving machines**: copy `.apm/` (database + `sessions/` + `rest-token`) and
-  keep file modes. The token file is local state, same trust boundary as the
-  database.
+* **Moving machines**: take an `apm backup`, copy that one file (not `.apm/` with
+  `sessions/` and `rest-token`), and let the new machine mint its own credentials.
+  For live cross-machine access use `apm-serve` over the network boundary instead
+  of copying the database.
+* **Export is redacted, not a secret scanner**: known session/run/token and
+  idempotency fields are removed recursively and token-shaped strings replaced,
+  but review the NDJSON before sharing it. There is no importer.
+* **What not to put in git**: the active `.apm/` directory. Version the workflow
+  documents and fixtures instead; there is no supported git sync of a live
+  ledger.
 
 ## 7. Troubleshooting
 

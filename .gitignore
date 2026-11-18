@@ -13,7 +13,8 @@
 *.sqlite
 *.sqlite3
 
-# AgentPM local state: the SQLite ledger plus 0600 claim-token files.
-# This project never ships a ledger or a token; a consumer repository that wants
-# a shared ledger opts in explicitly (see README).
+# AgentPM local state: the SQLite ledger, its WAL/SHM and the 0600 token files.
+# The active ledger is never tracked. Use `apm backup` for a consistent snapshot
+# and `apm export` for a redacted audit copy; version workflow documents and
+# fixtures instead. Cross-machine sharing goes through `apm-serve`, not git.
 .apm/

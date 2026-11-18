@@ -139,6 +139,17 @@ enum Cmd {
     Doctor,
     /// Append a diagnostic note (no claim required; never changes item state).
     Diag(DiagArgs),
+    /// Create a WAL-consistent, self-contained backup (refuses to overwrite).
+    ///
+    /// The snapshot includes committed WAL frames and every business table. It is
+    /// a copy of the ledger, so it keeps the same trust boundary: do not commit it.
+    Backup(BackupArgs),
+    /// Export a redacted, versioned NDJSON audit view of the project.
+    ///
+    /// Claims, sessions, tokens and idempotency keys are excluded by construction;
+    /// token-shaped strings are redacted defensively. This is for audit/archival,
+    /// not for live sync (there is no importer).
+    Export(ExportArgs),
     /// Serve the embedded read-only dashboard on loopback and open a browser.
     ///
     /// Same process and same guards as `apm-serve`, plus `/ui` assets, a strict
@@ -679,6 +690,21 @@ struct EventsArgs {
 }
 
 #[derive(Args, Debug)]
+struct BackupArgs {
+    /// Destination database file (default: apm-backup-<UTC timestamp>.db in cwd).
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ExportArgs {
+    /// Write NDJSON to this file instead of stdout. Refuses to overwrite and is
+    /// created with mode 0600 where the platform supports it.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 struct DiagArgs {
     #[arg(long)]
     item: Option<String>,
@@ -844,6 +870,8 @@ fn dispatch(app: App, cmd: Cmd) -> Result<()> {
         Cmd::Expire => cmd_expire(app),
         Cmd::Doctor => cmd_doctor(app),
         Cmd::Diag(args) => cmd_diag(app, args),
+        Cmd::Backup(args) => cmd_backup(app, args),
+        Cmd::Export(args) => cmd_export(app, args),
         // Handled before the Store is opened (see `run`).
         Cmd::Ui(_) => unreachable!("apm ui is dispatched before any Store is opened"),
     }
@@ -2198,6 +2226,83 @@ fn cmd_doctor(app: App) -> Result<()> {
         lines.push(format!("warning: {w}"));
     }
     app.out_ok(report, lines.join("\n"))
+}
+
+fn cmd_backup(app: App, args: BackupArgs) -> Result<()> {
+    let dest = match args.out {
+        Some(path) => path,
+        None => {
+            let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            std::env::current_dir()
+                .map_err(|e| Error::Internal(format!("cannot read cwd: {e}")))?
+                .join(format!("apm-backup-{stamp}.db"))
+        }
+    };
+    let report = app.store.backup_to(&dest)?;
+    app.out_ok(
+        json!({ "backup": report }),
+        format!(
+            "backup: {} ({} items, {} events, {} bytes)",
+            report.path, report.items, report.events, report.bytes
+        ),
+    )
+}
+
+fn cmd_export(app: App, args: ExportArgs) -> Result<()> {
+    let project = app.globals.project.as_deref();
+    let Some(path) = args.out else {
+        // NDJSON owns stdout: no human/JSON envelope here, or the stream would
+        // stop being one JSON document per line.
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        app.store.export_ndjson(project, &mut lock)?;
+        return Ok(());
+    };
+    if path.exists() {
+        return Err(Error::invalid(format!(
+            "export destination already exists: {} (refusing to overwrite)",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Internal(format!("cannot create {}: {e}", parent.display())))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|e| Error::Internal(format!("cannot create {}: {e}", path.display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let report = match app.store.export_ndjson(project, &mut writer) {
+        Ok(report) => report,
+        Err(err) => {
+            // Do not leave a half-written audit file behind.
+            drop(writer);
+            let _ = std::fs::remove_file(&path);
+            return Err(err);
+        }
+    };
+    use std::io::Write;
+    writer
+        .flush()
+        .map_err(|e| Error::Internal(format!("cannot flush {}: {e}", path.display())))?;
+    app.out_ok(
+        json!({ "export": report }),
+        format!(
+            "export: {} ({} records, {} bytes)",
+            path.display(),
+            report.records,
+            report.bytes
+        ),
+    )
 }
 
 fn cmd_diag(mut app: App, args: DiagArgs) -> Result<()> {
