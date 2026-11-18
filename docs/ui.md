@@ -199,6 +199,13 @@ disclosure below the graph lists the same relations in reading order
 buttons that drive the same selection — that list is the keyboard and
 screen-reader equivalent of the picture.
 
+**Node boxes fit their content.** The box is 88 px tall (104 px in the overlay):
+id row + two 1.5 line-height title lines + meta row + padding, with `flex: none`
+on every text row so the flex column cannot squeeze a line (an author
+`overflow: hidden` would then shave the glyph descenders). Lines are asserted to
+have `scrollHeight <= clientHeight` in the real browser at the default fit, 150 %
+and ~180 % zoom.
+
 **Titles are measured in Unicode width units, not characters.** A CJK glyph is
 worth two Latin letters, so node width comes from the widest *wrapped* line
 (`titleUnits`, `MAX_LINE_UNITS = 26` ≈ 184 px of the 208 px minimum box).

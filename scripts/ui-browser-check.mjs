@@ -742,7 +742,10 @@ async function main() {
 		};
 	});
 
-	assert(single.width >= 180 && single.height >= 60, `a single node keeps a readable box (${single.width}x${single.height})`);
+	assert(
+		single.width >= 180 && single.height >= 70,
+		`a single node keeps a readable box (${single.width}x${single.height})`,
+	);
 	assert(single.title.length > 0, "a single node still shows its title");
 	await page.click(".dag-expand");
 	await page.waitForSelector(".dag-dialog[open] .dag .dag-node");
@@ -1165,6 +1168,95 @@ async function main() {
 	assert(cjkFit.nodes === 2, `the Chinese chain renders both nodes (${cjkFit.nodes})`);
 	assert(cjkFit.level >= 85, `a two-node Chinese chain fits at >= 85% (${cjkFit.level}%)`);
 
+	// Vertical geometry (APM-48): the two title lines must not be squeezed by the
+	// flex column. Measured at the default fit, at ~150% and at ~174%.
+	const verticalGeometry = async (label) =>
+		page.evaluate((name) => {
+			const node = document.querySelector(".dag-panel .dag .dag-node[data-selected='true']")
+				?? document.querySelector(".dag-panel .dag .dag-node");
+			const lines = [...node.querySelectorAll(".dag-node-title-line")];
+			const title = node.querySelector(".dag-node-title");
+			const id = node.querySelector(".dag-node-id");
+			const meta = node.querySelector(".dag-node-meta");
+			const level = document.querySelector(".dag-panel .dag-zoom-level")?.textContent ?? "";
+			const overflow = (element) => (element ? element.scrollHeight - element.clientHeight : 0);
+			return {
+				label: name,
+				level,
+				lines: lines.map((line) => ({
+					text: line.textContent ?? "",
+					client: line.clientHeight,
+					scroll: line.scrollHeight,
+				})),
+				titleOverflow: overflow(title),
+				idOverflow: overflow(id),
+				metaOverflow: overflow(meta),
+				nodeOverflow: overflow(node),
+				nodeWidthOverflow: node.scrollWidth - node.clientWidth,
+				idVisible: Boolean(id && id.getBoundingClientRect().height > 0),
+				metaVisible: Boolean(meta && meta.getBoundingClientRect().height > 0),
+				box: [Math.round(node.getBoundingClientRect().width), Math.round(node.getBoundingClientRect().height)],
+				tooltip: title?.getAttribute("title") ?? "",
+				aria: node.getAttribute("aria-label") ?? "",
+			};
+		}, label);
+
+	const geometryChecks = [];
+	geometryChecks.push(await verticalGeometry("default"));
+
+	// Zoom to >= 150% (each + step is 1.2x from the fit scale).
+	for (let i = 0; i < 6; i += 1) {
+		const level = await page.evaluate(() =>
+			Number.parseInt(document.querySelector(".dag-panel .dag-zoom-level")?.textContent ?? "0", 10),
+		);
+		if (level >= 150) break;
+		await page.click(".dag-panel .dag-zoom-in");
+		await page.waitForTimeout(80);
+	}
+	await page.waitForTimeout(150);
+	geometryChecks.push(await verticalGeometry("150%"));
+
+	for (let i = 0; i < 4; i += 1) {
+		const level = await page.evaluate(() =>
+			Number.parseInt(document.querySelector(".dag-panel .dag-zoom-level")?.textContent ?? "0", 10),
+		);
+		if (level >= 174) break;
+		await page.click(".dag-panel .dag-zoom-in");
+		await page.waitForTimeout(80);
+	}
+	await page.waitForTimeout(150);
+	geometryChecks.push(await verticalGeometry("174%"));
+
+	const highScale = geometryChecks[2].level;
+	assert(
+		Number.parseInt(geometryChecks[1].level, 10) >= 150 && Number.parseInt(highScale, 10) >= 174,
+		`zoom reaches the measured scales (${geometryChecks[1].level}, ${highScale})`,
+	);
+	for (const check of geometryChecks) {
+		for (const line of check.lines) {
+			assert(
+				line.scroll <= line.client,
+				`${check.label}: the title line is not clipped vertically ("${line.text}" ${line.scroll}/${line.client}, zoom ${check.level})`,
+			);
+		}
+		assert(
+			check.titleOverflow <= 0 && check.nodeOverflow <= 0 && check.idOverflow <= 0 && check.metaOverflow <= 0,
+			`${check.label}: title block, id, meta and node have no vertical overflow (${check.titleOverflow}/${check.idOverflow}/${check.metaOverflow}/${check.nodeOverflow}, zoom ${check.level})`,
+		);
+		assert(
+			check.nodeWidthOverflow <= 1,
+			`${check.label}: no horizontal overflow at ${check.level} (${check.nodeWidthOverflow})`,
+		);
+		assert(
+			check.idVisible && check.metaVisible && check.tooltip.length > 0 && check.aria.length > 0,
+			`${check.label}: id, meta, title tooltip and aria-label all survive (${check.level})`,
+		);
+		assert(check.lines.length >= 1, `${check.label}: the title lines are rendered (${check.lines.length})`);
+	}
+	// Back to the fit view for the checks that follow.
+	await page.click(".dag-panel .dag-fit");
+	await page.waitForTimeout(200);
+
 	// A long Chinese title wraps into two lines inside the box: no overflow, and the
 	// full text stays available through the title/aria attributes.
 	await page.evaluate((id) => {
@@ -1203,7 +1295,7 @@ async function main() {
 		`the Chinese title does not overflow its box (${cjkWrap.overflow.join(",")} / ${cjkWrap.nodeOverflow})`,
 	);
 	assert(cjkWrap.tooltip.length > 5 && cjkWrap.aria.includes("修复分片映射表"), "the full Chinese title stays available");
-	assert(cjkWrap.box[0] >= 180 && cjkWrap.box[1] >= 60, `the Chinese node keeps a readable box (${cjkWrap.box.join("x")})`);
+	assert(cjkWrap.box[0] >= 180 && cjkWrap.box[1] >= 70, `the Chinese node keeps a readable box (${cjkWrap.box.join("x")})`);
 
 	// The empty state must be really hidden on a non-empty graph (APM-46 review): an
 	// author `display: grid` used to override `[hidden]`, painting the hint text on

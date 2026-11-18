@@ -1530,7 +1530,13 @@ pre.field-value {
 	white-space: normal;
 	display: flex;
 	flex-direction: column;
-	line-height: var(--line-tight);
+	/* 1.5 rather than --line-tight: at 11px the tight box (15px) was 1px shorter
+	   than the glyph box (16px), so overflow:hidden shaved the descenders. */
+	line-height: 1.5;
+	/* Never let the column squeeze the title: a shrunk line with overflow:hidden
+	   clips glyph descenders (clientHeight < scrollHeight). */
+	flex: 0 0 auto;
+	max-width: 100%;
 }
 
 .dag-node-title-line {
@@ -1538,6 +1544,13 @@ pre.field-value {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
+	flex: none;
+}
+
+/* The id and meta lines are single-line and must keep their full height too. */
+.dag-node-id,
+.dag-node-meta {
+	flex: none;
 }
 
 .dag-dialog {

@@ -360,6 +360,22 @@ describe("legacy wrapper and text view", () => {
 		expect(wrapTitle("", 10)).toEqual([""]);
 	});
 
+	it("leaves room for id + two 1.5 title lines + meta inside the node box", () => {
+		// 11px text, line-height 1.5 (≈17px), 6px padding top/bottom, 1px gaps and
+		// ~16px for the id and meta rows: 17*2 + 16 + 16 + 2 + 12 ≈ 80, so NODE_H
+		// must be at least that (APM-48: 76 squeezed the title and clipped glyphs).
+		const contentHeight = 17 * 2 + 16 + 16 + 2 + 12;
+		expect(NODE_H).toBeGreaterThanOrEqual(contentHeight);
+		expect(NODE_W).toBeGreaterThanOrEqual(200);
+
+		// Two wrapped Chinese lines stay inside the layout box the layout hands out.
+		const item = make([{ id: "cjk3", title: "修复分片映射表在并发回收阶段偶发死锁并补充长时间回归用例" }])[0]!;
+		const layout = layoutDependencies(localDagFor(buildGraph([item]), "cjk3", 2, "dependencies"));
+		const node = layout.nodes[0]!;
+		expect(node.h).toBe(NODE_H);
+		expect(node.w).toBeGreaterThanOrEqual(NODE_W);
+	});
+
 	it("hides the empty hint on a non-empty graph and shows it when the relation is empty", () => {
 		const layout = layoutDependencies(localDagFor(graphFor(), "s", 2, "dependencies"));
 		const view = createGraphView({ relation: "dependencies" });

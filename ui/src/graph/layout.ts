@@ -27,9 +27,15 @@ import type {
 
 export const NODE_W = 208;
 export { MAX_LINE_UNITS } from "./text";
-export const NODE_H = 76;
+/**
+ * Node height must fit id + two title lines + meta inside a 6px/8px padded box.
+ * At 11px/1.25 that is ~72px of content; 76 left no slack and the flex column
+ * shrank the title block, clipping glyph descenders. 88 gives one line of slack
+ * and keeps the box tight (APM-48).
+ */
+export const NODE_H = 88;
 export const NODE_W_EXPANDED = 264;
-export const NODE_H_EXPANDED = 96;
+export const NODE_H_EXPANDED = 104;
 const PAD = 24;
 
 export interface LayoutOptions {
