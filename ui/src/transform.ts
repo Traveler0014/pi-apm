@@ -319,21 +319,60 @@ export interface Metric {
 	tone?: "danger" | "warn" | "info" | "ok" | "muted";
 }
 
-/** Header summary: the numbers a human scans first. */
-export function summarize(dashboard: Dashboard): Metric[] {
-	const totals = dashboard.totals ?? {};
-	const count = (key: string): number => {
-		const raw = totals[key];
-		return typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
-	};
-	const buckets = dashboard.buckets;
+/**
+ * Header summary, computed from the *complete* item snapshot (APM-49).
+ *
+ * The dashboard's own totals are a recent window: `status:done` only counts items
+ * finished inside `done_recent_seconds`, and `waiting_human` counts attention on
+ * items that may already be closed. Reading those made the header disagree with
+ * the list right below it (e.g. "done 15" next to a Closed group of 48), so the
+ * numbers come from the same `groupItems` classification the queue uses:
+ *
+ *   open           — every item that is not closed (any open category);
+ *   in progress    — the `in_progress` group (active category or a live claim);
+ *   ready          — the `startable` group (open, unclaimed, unblocked);
+ *   waiting human  — non-closed items holding an open attention (may overlap
+ *                    with in progress: an active item can still be waiting on a
+ *                    human), so it is counted directly instead of via the group;
+ *   at risk        — the `at_risk` group;
+ *   closed         — the `closed` group: done, cancelled, aborted and any custom
+ *                    closed state, not just the recent-completion window.
+ */
+export function summarizeItems(items: readonly WorkItem[], now: number = Date.now()): Metric[] {
+	const { counts } = groupItems(items, now);
+	const count = (key: GroupKey): number => counts.get(key) ?? 0;
+	const closed = count("closed");
+	const open = items.length - closed;
+	// Waiting human is *not* the needs_human group: that group is a bucket for the
+	// queue (in progress beats waiting human), while the header counts the question
+	// itself. An active or reviewing item that asked a human still waits for one, so
+	// the two numbers may legitimately overlap; closed items never count (APM-49).
+	const waitingHuman = items.filter(
+		(item) => !isClosed(item) && (item.waiting_on_human === true || (item.attention ?? []).some((entry) => entry.status === "open")),
+	).length;
+	const atRisk = count("at_risk");
 	return [
-		{ label: "open", value: count("open_items"), hint: "items with an open state", tone: "info" },
-		{ label: "in progress", value: (buckets.in_progress ?? []).length, tone: "info" },
-		{ label: "ready", value: (buckets.ready_unclaimed ?? []).length, tone: "ok" },
-		{ label: "waiting human", value: count("waiting_human"), tone: count("waiting_human") > 0 ? "warn" : "muted" },
-		{ label: "at risk", value: count("at_risk"), tone: count("at_risk") > 0 ? "danger" : "muted" },
-		{ label: "done", value: count("status:done"), tone: "muted" },
+		{
+			label: "open",
+			value: open,
+			hint: "every item in an open state (all groups except closed)",
+			tone: open > 0 ? "info" : "muted",
+		},
+		{ label: "in progress", value: count("in_progress"), hint: "active status or a live claim", tone: "info" },
+		{ label: "ready", value: count("startable"), hint: "open, unclaimed and unblocked", tone: "ok" },
+		{
+			label: "waiting human",
+			value: waitingHuman,
+			hint: "non-closed items with an open question, including ones already in progress",
+			tone: waitingHuman > 0 ? "warn" : "muted",
+		},
+		{ label: "at risk", value: atRisk, hint: "stale claims, bad health or unexplained waiting", tone: atRisk > 0 ? "danger" : "muted" },
+		{
+			label: "closed",
+			value: closed,
+			hint: "every terminal state: done, cancelled, aborted and custom closed",
+			tone: "muted",
+		},
 	];
 }
 

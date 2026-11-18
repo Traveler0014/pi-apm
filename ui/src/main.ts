@@ -49,7 +49,7 @@ import {
 	buildQueue,
 	connectionView,
 	defaultViewState,
-	summarize,
+	summarizeItems,
 } from "./transform";
 import type { Dashboard, ItemDetail, WorkItem, WorkflowDef } from "./types";
 import { acceptanceProgress, stageModel, workflowKey } from "./workflow";
@@ -138,7 +138,8 @@ function render(): void {
 	const ctx = context();
 	const dashboard = snapshot?.dashboard ?? null;
 	updateProject(shell, dashboard?.project ?? (useMock ? "pi-apm (mock)" : "…"));
-	updateMetrics(shell, dashboard ? summarize(dashboard) : []);
+	// The header reads the full snapshot, not the dashboard's recent window (APM-49).
+	updateMetrics(shell, summarizeItems(snapshot?.items ?? [], ctx.now));
 	updateHeader(shell, {
 		connection,
 		generatedAt: dashboard?.generated_at ?? null,

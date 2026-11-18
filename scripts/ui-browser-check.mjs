@@ -143,6 +143,19 @@ async function main() {
 			"--question", "Which cache backend?", "--context", "browser fixture"],
 		env,
 	);
+	// A closed item that still carries an open attention must not count as current
+	// "waiting human" work (APM-49: the dashboard totals did count it).
+	const closedAttention = identifier([
+		"create", "--title", "Closed but still asked", "--goal", "verify closed attention",
+		"--current-state", "fixture ready",
+	]);
+	run(
+		BIN,
+		["--human", "attention", "request", "--item", closedAttention,
+			"--question", "is this still needed?", "--context", "browser fixture"],
+		env,
+	);
+	run(BIN, ["--human", "status", closedAttention, "--to", "cancelled", "--reason", "obsolete", "--json"], env);
 	run(BIN, ["claim", dependent, "--session", "browser", "--json"], env);
 	run(BIN, ["dep", "add", dependent, blocked, "--session", "browser", "--json"], env);
 	run(BIN, ["release", dependent, "--session", "browser", "--json"], env);
@@ -325,6 +338,7 @@ async function main() {
 	});
 	page.on("pageerror", (error) => consoleErrors.push(String(error)));
 
+	const closedAttentionItem = closedAttention;
 	const pageTicket = new URL(launchUrl).hash.replace(/^#/, "").split("&").find((part) => part.startsWith("ticket="))?.slice("ticket=".length) ?? "";
 	await page.goto(launchUrl, { waitUntil: "networkidle" });
 	await page.waitForSelector('section[aria-label="Summary"]');
@@ -366,18 +380,87 @@ async function main() {
 	assert(!serverOut.includes("apm_ui_"), "server stdout never contains the bearer token");
 	assert(serverOut.includes("#ticket=apm_boot_"), "server stdout carries the one-time ticket");
 
-	// 2. First paint matches the ledger JSON.
+	// 2. First paint matches the complete item snapshot (APM-49): the header must
+	// read the same list the page renders, not the dashboard's recent window.
 	let text = await page.evaluate(() => document.body.innerText);
-	const expected = {
-		OPEN: dashboard.totals.open_items,
-		"IN PROGRESS": dashboard.buckets.in_progress.length,
-		READY: dashboard.buckets.ready_unclaimed.length,
-		"WAITING HUMAN": dashboard.totals.waiting_human,
-		"DONE": dashboard.totals["status:done"],
-	};
-	for (const [label, value] of Object.entries(expected)) {
-		assert(metric(text, label) === value, `metric ${label}=${metric(text, label)} matches ledger ${value}`);
-	}
+	const snapshot = await page.evaluate(async () => {
+		const response = await fetch("/api/items?all=true", { credentials: "same-origin" });
+		const body = await response.json();
+		return body.items.map((item) => ({
+			identifier: item.identifier,
+			status: item.status,
+			category: item.status_category,
+			waiting: item.waiting_on_human,
+			attention: (item.attention ?? []).length,
+			health: item.health,
+		}));
+	});
+	const closedCount = snapshot.filter((item) => item.category === "closed").length;
+	const openCount = snapshot.length - closedCount;
+	assert(closedCount > 0 && openCount > 0, `the snapshot has both open and closed items (${openCount}/${closedCount})`);
+	assert(metric(text, "OPEN") === openCount, `metric OPEN=${metric(text, "OPEN")} counts the whole snapshot (${openCount})`);
+	assert(metric(text, "CLOSED") === closedCount, `metric CLOSED=${metric(text, "CLOSED")} counts every closed item (${closedCount})`);
+	assert(!/\bDONE\b/.test(text.split("SUMMARY")[1]?.split("SEARCH")[0] ?? ""), "the terminal metric is CLOSED, not DONE");
+	// The recent-completion window is narrower than the closed group: the old
+	// "done" number would have been 15 here while 48+ items are closed.
+	assert(
+		metric(text, "CLOSED") >= (dashboard.totals["status:done"] ?? 0),
+		`CLOSED (${metric(text, "CLOSED")}) covers at least the recent-done window (${dashboard.totals["status:done"]})`,
+	);
+	// Waiting human counts the question, not the queue bucket (APM-49 review): an
+	// active item that asked a human counts, an already-closed one does not.
+	const closedWithAttention = snapshot.filter((item) => item.category === "closed" && item.attention > 0);
+	const openWaiting = snapshot.filter((item) => item.category !== "closed" && (item.waiting || item.attention > 0));
+	assert(closedWithAttention.length >= 1, `the fixture has a closed item with an open attention (${closedWithAttention.length})`);
+	assert(openWaiting.length >= 1, `the fixture has a non-closed item waiting on a human (${openWaiting.length})`);
+	assert(
+		metric(text, "WAITING HUMAN") === openWaiting.length,
+		`WAITING HUMAN counts non-closed questions (${metric(text, "WAITING HUMAN")}/${openWaiting.length})`,
+	);
+	assert(
+		metric(text, "WAITING HUMAN") < snapshot.filter((item) => item.attention > 0).length,
+		`closed attention stays out of WAITING HUMAN (${metric(text, "WAITING HUMAN")} of ${snapshot.filter((item) => item.attention > 0).length} attention holders)`,
+	);
+
+	// The header agrees with the rendered groups for every open bucket.
+	await page.click('[data-view="topology"]');
+	// Scope the wait to the topology column: the list view keeps its own
+	// `.queue-group` sections (hidden here), and Playwright's default is "visible".
+	await page.waitForSelector('.topology-groups [data-group="ready"], .topology-groups [data-group="in_progress"]');
+	const groupSizes = await page.evaluate(() =>
+		Object.fromEntries(
+			[...document.querySelectorAll(".topology-groups [data-group]")].map((group) => [
+				group.dataset.group,
+				group.querySelectorAll("[data-item-id]").length,
+			]),
+		),
+	);
+	text = await page.evaluate(() => document.body.innerText);
+	assert(
+		metric(text, "IN PROGRESS") === (groupSizes.in_progress ?? 0),
+		`metric IN PROGRESS matches its group (${metric(text, "IN PROGRESS")}/${groupSizes.in_progress ?? 0})`,
+	);
+	assert(
+		metric(text, "READY") === (groupSizes.ready ?? 0),
+		`metric READY matches its group (${metric(text, "READY")}/${groupSizes.ready ?? 0})`,
+	);
+	// Waiting human deliberately differs from the needs_human bucket when an
+	// in-progress item holds an open question; it must never drop below the bucket.
+	assert(
+		metric(text, "WAITING HUMAN") >= (groupSizes.needs_human ?? 0),
+		`metric WAITING HUMAN covers its bucket at least (${metric(text, "WAITING HUMAN")}/${groupSizes.needs_human ?? 0})`,
+	);
+	const closedAttentionInGroup = await page.evaluate((id) =>
+		[...document.querySelectorAll('[data-group="needs_human"] [data-item-id]')].some(
+			(node) => node.querySelector(".identifier")?.textContent === id,
+		), closedAttentionItem);
+	assert(!closedAttentionInGroup, "a closed item with an open attention stays out of the needs-human group");
+	assert(
+		metric(text, "AT RISK") === (groupSizes.at_risk ?? 0),
+		`metric AT RISK matches its group (${metric(text, "AT RISK")}/${groupSizes.at_risk ?? 0})`,
+	);
+	await page.click('[data-view="list"]');
+	await page.waitForTimeout(200);
 
 	// 3. Deduplication: one row per item, multiple badges on one row.
 	const rows = await page.evaluate(() =>

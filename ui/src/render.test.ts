@@ -29,7 +29,7 @@ import {
 	type ViewMode,
 } from "./render";
 import { buildGraph, topologySummary } from "./topology";
-import { buildQueue, connectionView, defaultViewState, summarize, type ViewState } from "./transform";
+import { buildQueue, connectionView, defaultViewState, summarizeItems, type ViewState } from "./transform";
 import type { WorkItem, WorkflowDef } from "./types";
 import { acceptanceProgress, stageModel, workflowKey } from "./workflow";
 
@@ -73,7 +73,7 @@ function mount() {
 	});
 	const render = (patch: Partial<ViewState> = {}) => {
 		Object.assign(state, patch);
-		updateMetrics(shell, summarize(dashboard));
+		updateMetrics(shell, summarizeItems(items, NOW));
 		updateFilters(shell, state, dashboard);
 		updateViews(shell, view.mode, view.selected);
 		updateStatusScope(shell, state);
@@ -105,8 +105,8 @@ beforeEach(() => {
 
 describe("dashboard shell: list view", () => {
 	it("renders header metrics and one row per open item", () => {
-		const { root, shell, dashboard } = mount();
-		expect(root.querySelectorAll(".metric")).toHaveLength(summarize(dashboard).length);
+		const { root, shell } = mount();
+		expect(root.querySelectorAll(".metric")).toHaveLength(summarizeItems(allItems(), NOW).length);
 		// MOCK_ITEMS = 5 open items; the closed ones live in the fold.
 		expect(shell.queue.querySelectorAll(".row")).toHaveLength(MOCK_ITEMS.length);
 		const first = shell.queue.querySelector<HTMLElement>(".row");

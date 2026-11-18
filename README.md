@@ -882,6 +882,14 @@ keeps the pure `Authorization: Bearer` contract. Every `/ui` response carries a
 strict CSP (`default-src 'none'`, `'self'` only, no inline scripts or styles, no
 remote resources).
 
+The six header cards are computed from the **complete** item snapshot with the
+same classification the queue uses, so they can never disagree with the list:
+`open`, `in progress`, `ready`, `waiting human`, `at risk` and `closed` (every
+terminal state — done, cancelled, aborted and custom closed — not just the
+recent-completion window). Attention left on an already closed item is history,
+so it does not inflate `waiting human`; an item that is still being worked on but
+asked a human counts in both `in progress` and `waiting human`.
+
 Refreshing: the dashboard polls every 4 s (well under the 5 s budget), `R` or
 the **Refresh** button forces an immediate refresh, the **Recently done** fold
 stays folded until opened, and filters/sort/search survive both refreshes and

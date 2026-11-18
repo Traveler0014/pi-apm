@@ -215,6 +215,17 @@ needed), Latin titles still never split a word, and a truncated title ends with
 a long Chinese title therefore produces two readable lines instead of one
 overflowing line.
 
+**Header metrics come from the complete snapshot.** The six cards (open, in
+progress, ready, waiting human, at risk, closed) are computed with the same
+`groupItems` classification the queue uses, not from the dashboard's recent
+window. `closed` replaces the old `done` and covers every terminal state — done,
+cancelled, aborted and custom closed states — so the number matches the `Closed`
+group below it. `waiting human` counts the *question*, not the queue bucket: every item that is
+not closed and holds an open attention (or the `waiting_on_human` flag), which
+means an item that is already in progress can appear in both `in progress` and
+`waiting human` — it is being worked on *and* blocked on a human answer. An
+attention left on a closed item is history, not current work, so it never counts.
+
 **Status scope (Open / Closed / All).** The segmented control next to the view
 switch decides which lifecycle half the queue shows, and is kept in the URL
 (`#status=closed`) like the other view state. `Open` keeps the historical layout
