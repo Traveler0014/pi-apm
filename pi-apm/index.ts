@@ -60,27 +60,6 @@ interface ActiveRun {
 	digest: RunDigest;
 }
 
-let activeRun: ActiveRun | null = null;
-let runSeq = 0;
-let sideRunInFlight = false;
-/// Cancels the in-flight side-run when the session shuts down, so quitting never
-/// waits for a slow/hung child (and never orphans it).
-let sideRunController: AbortController | null = null;
-/// Env vars this extension injected for bash-invoked `apm` calls, with their
-/// previous values, so every run restores exactly what it changed.
-let injectedEnv: Array<[string, string | undefined]> = [];
-
-function restoreInjectedEnv(): void {
-	for (const [key, previous] of injectedEnv) {
-		if (previous === undefined) delete process.env[key];
-		else process.env[key] = previous;
-	}
-	injectedEnv = [];
-}
-/// Private PATH shim so the model can literally type `apm ...` in its bash tool
-/// even when the extension was configured with `--apm-bin /some/path/apm`.
-let pathShim: { dir: string; originalPath: string } | null = null;
-
 // ---------------------------------------------------------------------------
 // Process helpers
 // ---------------------------------------------------------------------------
@@ -110,7 +89,18 @@ interface ProcessResult {
 	spawnError?: string;
 }
 
-function runProcess(input: {
+/**
+ * Hard cap on a child's stdout buffer.
+ *
+ * Five million characters is far above any legitimate `apm --json` payload or
+ * side-run event stream (those are already bounded by the digest/prompt limits),
+ * and far below what a runaway child would need to exhaust memory. A capped
+ * buffer keeps the *tail*: JSON event streams end with the messages that matter,
+ * and the line parser skips the one partial first line.
+ */
+export const MAX_STDOUT_CHARS = 5_000_000;
+
+export function runProcess(input: {
 	command: string;
 	args: string[];
 	cwd: string;
@@ -129,11 +119,15 @@ function runProcess(input: {
 		let aborted = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		let abortFallback: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
 		const finish = (result: ProcessResult) => {
 			if (settled) return;
 			settled = true;
 			if (killTimer) clearTimeout(killTimer);
 			if (abortFallback) clearTimeout(abortFallback);
+			// A normal exit never fires the abort listener; leaving it attached would
+			// keep this closure (and the child object) alive for the session's lifetime.
+			if (input.signal && onAbort) input.signal.removeEventListener("abort", onAbort);
 			resolve(result);
 		};
 		try {
@@ -156,6 +150,11 @@ function runProcess(input: {
 		}
 		child.stdout?.on("data", (chunk: Buffer | string) => {
 			stdout += chunk.toString();
+			if (stdout.length > MAX_STDOUT_CHARS) {
+				// Bounded memory: keep the newest output, which is what the side-run
+				// summary and the exit diagnostics need.
+				stdout = stdout.slice(-MAX_STDOUT_CHARS);
+			}
 		});
 		child.stderr?.on("data", (chunk: Buffer | string) => {
 			stderr += chunk.toString();
@@ -225,6 +224,7 @@ function runProcess(input: {
 					500,
 				);
 			};
+			onAbort = abort;
 			if (input.signal.aborted) abort();
 			else input.signal.addEventListener("abort", abort, { once: true });
 		}
@@ -680,6 +680,29 @@ async function reconcileRun(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Per-instance state. Everything the extension mutates lives in this closure:
+	// two pi-apm instances in one process (tests, a future multi-session host)
+	// must not share a run, a side-run guard, an injected env list or a PATH shim.
+	let activeRun: ActiveRun | null = null;
+	let runSeq = 0;
+	let sideRunInFlight = false;
+	/// Cancels the in-flight side-run when the session shuts down, so quitting
+	/// never waits for a slow/hung child (and never orphans it).
+	let sideRunController: AbortController | null = null;
+	/// Env vars this extension injected for bash-invoked `apm` calls, with their
+	/// previous values, so every run restores exactly what it changed.
+	let injectedEnv: Array<[string, string | undefined]> = [];
+	/// Private PATH shim so the model can literally type `apm ...` in its bash
+	/// tool even when the extension was configured with `--apm-bin /some/path/apm`.
+	let pathShim: { dir: string; originalPath: string } | null = null;
+
+	function restoreInjectedEnv(): void {
+		for (const [key, previous] of injectedEnv) {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		}
+		injectedEnv = [];
+	}
 	// Durable run-sync reports are rendered as a compact entry; expanded shows
 	// reconciliation details, output and the run/session identifiers.
 	// Guarded so older Pi builds (and test doubles) without entry renderers still
@@ -717,24 +740,24 @@ export default function (pi: ExtensionAPI) {
 		return typeof value === "string" && value.trim() ? value : undefined;
 	};
 
-/**
- * CLI metadata shared by every write and read this extension performs:
- * `--session` (claim-token resolution), `--run` (audit correlation) and
- * `--agent` (actor identity). Kept in one place so tools cannot forget it.
- */
-function metaArgs(
-	ctx: ExtensionContext,
-	options: { runId?: string | null; agent?: string; sessionId?: string | null } = {},
-): string[] {
-	const out: string[] = [];
-	const session = options.sessionId ?? sessionIdOf(ctx);
-	if (session) out.push("--session", session);
-	const runId = options.runId === undefined ? activeRun?.id : options.runId;
-	if (runId) out.push("--run", runId);
-	const agent = options.agent ?? flagString("apm-agent");
-	if (agent) out.push("--agent", agent);
-	return out;
-}
+	/**
+	 * CLI metadata shared by every write and read this extension performs:
+	 * `--session` (claim-token resolution), `--run` (audit correlation) and
+	 * `--agent` (actor identity). Kept in one place so tools cannot forget it.
+	 */
+	function metaArgs(
+		ctx: ExtensionContext,
+		options: { runId?: string | null; agent?: string; sessionId?: string | null } = {},
+	): string[] {
+		const out: string[] = [];
+		const session = options.sessionId ?? sessionIdOf(ctx);
+		if (session) out.push("--session", session);
+		const runId = options.runId === undefined ? activeRun?.id : options.runId;
+		if (runId) out.push("--run", runId);
+		const agent = options.agent ?? flagString("apm-agent");
+		if (agent) out.push("--agent", agent);
+		return out;
+	}
 
 	const whichApm = (): string | null => {
 		for (const entry of (process.env.PATH ?? "").split(path.delimiter)) {
@@ -836,241 +859,241 @@ function metaArgs(
 		try {
 			if (!run) return;
 			const sessionId = sessionIdOf(ctx);
-		const projectDir = findProjectDir(ctx.cwd);
-		// Audit clarity: side-run writes must be distinguishable from the main
-		// agent's own writes for the same session.
-		const agentFlag = flagString("apm-agent");
-		const agent = agentFlag ? `${agentFlag}-side-run` : "side-run";
-		// A positive value in seconds; no hidden 15s floor, so
-		// `--apm-side-run-timeout 5` really means five seconds. Anything
-		// unusable falls back to the documented default of 180s.
-		const configuredSeconds = Number(pi.getFlag("apm-side-run-timeout") ?? "180");
-		const timeoutSeconds =
-			Number.isFinite(configuredSeconds) && configuredSeconds > 0 ? configuredSeconds : 180;
-		const timeoutMs = Math.round(timeoutSeconds * 1000);
+			const projectDir = findProjectDir(ctx.cwd);
+			// Audit clarity: side-run writes must be distinguishable from the main
+			// agent's own writes for the same session.
+			const agentFlag = flagString("apm-agent");
+			const agent = agentFlag ? `${agentFlag}-side-run` : "side-run";
+			// A positive value in seconds; no hidden 15s floor, so
+			// `--apm-side-run-timeout 5` really means five seconds. Anything
+			// unusable falls back to the documented default of 180s.
+			const configuredSeconds = Number(pi.getFlag("apm-side-run-timeout") ?? "180");
+			const timeoutSeconds =
+				Number.isFinite(configuredSeconds) && configuredSeconds > 0 ? configuredSeconds : 180;
+			const timeoutMs = Math.round(timeoutSeconds * 1000);
 
-		// Cheap guards first: never touch the DB for a non-APM project, and never
-		// spawn a side-run from inside a side-run.
-		const skipReason = preflightSkip({
-			disabled: pi.getFlag("apm-disabled") === true,
-			env: process.env as Record<string, string | undefined>,
-			projectDir,
-			hasSession: Boolean(sessionId),
-		});
-		if (skipReason) {
-			appendReport(pi, {
-				ran: false,
-				mode: "skip",
-				reason: skipReason,
-				runId: run.id,
-				sessionId,
-				items: [],
-				calls: 0,
-				childEvents: 0,
-				reconciled: [],
-				errors: [],
-				durationMs: 0,
-				at: nowIso(),
-			});
-			return;
-		}
-		if (!projectDir || !sessionId) return;
-		if (sideRunInFlight) {
-			appendReport(pi, {
-				ran: false,
-				mode: "skip",
-				reason: "another side-run is still running",
-				runId: run.id,
-				sessionId,
-				items: [],
-				calls: 0,
-				childEvents: 0,
-				reconciled: [],
-				errors: [],
-				durationMs: 0,
-				at: nowIso(),
-			});
-			return;
-		}
-
-		sideRunInFlight = true;
-		sideRunController = controller;
-		const started = Date.now();
-		const report: SideRunReport = {
-			ran: false,
-			mode: "skip",
-			reason: "",
-			runId: run.id,
-			sessionId,
-			items: [],
-			calls: 0,
-			childEvents: 0,
-			reconciled: [],
-			errors: [],
-			durationMs: 0,
-			at: nowIso(),
-		};
-		try {
-			const safeCtx = withBin(ctx);
-			const claims = await loadClaims(safeCtx, sessionId, signal);
-			const decision = decideRunMode({
+			// Cheap guards first: never touch the DB for a non-APM project, and never
+			// spawn a side-run from inside a side-run.
+			const skipReason = preflightSkip({
 				disabled: pi.getFlag("apm-disabled") === true,
 				env: process.env as Record<string, string | undefined>,
-				aborted: event.aborted,
 				projectDir,
-				claims,
-				hasSession: true,
+				hasSession: Boolean(sessionId),
 			});
-			report.mode = decision.mode;
-			report.reason = decision.reason;
-			report.items = claims.map((c) => c.identifier);
-
-			if (decision.mode === "skip") {
-				report.durationMs = Date.now() - started;
-				appendReport(pi, report);
+			if (skipReason) {
+				appendReport(pi, {
+					ran: false,
+					mode: "skip",
+					reason: skipReason,
+					runId: run.id,
+					sessionId,
+					items: [],
+					calls: 0,
+					childEvents: 0,
+					reconciled: [],
+					errors: [],
+					durationMs: 0,
+					at: nowIso(),
+				});
+				return;
+			}
+			if (!projectDir || !sessionId) return;
+			if (sideRunInFlight) {
+				appendReport(pi, {
+					ran: false,
+					mode: "skip",
+					reason: "another side-run is still running",
+					runId: run.id,
+					sessionId,
+					items: [],
+					calls: 0,
+					childEvents: 0,
+					reconciled: [],
+					errors: [],
+					durationMs: 0,
+					at: nowIso(),
+				});
 				return;
 			}
 
-			if (decision.mode === "abort-sync") {
-				const meta = metaArgs(safeCtx, { sessionId, runId: run.id, agent });
-				const outcome = await applyAbortPlan(safeCtx, {
+			sideRunInFlight = true;
+			sideRunController = controller;
+			const started = Date.now();
+			const report: SideRunReport = {
+				ran: false,
+				mode: "skip",
+				reason: "",
+				runId: run.id,
+				sessionId,
+				items: [],
+				calls: 0,
+				childEvents: 0,
+				reconciled: [],
+				errors: [],
+				durationMs: 0,
+				at: nowIso(),
+			};
+			try {
+				const safeCtx = withBin(ctx);
+				const claims = await loadClaims(safeCtx, sessionId, signal);
+				const decision = decideRunMode({
+					disabled: pi.getFlag("apm-disabled") === true,
+					env: process.env as Record<string, string | undefined>,
+					aborted: event.aborted,
+					projectDir,
+					claims,
+					hasSession: true,
+				});
+				report.mode = decision.mode;
+				report.reason = decision.reason;
+				report.items = claims.map((c) => c.identifier);
+
+				if (decision.mode === "skip") {
+					report.durationMs = Date.now() - started;
+					appendReport(pi, report);
+					return;
+				}
+
+				if (decision.mode === "abort-sync") {
+					const meta = metaArgs(safeCtx, { sessionId, runId: run.id, agent });
+					const outcome = await applyAbortPlan(safeCtx, {
+						claims,
+						runId: run.id,
+						sessionId,
+						agent,
+						meta,
+						signal,
+						reason: "run aborted by the user (Escape/interrupt); liveness only, no progress recorded",
+					});
+					// The abort plan is deterministic; reconciliation covers anything it
+					// could not write (e.g. a lease that expired mid-plan).
+					const recon = await reconcileRun(safeCtx, {
+						claims,
+						runId: run.id,
+						sessionId,
+						agent,
+						meta,
+						aborted: true,
+						childFailed: false,
+						signal,
+					});
+					report.ran = true;
+					report.calls = outcome.calls;
+					report.reconciled = recon.results;
+					report.errors = [...outcome.errors, ...recon.errors];
+					report.durationMs = Date.now() - started;
+					appendReport(pi, report);
+					if (outcome.errors.length && ctx.hasUI) {
+						ctx.ui.notify(
+							`APM: aborted-run sync had ${outcome.errors.length} problem(s); see /apm-doctor`,
+							"warning",
+						);
+					}
+					return;
+				}
+
+				const output = await runSideRun(safeCtx, {
 					claims,
 					runId: run.id,
 					sessionId,
+					projectDir,
+					digest: run.digest,
+					startedAt: run.startedAt,
+					timeoutMs,
+					model: flagString("apm-side-run-model"),
 					agent,
-					meta,
 					signal,
-					reason: "run aborted by the user (Escape/interrupt); liveness only, no progress recorded",
 				});
-				// The abort plan is deterministic; reconciliation covers anything it
-				// could not write (e.g. a lease that expired mid-plan).
+				const meta = metaArgs(safeCtx, { sessionId, runId: run.id, agent });
+				if (output.aborted || signal.aborted) {
+					// The session is shutting down and the child was killed on purpose.
+					// Record the truth (cancelled, not failed) and do not reconcile: every
+					// extra `apm` call would block the exit this cancellation exists for.
+					report.mode = "skip";
+					report.reason = "session shutdown: side-run cancelled";
+					report.aborted = true;
+					report.childEvents = output.events;
+					report.durationMs = Date.now() - started;
+					appendReport(pi, report);
+					return;
+				}
+				// Guarantee, not hope: every claimed item must carry an event for this
+				// run, even when the child did nothing or failed.
 				const recon = await reconcileRun(safeCtx, {
 					claims,
 					runId: run.id,
 					sessionId,
 					agent,
 					meta,
-					aborted: true,
-					childFailed: false,
+					aborted: false,
+					childFailed: output.errors.length > 0,
 					signal,
 				});
-				report.ran = true;
-				report.calls = outcome.calls;
-				report.reconciled = recon.results;
-				report.errors = [...outcome.errors, ...recon.errors];
-				report.durationMs = Date.now() - started;
-				appendReport(pi, report);
-				if (outcome.errors.length && ctx.hasUI) {
-					ctx.ui.notify(
-						`APM: aborted-run sync had ${outcome.errors.length} problem(s); see /apm-doctor`,
-						"warning",
-					);
+				if (signal.aborted) {
+					// Shutdown landed while reconciliation was running: it stopped early, so
+					// this run did NOT sync. Reporting `ran: true` here would render as
+					// "run synced" for a run that wrote nothing — never read as success.
+					report.mode = "skip";
+					report.reason = "session shutdown: reconciliation cancelled";
+					report.aborted = true;
+					report.childEvents = output.events;
+					report.reconciled = recon.results;
+					report.durationMs = Date.now() - started;
+					appendReport(pi, report);
+					return;
 				}
-				return;
-			}
-
-			const output = await runSideRun(safeCtx, {
-				claims,
-				runId: run.id,
-				sessionId,
-				projectDir,
-				digest: run.digest,
-				startedAt: run.startedAt,
-				timeoutMs,
-				model: flagString("apm-side-run-model"),
-				agent,
-				signal,
-			});
-			const meta = metaArgs(safeCtx, { sessionId, runId: run.id, agent });
-			if (output.aborted || signal.aborted) {
-				// The session is shutting down and the child was killed on purpose.
-				// Record the truth (cancelled, not failed) and do not reconcile: every
-				// extra `apm` call would block the exit this cancellation exists for.
-				report.mode = "skip";
-				report.reason = "session shutdown: side-run cancelled";
-				report.aborted = true;
+				report.ran = true;
 				report.childEvents = output.events;
-				report.durationMs = Date.now() - started;
-				appendReport(pi, report);
-				return;
-			}
-			// Guarantee, not hope: every claimed item must carry an event for this
-			// run, even when the child did nothing or failed.
-			const recon = await reconcileRun(safeCtx, {
-				claims,
-				runId: run.id,
-				sessionId,
-				agent,
-				meta,
-				aborted: false,
-				childFailed: output.errors.length > 0,
-				signal,
-			});
-			if (signal.aborted) {
-				// Shutdown landed while reconciliation was running: it stopped early, so
-				// this run did NOT sync. Reporting `ran: true` here would render as
-				// "run synced" for a run that wrote nothing — never read as success.
-				report.mode = "skip";
-				report.reason = "session shutdown: reconciliation cancelled";
-				report.aborted = true;
-				report.childEvents = output.events;
+				report.output = output.text ? redactSecrets(truncateStderr(output.text)) : undefined;
 				report.reconciled = recon.results;
+				report.errors = [...output.errors, ...recon.errors];
 				report.durationMs = Date.now() - started;
 				appendReport(pi, report);
-				return;
-			}
-			report.ran = true;
-			report.childEvents = output.events;
-			report.output = output.text ? redactSecrets(truncateStderr(output.text)) : undefined;
-			report.reconciled = recon.results;
-			report.errors = [...output.errors, ...recon.errors];
-			report.durationMs = Date.now() - started;
-			appendReport(pi, report);
 
-			if (output.errors.length) {
-				await callApm(
-					safeCtx,
-					[
-						"diag",
-						"--code",
-						"side_run_failed",
-						"--message",
-						truncateStderr(output.errors.join("; ")),
-						"--idempotency-key",
-						`sr:${sessionId}:${run.id}:project:diag`,
-						"--json",
-					],
-					{ timeoutMs: 15_000, signal },
-				).catch(() => undefined);
+				if (output.errors.length) {
+					await callApm(
+						safeCtx,
+						[
+							"diag",
+							"--code",
+							"side_run_failed",
+							"--message",
+							truncateStderr(output.errors.join("; ")),
+							"--idempotency-key",
+							`sr:${sessionId}:${run.id}:project:diag`,
+							"--json",
+						],
+						{ timeoutMs: 15_000, signal },
+					).catch(() => undefined);
+					if (ctx.hasUI) {
+						ctx.ui.notify(
+							`APM side-run finished with ${output.errors.length} problem(s); run /apm-doctor`,
+							"warning",
+						);
+					}
+				}
+			} catch (error) {
+				report.errors.push(error instanceof Error ? error.message : String(error));
+				report.durationMs = Date.now() - started;
+				if (signal.aborted) {
+					// Aborting kills in-flight work, which can surface as an exception; it is
+					// still a cancellation, not a plugin failure.
+					report.mode = "skip";
+					report.reason = "session shutdown: side-run cancelled";
+					report.aborted = true;
+					report.errors = [];
+					appendReport(pi, report);
+					return;
+				}
+				appendReport(pi, report);
 				if (ctx.hasUI) {
 					ctx.ui.notify(
-						`APM side-run finished with ${output.errors.length} problem(s); run /apm-doctor`,
+						`APM side-run unavailable: ${error instanceof Error ? error.message : String(error)}`,
 						"warning",
 					);
 				}
 			}
-		} catch (error) {
-			report.errors.push(error instanceof Error ? error.message : String(error));
-			report.durationMs = Date.now() - started;
-			if (signal.aborted) {
-				// Aborting kills in-flight work, which can surface as an exception; it is
-				// still a cancellation, not a plugin failure.
-				report.mode = "skip";
-				report.reason = "session shutdown: side-run cancelled";
-				report.aborted = true;
-				report.errors = [];
-				appendReport(pi, report);
-				return;
-			}
-			appendReport(pi, report);
-			if (ctx.hasUI) {
-				ctx.ui.notify(
-					`APM side-run unavailable: ${error instanceof Error ? error.message : String(error)}`,
-					"warning",
-				);
-			}
-		}
-		} finally {
+			} finally {
 			if (sideRunController === controller) sideRunController = null;
 			sideRunInFlight = false;
 			restoreInjectedEnv();
@@ -1105,8 +1128,8 @@ function metaArgs(
 			"Show the AgentPM status board: waiting for a human, in progress, no substantive progress, lost leases, blocked dependencies, recently done. Use at the start of work or when the user asks what is going on.",
 		promptSnippet: "Read the agent work ledger status board (apm_dashboard)",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const result = await callApm(withBin(ctx), ["dashboard", "--json", ...metaArgs(ctx)]);
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			const result = await callApm(withBin(ctx), ["dashboard", "--json", ...metaArgs(ctx)], { signal });
 			if (!result.ok) return apmFailure(result);
 			const data = result.data as {
 				buckets?: Record<string, Array<Record<string, unknown>>>;
@@ -1155,13 +1178,13 @@ function metaArgs(
 			),
 			reason: Type.Optional(Type.String({ description: "Why you are taking over" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const args: string[] = ["claim", params.item, "--json"];
 			if (params.lease_seconds) args.push("--lease", String(params.lease_seconds));
 			if (params.takeover) args.push("--takeover");
 			if (params.reason) args.push("--reason", params.reason);
 			args.push(...metaArgs(ctx));
-			const result = await callApm(withBin(ctx), args);
+			const result = await callApm(withBin(ctx), args, { signal });
 			if (!result.ok) return apmFailure(result);
 			const data = result.data as { claim?: Record<string, unknown>; takeover?: boolean };
 			const claim = { ...(data.claim ?? {}) };
@@ -1184,11 +1207,11 @@ function metaArgs(
 			item: Type.String(),
 			reason: Type.Optional(Type.String()),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const args: string[] = ["release", params.item, "--json"];
 			if (params.reason) args.push("--reason", params.reason);
 			args.push(...metaArgs(ctx));
-			const result = await callApm(withBin(ctx), args);
+			const result = await callApm(withBin(ctx), args, { signal });
 			if (!result.ok) return apmFailure(result);
 			return { content: [jsonText(result.data)], details: result.data };
 		},
@@ -1211,9 +1234,9 @@ function metaArgs(
 				Type.Number({ description: "Optimistic-lock version; defaults to a fresh read" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const safeCtx = withBin(ctx);
-			const version = params.expect_version ?? (await currentVersion(safeCtx, params.item));
+			const version = params.expect_version ?? (await currentVersion(safeCtx, params.item, signal));
 			const args: string[] = [
 				"progress",
 				params.item,
@@ -1228,7 +1251,7 @@ function metaArgs(
 			if (params.waiting_on_human) args.push("--waiting-human");
 			if (params.waiting_reason) args.push("--waiting-reason", params.waiting_reason);
 			args.push(...metaArgs(ctx));
-			const result = await callApm(safeCtx, args);
+			const result = await callApm(safeCtx, args, { signal });
 			if (!result.ok) return apmFailure(result);
 			const data = result.data as {
 				item?: Record<string, unknown>;
@@ -1266,7 +1289,7 @@ function metaArgs(
 			outcome: Type.Optional(StringEnum(["completed", "aborted", "unknown"] as const)),
 			note: Type.Optional(Type.String()),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const args: string[] = [
 				"sync",
 				params.item,
@@ -1276,7 +1299,7 @@ function metaArgs(
 			];
 			if (params.note) args.push("--note", params.note);
 			args.push(...metaArgs(ctx));
-			const result = await callApm(withBin(ctx), args);
+			const result = await callApm(withBin(ctx), args, { signal });
 			if (!result.ok) return apmFailure(result);
 			const data = result.data as { identifier?: string; run?: { outcome?: string } };
 			return {
@@ -1308,9 +1331,9 @@ function metaArgs(
 				Type.Number({ description: "Optimistic-lock version; defaults to a fresh read" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const safeCtx = withBin(ctx);
-			const version = params.expect_version ?? (await currentVersion(safeCtx, params.item));
+			const version = params.expect_version ?? (await currentVersion(safeCtx, params.item, signal));
 			const args: string[] = [
 				"status",
 				params.item,
@@ -1323,7 +1346,7 @@ function metaArgs(
 			if (params.reason) args.push("--reason", params.reason);
 			if (params.note) args.push("--note", params.note);
 			args.push(...metaArgs(ctx));
-			const result = await callApm(safeCtx, args);
+			const result = await callApm(safeCtx, args, { signal });
 			if (!result.ok) return apmFailure(result);
 			const data = result.data as { item?: Record<string, unknown> };
 			const item = data.item ?? {};
@@ -1350,16 +1373,14 @@ function metaArgs(
 			references: Type.Optional(Type.Array(Type.String())),
 			notes: Type.Optional(Type.String()),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const safeCtx = withBin(ctx);
 			if (params.action === "show") {
-				const result = await callApm(safeCtx, [
-					"context",
-					"show",
-					params.item,
-					"--json",
-					...metaArgs(ctx),
-				]);
+				const result = await callApm(
+					safeCtx,
+					["context", "show", params.item, "--json", ...metaArgs(ctx)],
+					{ signal },
+				);
 				if (!result.ok) return apmFailure(result);
 				return { content: [jsonText(result.data)], details: result.data };
 			}
@@ -1374,13 +1395,11 @@ function metaArgs(
 					details: {},
 				};
 			}
-			const current = await callApm(safeCtx, [
-				"context",
-				"show",
-				params.item,
-				"--json",
-				...metaArgs(ctx),
-			]);
+			const current = await callApm(
+				safeCtx,
+				["context", "show", params.item, "--json", ...metaArgs(ctx)],
+				{ signal },
+			);
 			if (!current.ok) return apmFailure(current);
 			const doc =
 				((current.data as { context?: { doc?: Record<string, unknown> } }).context?.doc as
@@ -1393,20 +1412,24 @@ function metaArgs(
 				references: params.references ?? ((doc.references as string[] | undefined) ?? []),
 				notes: params.notes ?? ((doc.notes as string | undefined) ?? undefined),
 			};
-			const version = await currentVersion(safeCtx, params.item);
-			const result = await callApm(safeCtx, [
-				"context",
-				"revise",
-				params.item,
-				"--context-json",
-				JSON.stringify(merged),
-				"--reason",
-				params.reason,
-				"--expect-version",
-				String(version),
-				"--json",
-				...metaArgs(ctx),
-			]);
+			const version = await currentVersion(safeCtx, params.item, signal);
+			const result = await callApm(
+				safeCtx,
+				[
+					"context",
+					"revise",
+					params.item,
+					"--context-json",
+					JSON.stringify(merged),
+					"--reason",
+					params.reason,
+					"--expect-version",
+					String(version),
+					"--json",
+					...metaArgs(ctx),
+				],
+				{ signal },
+			);
 			if (!result.ok) return apmFailure(result);
 			return { content: [jsonText(result.data)], details: result.data };
 		},
@@ -1426,14 +1449,14 @@ function metaArgs(
 			recommendation: Type.Optional(Type.String()),
 			blocking: Type.Optional(Type.Boolean()),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const args: string[] = ["attention", "request", "--question", params.question, "--context", params.context];
 			if (params.item) args.push("--item", params.item);
 			for (const option of params.options ?? []) args.push("--option", option);
 			if (params.recommendation) args.push("--recommend", params.recommendation);
 			if (params.blocking === false) args.push("--non-blocking");
 			args.push("--json", ...metaArgs(ctx));
-			const result = await callApm(withBin(ctx), args);
+			const result = await callApm(withBin(ctx), args, { signal });
 			if (!result.ok) return apmFailure(result);
 			const data = result.data as { attention?: Record<string, unknown> };
 			const attention = data.attention ?? {};
@@ -1517,8 +1540,8 @@ function claim_bracket(claim: Record<string, unknown>): string {
 	return String(claim.version ?? "?");
 }
 
-async function currentVersion(ctx: ExtensionContext, item: string): Promise<number> {
-	const result = await callApm(ctx, ["get", item, "--json"]);
+async function currentVersion(ctx: ExtensionContext, item: string, signal?: AbortSignal): Promise<number> {
+	const result = await callApm(ctx, ["get", item, "--json"], { signal });
 	if (!result.ok) {
 		throw new ApmBinaryError(
 			`cannot read ${item}: ${result.error?.code} ${result.error?.message}`,

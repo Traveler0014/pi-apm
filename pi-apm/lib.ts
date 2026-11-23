@@ -163,9 +163,18 @@ export function emptyDigest(): RunDigest {
 	return { userPrompts: [], assistantTexts: [], toolCalls: [], filesTouched: [], errors: [] };
 }
 
-/// Claim tokens are `apm_` + 32+ hex chars. They must never reach a prompt, a
-/// child argv, a ledger field, or a report: models happily echo command output.
-const TOKEN_PATTERN = /apm_[0-9a-f]{32,}/g;
+/// Any APM secret: `apm_` + 32+ token characters. Kept byte-for-byte in line with
+/// the Rust side (`src/redact.rs`), so all issued shapes are covered:
+///
+///   * claim tokens — `apm_` + two UUIDs (64 hex chars);
+///   * REST bearer tokens — `apm_rest_` + hex;
+///   * UI session tokens — `apm_ui_` + hex;
+///   * bootstrap tickets — `apm_boot_` + hex.
+///
+/// Tool names such as `apm_dashboard` stay readable: their body is shorter than
+/// the 32-character threshold. These secrets must never reach a prompt, a child
+/// argv, a ledger field, or a report: models happily echo command output.
+const TOKEN_PATTERN = /apm_[A-Za-z0-9_-]{32,}/g;
 
 export function redactSecrets(text: string): string {
 	return text.replace(TOKEN_PATTERN, "apm_[redacted]");

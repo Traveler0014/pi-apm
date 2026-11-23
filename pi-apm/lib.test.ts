@@ -408,6 +408,29 @@ describe("redaction", () => {
 		expect(redacted).toContain("apm_claim");
 	});
 
+	it("covers every issued token shape and leaves short tool names alone", () => {
+		// Same rule as the Rust side (`src/redact.rs`): `apm_` + 32+ of
+		// [A-Za-z0-9_-], which covers claim and the prefixed REST/UI/boot secrets.
+		const shapes = [
+			`apm_${"ab12".repeat(16)}`,
+			`apm_rest_${"0a".repeat(24)}`,
+			`apm_ui_${"0a".repeat(24)}`,
+			`apm_boot_${"0a".repeat(24)}`,
+		];
+		for (const secret of shapes) {
+			const redacted = redactSecrets(`id ${secret} end`);
+			expect(redacted, secret).not.toContain(secret);
+			expect(redacted).toContain("apm_[redacted]");
+		}
+		// Below the 32-char threshold nothing is redacted: docs and tool names
+		// (`apm_dashboard`) must stay readable.
+		expect(redactSecrets("apm_dashboard and apm_1234")).toBe("apm_dashboard and apm_1234");
+		const short = `apm_${"a".repeat(31)}`;
+		expect(redactSecrets(short)).toBe(short);
+		const exact = `apm_${"a".repeat(32)}`;
+		expect(redactSecrets(exact)).toBe("apm_[redacted]");
+	});
+
 	it("scrubs a digest that captured command output", () => {
 		const digest = digestRun([
 			{ role: "assistant", content: [{ type: "text", text: `output: ${token}` }] },

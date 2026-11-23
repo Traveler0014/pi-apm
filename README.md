@@ -558,7 +558,7 @@ versions** (never tokens — the CLI resolves them from the 0600 session file), 
 run digest (user prompts, final assistant texts, tool calls, touched files, tool
 errors), and the **per-item, per-operation idempotency keys** to use. Every
 digest field, the task prompt, the child's reported output and the persisted
-report are scrubbed of `apm_[0-9a-f]{32,}` tokens before they are used. The child
+report are scrubbed of `apm_[A-Za-z0-9_-]{32,}` tokens before they are used. The child
 is started with `APM_BIN` and a private `PATH` entry containing `apm`, so a
 `--apm-bin` configuration still works inside its bash tool. The system prompt forbids creating items, claiming new work,
 releasing claims, inventing progress, and closing items without evidence.
@@ -632,8 +632,9 @@ broken plugin cannot break the main reply.
   (`token_suppressed: true`, `token_source: session_file`) in both text and JSON,
   and `apm claims --with-tokens` is force-suppressed. A child therefore cannot
   paste a token into `progress_summary`/context even if it echoes command output.
-  The extension additionally redacts `apm_[0-9a-f]{32,}` from digests, prompts,
-  child output and reports.
+  The extension additionally redacts every APM secret shape
+  (`apm_[A-Za-z0-9_-]{32,}`: claim tokens plus `apm_rest_`/`apm_ui_`/`apm_boot_`)
+  from digests, prompts, child output and reports.
 - Ordinary CLI/agent usage (not a side-run) still prints the token **once** on
   `claim` and supports `claims --with-tokens` — that is the documented local
   contract for humans and scripts. `apm` does not try to stop a model from reading
@@ -680,7 +681,8 @@ reconciled items, six errors, six output lines and the metadata line:
 | indented plain lines | the child's summary of what it did, truncated |
 
 Claim tokens never appear: output and errors are scrubbed with the same
-`apm_[0-9a-f]{32,}` redaction the rest of the plugin uses.
+`apm_[A-Za-z0-9_-]{32,}` redaction the rest of the plugin (and the Rust side)
+uses.
 
 **Where to look when something is off**
 
@@ -779,7 +781,7 @@ Claim tokens are bearer secrets. `apm-mcp` writes the plaintext from `claim` int
 the same 0600 session file the CLI uses (`<data_dir>/sessions/<session>.json`),
 keeps it in process memory, and returns `token: null` / `token_suppressed: true`
 in every result. Results and diagnostics are additionally scrubbed of
-`apm_[0-9a-f]{32,}`.
+`apm_[A-Za-z0-9_-]{32,}` (claim, `apm_rest_`, `apm_ui_`, `apm_boot_`).
 
 ### 8.4 Verify the connection
 
