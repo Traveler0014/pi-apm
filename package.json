@@ -30,7 +30,7 @@
     "test:rust": "cargo test --all-targets",
     "test:stress": "bash scripts/stress.sh 10",
     "typecheck": "tsc -p tsconfig.json",
-    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && npx tsc -p tsconfig.json && npm run ui:typecheck && test -s ui/dist/index.html && npx vitest run && bash scripts/test-release-scripts.sh && bash scripts/test-package-windows.sh && bash scripts/test-release-gate.sh",
+    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && npx tsc -p tsconfig.json && npm run ui:typecheck && test -s ui/dist/index.html && npx vitest run && bash scripts/test-release-scripts.sh && bash scripts/test-package-windows.sh && bash scripts/test-release-gate.sh && bash scripts/test-install-script.sh",
     "ui:dev": "vite --config ui/vite.config.ts",
     "ui:build": "vite build --config ui/vite.config.ts",
     "ui:test": "vitest run ui",

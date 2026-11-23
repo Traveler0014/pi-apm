@@ -78,6 +78,7 @@ verify:
     bash scripts/test-release-scripts.sh
     bash scripts/test-package-windows.sh
     bash scripts/test-release-gate.sh
+    bash scripts/test-install-script.sh
 
 # Offline sanity for the documentation tree: every relative link in README.md and
 # docs/*.md must resolve, and every `#fragment` must match a heading slug.
@@ -95,6 +96,7 @@ test-release-scripts:
     bash scripts/test-release-scripts.sh
     bash scripts/test-package-windows.sh
     bash scripts/test-release-gate.sh
+    bash scripts/test-install-script.sh
 
 # Build a distributable archive for the host target into dist/ (no tag, no
 # publish). CI builds the full platform matrix; see docs/release.md.

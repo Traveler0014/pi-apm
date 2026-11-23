@@ -41,36 +41,51 @@ The distribution point is the GitHub repository:
 [GitHub Releases](https://github.com/Traveler0014/pi-apm/releases); source builds
 are covered in [`docs/development.md`](docs/development.md).
 
-### Binaries from a GitHub Release
+### One-line installer (Linux and macOS, recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh | bash
+```
+
+The script detects the platform (Linux/macOS, x64/arm64), resolves the latest
+release through GitHub's `/releases/latest` redirect, verifies the archive
+against the aggregate `SHA256SUMS.txt` **and** the package's own `SHA256SUMS`,
+then installs `apm`, `apm-mcp` and `apm-serve` into `~/.local/bin` atomically
+(temp file + rename, so a running binary can be replaced safely). It needs only
+bash, curl (or wget), tar and sha256sum/shasum — no `gh`, no token. Nothing is
+written unless both checksum layers pass.
+
+Pin a version or choose a directory with flags or the matching environment
+variables:
+
+```bash
+# --version / APM_VERSION accepts v0.2.0 or 0.2.0
+# --bin-dir / APM_BIN_DIR (BINDIR also accepted) defaults to ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh \
+  | bash -s -- --version v0.2.0 --bin-dir /usr/local/bin
+
+# or configure a saved copy from the environment
+APM_VERSION=v0.2.0 APM_BIN_DIR="$HOME/bin" bash install.sh
+```
+
+**Windows:** download `apm-0.2.0-x86_64-pc-windows-msvc.zip` from
+[GitHub Releases](https://github.com/Traveler0014/pi-apm/releases), extract it,
+and put the three `.exe` files on `PATH`.
+
+### Manual download and verification
 
 Three binaries come out of the same crate: `apm` (the CLI), `apm-mcp` (the MCP
-stdio server) and `apm-serve` (the optional loopback REST adapter). Each release
+stdio server) and `apm-serve` (the optional loopback REST adapter). Every release
 attaches one archive per platform (Linux x64/arm64, macOS x64/arm64, Windows x64)
 with all three binaries, `README.md`, `LICENSE`, a per-package `SHA256SUMS`, plus
 an aggregate `SHA256SUMS.txt`.
 
-```bash
-# 1. Download the archive for your platform plus the aggregate checksum list.
-#    Replace v0.2.0 with the latest release tag if a newer one exists.
-gh release download v0.2.0 --repo Traveler0014/pi-apm \
-  --pattern 'apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz' \
-  --pattern 'SHA256SUMS.txt'
+Prefer to verify by hand? The copy-paste `gh release download`, two-layer
+checksum verification and `install -m 0755` steps live in
+[`docs/release.md`](docs/release.md#manual-download-and-verification), together
+with the installer flags, checksum fallbacks and troubleshooting.
 
-# 2. Verify that archive against the aggregate list (the list covers every
-#    platform, so check one line instead of `sha256sum -c` on the whole file).
-grep ' apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
-# macOS has no sha256sum: use `shasum -a 256 -c -` instead.
-
-# 3. Unpack, check the per-package list, install all three binaries.
-tar -xzf apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz
-(cd apm-0.2.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS)
-install -m 0755 apm-0.2.0-x86_64-unknown-linux-gnu/{apm,apm-mcp,apm-serve} ~/.local/bin/
-
-apm --version && apm-mcp --version && apm-serve --version
-```
-
-Windows: `Expand-Archive apm-0.2.0-x86_64-pc-windows-msvc.zip`, then copy the
-three `.exe` files somewhere on `PATH`. If `~/.local/bin` is not on your `PATH`:
+If `~/.local/bin` is not on your `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -78,8 +93,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 **Upgrade** = install the newer release over the same paths (the ledger is
 unchanged). **Rollback** = reinstall the previous tag's archive; never edit the
-database to roll back. The full policy, checksum fallbacks and troubleshooting
-live in [`docs/release.md`](docs/release.md#download-install-upgrade-rollback).
+database to roll back.
 
 ### Pi extension
 

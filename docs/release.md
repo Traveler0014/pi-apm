@@ -190,6 +190,58 @@ Use `--skip-run` to check only structure/checksums (for a foreign package).
 
 ## Download, install, upgrade, rollback
 
+### One-line installer (Linux/macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh | bash
+```
+
+`scripts/install.sh` is the recommended path for users who just want the
+binaries. It:
+
+1. maps `uname -s`/`uname -m` to one of the four supported triples
+   (`x86_64`/`aarch64` × Linux/Darwin) and refuses anything else with a clear
+   message (Windows users are pointed at the `.zip` release);
+2. resolves the latest tag from the `https://github.com/<repo>/releases/latest`
+   **redirect** (not the rate-limited JSON API), or takes an explicit version;
+3. downloads `apm-<version>-<target>.tar.gz` and `SHA256SUMS.txt` into a
+   `mktemp -d` directory (removed by a trap), then verifies **two layers**:
+   the aggregate list's exact line for this archive, and the package's own
+   `SHA256SUMS` (three binaries + `README.md` + `LICENSE`);
+4. installs `apm`, `apm-mcp` and `apm-serve` by staging each in the destination
+   directory (mode 0755) and `mv -f`-renaming it over the target, so an existing
+   or running binary is replaced atomically;
+5. prints a `PATH` hint when the destination is not on `PATH`, then runs
+   `--version` for all three binaries.
+
+No `gh` CLI and no token are required: only bash, curl (or wget), tar and
+`sha256sum` (or macOS `shasum -a 256`). Nothing is written to the destination
+unless both checksum layers pass, and the whole script is wrapped in `main()`
+so an interrupted `curl | bash` transfer cannot execute half a script.
+
+| flag | environment | default | meaning |
+|---|---|---|---|
+| `--version <tag>` | `APM_VERSION` | latest release | release tag, `v0.2.0` or `0.2.0` |
+| `--bin-dir <dir>` | `APM_BIN_DIR`, `BINDIR` | `$HOME/.local/bin` | install destination |
+| `--repo <owner/name>` | `APM_REPO` | `Traveler0014/pi-apm` | GitHub repository |
+| `--help` | – | – | usage |
+
+```bash
+# pinned version and custom directory
+curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh \
+  | bash -s -- --version v0.2.0 --bin-dir /usr/local/bin
+
+# environment form (also useful when the script is saved locally)
+APM_VERSION=v0.2.0 APM_BIN_DIR="$HOME/bin" bash scripts/install.sh
+```
+
+`repo` and `version` are validated against a strict whitelist before they reach a
+URL, so neither can inject a path or query. The installer is covered by
+`scripts/test-install-script.sh` (fully offline: fake `curl`, real fixture
+archives and checksums, injected `uname`), which runs in `just verify` and CI.
+
+### Manual download and verification
+
 ```bash
 # 1. Pick a release; download the archive and the aggregate checksum list
 gh release download v0.2.0 --repo Traveler0014/pi-apm \
@@ -198,7 +250,7 @@ gh release download v0.2.0 --repo Traveler0014/pi-apm \
 
 # 2. Verify just this archive against the aggregate list (the list covers all
 #    platforms, so check one line instead of `sha256sum -c` on the whole file)
-grep ' apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
+grep 'apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
 # macOS has no sha256sum: use `shasum -a 256 -c -` instead.
 
 tar -xzf apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz

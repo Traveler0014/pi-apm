@@ -79,7 +79,11 @@ npx vitest run             # 276 tests across 20 files: the extension
 npm run ui:browser         # real Chromium against a throwaway ledger (needs
                            #   Chromium; prints SKIP when none is installed)
 
-npm run verify             # all of the above that can run non-interactively
+npm run verify             # all of the above that can run non-interactively,
+                           #   plus the three release-script suites and the
+                           #   offline installer tests
+bash scripts/test-install-script.sh  # installer only: platforms, versions,
+                                     #   checksum tampering, atomic upgrade
 just ui-dist-check         # committed ui/dist matches a fresh build
 python3 scripts/check-doc-links.py   # README + docs/ relative links and anchors
 
@@ -225,6 +229,9 @@ scripts/
   stress.sh       CLI cross-process claim/write race
   stress-rest.sh  REST variant: servers, HTTP racers, mixed HTTP/CLI writers
   ui-browser-check.mjs  real Chromium run over a throwaway ledger
+  install.sh            one-line Linux/macOS installer (release download + verify)
+  test-install-script.sh  offline installer tests: 4 platforms, versions,
+                        checksum tampering, atomic upgrade, no bin-dir pollution
   check-doc-links.py    README/docs relative-link and anchor checker
   package-release.sh / verify-package.sh  release archive + offline verification
   test-release-scripts.sh / test-package-windows.sh / test-release-gate.sh
