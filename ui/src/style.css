@@ -238,6 +238,22 @@ body {
 	display: none;
 }
 
+/* --- truncation notice ------------------------------------------------ */
+
+.truncation {
+	margin: 0;
+	padding: 10px 12px;
+	border-radius: var(--radius);
+	border: 1px dashed var(--warn);
+	background: color-mix(in srgb, var(--warn) 8%, var(--surface));
+	color: var(--text);
+	font-size: 14px;
+}
+
+.truncation[hidden] {
+	display: none;
+}
+
 /* --- controls -------------------------------------------------------- */
 
 .controls {

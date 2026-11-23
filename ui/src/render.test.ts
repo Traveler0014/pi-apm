@@ -18,6 +18,7 @@ import {
 	updateFilters,
 	updateHeader,
 	updateMetrics,
+	updateTruncation,
 	updateDagPanel,
 	type DagPanelState,
 	updateQueue,
@@ -649,5 +650,26 @@ describe("topology master/detail workspace (APM-46)", () => {
 		panel.key = null;
 		render();
 		expect(shell.dagPanel.querySelector<HTMLElement>(".dag")!.dataset.relation).toBe("hierarchy");
+	});
+});
+
+describe("dashboard shell: truncation notice", () => {
+	it("stays hidden for a complete snapshot and explains a capped one", () => {
+		const { root, shell } = mount();
+		updateTruncation(shell, null);
+		expect(shell.truncation.hidden).toBe(true);
+		expect(shell.truncation.textContent).toBe("");
+		// The notice is part of the static shell, next to the metrics.
+		expect(root.querySelector(".truncation")).toBe(shell.truncation);
+
+		updateTruncation(shell, { shown: 1000, limit: 1000 });
+		expect(shell.truncation.hidden).toBe(false);
+		expect(shell.truncation.textContent).toContain("Showing the newest 1000 items");
+		expect(shell.truncation.textContent).toContain("header totals and the topology omit the rest");
+		expect(shell.truncation.getAttribute("role")).toBe("status");
+
+		// A later complete snapshot hides it again (no stale warning).
+		updateTruncation(shell, null);
+		expect(shell.truncation.hidden).toBe(true);
 	});
 });

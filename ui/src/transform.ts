@@ -33,6 +33,20 @@ export const BUCKETS: BucketMeta[] = [
 const BUCKET_BY_KEY = new Map(BUCKETS.map((bucket) => [bucket.key, bucket]));
 const ACTIVE_BUCKETS = BUCKETS.filter((bucket) => bucket.key !== "recently_done");
 
+/**
+ * How many items the dashboard fetches for its flat snapshot.
+ *
+ * The header metrics and the topology are computed from this list, not from the
+ * dashboard's recent window, so the cap is a real data boundary — hence the
+ * visible truncation notice when the ledger reaches it (APM-55).
+ */
+export const ITEM_LIST_LIMIT = 1000;
+
+/** True when the fetch came back at the cap, i.e. the ledger may hold more. */
+export function isListTruncated(fetched: number, limit: number = ITEM_LIST_LIMIT): boolean {
+	return fetched >= limit;
+}
+
 export function bucketMeta(key: BucketKey): BucketMeta {
 	return BUCKET_BY_KEY.get(key) ?? { key, label: key, symbol: "?", tone: "muted" };
 }

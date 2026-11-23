@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import { MOCK_CLOSED_EXTRA, MOCK_DONE, MOCK_ITEMS, mockDashboard } from "./fixtures";
 import {
 	BUCKETS,
+	ITEM_LIST_LIMIT,
 	buildQueue,
 	clockTime,
 	connectionView,
 	dataAge,
 	defaultViewState,
+	isListTruncated,
 	matchesQuery,
 	relativeTime,
 	sortQueue,
@@ -386,5 +388,19 @@ describe("status scope (APM-30)", () => {
 		expect(filtered.filtered).toBe(all.total);
 		expect(filtered.items).toEqual([]);
 		expect(filtered.closedTotal).toBe(all.closedTotal);
+	});
+});
+
+describe("list truncation", () => {
+	it("treats a full page of results as possibly truncated", () => {
+		// The server returns at most `limit` rows, so `fetched == limit` means
+		// "there may be more" — the header metrics must not pretend otherwise.
+		expect(isListTruncated(ITEM_LIST_LIMIT, ITEM_LIST_LIMIT)).toBe(true);
+		expect(isListTruncated(ITEM_LIST_LIMIT + 1, ITEM_LIST_LIMIT)).toBe(true);
+		expect(isListTruncated(ITEM_LIST_LIMIT - 1, ITEM_LIST_LIMIT)).toBe(false);
+		expect(isListTruncated(0, ITEM_LIST_LIMIT)).toBe(false);
+		// The default cap is the one the dashboard fetches with.
+		expect(isListTruncated(ITEM_LIST_LIMIT)).toBe(true);
+		expect(ITEM_LIST_LIMIT).toBeGreaterThanOrEqual(500);
 	});
 });

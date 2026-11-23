@@ -22,6 +22,8 @@ import {
 } from "./api";
 import { createDrawer } from "./detail";
 import { createMockFetcher } from "./fixtures";
+import { type FocusSnapshot, focusSelector } from "./focus";
+import { createLazyLoader } from "./lazy";
 import { createPoller } from "./poller";
 import {
 	createShell,
@@ -37,27 +39,31 @@ import {
 	updateStatusScope,
 	updateSelectionSummary,
 	updateTopology,
+	updateTruncation,
 	updateViews,
 	type RenderContext,
 	type ViewMode,
 } from "./render";
-import { cacheIsFresh, findByReference, pruneCache, reconcileSelection } from "./selection";
+import { findByReference, reconcileSelection } from "./selection";
 import { type DagScope, buildGraph, topologySummary } from "./topology";
 import {
 	type ConnectionView,
 	type ViewState,
+	ITEM_LIST_LIMIT,
 	buildQueue,
 	connectionView,
 	defaultViewState,
+	isListTruncated,
 	summarizeItems,
 } from "./transform";
-import type { Dashboard, ItemDetail, WorkItem, WorkflowDef } from "./types";
-import { acceptanceProgress, stageModel, workflowKey } from "./workflow";
+import type { Dashboard, WorkItem } from "./types";
 
 interface Snapshot {
 	dashboard: Dashboard;
 	items: WorkItem[];
 	fetchedAt: number;
+	/** True when the flat fetch hit [`ITEM_LIST_LIMIT`] and may be incomplete. */
+	truncated: boolean;
 }
 
 const root = document.getElementById("app");
@@ -77,58 +83,21 @@ const dagPanel: DagPanelState = { relation: "dependencies", view: null, key: nul
 let snapshot: Snapshot | null = null;
 let connection: ConnectionView = connectionView({ lastSuccessAt: null, lastError: null, refreshing: false, now: Date.now() });
 
-// --- caches --------------------------------------------------------------
-/** workflow definition cache: `id@version` → definition, "missing", or pending. */
-const workflows = new Map<string, WorkflowDef | "missing" | "pending">();
-/** detail cache: item id → detail + the item version it was fetched at. */
-const details = new Map<string, { detail: ItemDetail; version: number }>();
-const detailRequests = new Set<string>();
-
-function stageOf(item: WorkItem): ReturnType<typeof stageModel> {
-	return stageModel(item, (id, version) => {
-		const key = workflowKey(id, version);
-		const cached = workflows.get(key);
-		if (cached === "missing") return null;
-		if (cached && cached !== "pending") return cached;
-		if (cached === "pending") return undefined;
-		workflows.set(key, "pending");
-		api
-			.getItemWorkflow(item.id)
-			.then((response) => {
-				workflows.set(key, response.workflow);
-				// The response can carry a different key if the item moved; store both.
-				workflows.set(workflowKey(response.workflow_id, response.workflow_version), response.workflow);
-			})
-			.catch(() => workflows.set(key, "missing"))
-			.finally(() => render());
-		return undefined;
-	});
-}
-
-function acceptanceOf(item: WorkItem): ReturnType<typeof acceptanceProgress> {
-	const cached = details.get(item.id);
-	const fresh = cacheIsFresh(cached, item);
-	// Only the selected item is loaded eagerly; everything else shows nothing
-	// rather than a misleading "0/0". A stale entry is refetched and, until the
-	// new data lands, not shown at all (an old ratio would be a lie).
-	if (selectedId === item.id && !fresh && !detailRequests.has(item.id)) {
-		detailRequests.add(item.id);
-		api
-			.getItem(item.id)
-			.then((response) => {
-				details.set(item.id, { detail: response.item, version: response.item.item.version });
-			})
-			.catch(() => undefined)
-			.finally(() => {
-				detailRequests.delete(item.id);
-				render();
-			});
-	}
-	return fresh ? acceptanceProgress(cached!.detail.acceptance) : undefined;
-}
+// --- lazy loading --------------------------------------------------------
+// Workflow definitions and the selected item's detail are fetched lazily and
+// cached. The loader owns the retry/cooldown policy so a failing backend cannot
+// turn one render into a request storm (APM-55).
+const lazy = createLazyLoader({ api, onUpdate: () => render() });
 
 function context(): RenderContext {
-	return { state, view, selectedId, stageOf, acceptanceOf, now: Date.now() };
+	return {
+		state,
+		view,
+		selectedId,
+		stageOf: lazy.stageOf,
+		acceptanceOf: (item) => lazy.acceptanceOf(item, selectedId),
+		now: Date.now(),
+	};
 }
 
 // --- rendering -----------------------------------------------------------
@@ -140,6 +109,10 @@ function render(): void {
 	updateProject(shell, dashboard?.project ?? (useMock ? "pi-apm (mock)" : "…"));
 	// The header reads the full snapshot, not the dashboard's recent window (APM-49).
 	updateMetrics(shell, summarizeItems(snapshot?.items ?? [], ctx.now));
+	updateTruncation(
+		shell,
+		snapshot?.truncated ? { shown: snapshot.items.length, limit: ITEM_LIST_LIMIT } : null,
+	);
 	updateHeader(shell, {
 		connection,
 		generatedAt: dashboard?.generated_at ?? null,
@@ -157,7 +130,7 @@ function render(): void {
 	const graph = buildGraph(snapshot?.items ?? []);
 	updateTopology(shell, topologySummary(graph), ctx, state.statusScope === "open" ? undefined : queue.closed);
 	const selected = selectedId ? (snapshot?.items.find((item) => item.id === selectedId) ?? null) : null;
-	updateSelectionSummary(shell, ctx, selected, selected ? details.get(selected.id)?.detail : undefined);
+	updateSelectionSummary(shell, ctx, selected, selected ? lazy.detailFor(selected.id) : undefined);
 	applyWorkspaceHeight(shell);
 	updateDagPanel(
 		shell,
@@ -188,17 +161,6 @@ function renderClock(): void {
 	updateBanner(shell, connection);
 }
 
-interface FocusSnapshot {
-	itemId?: string;
-	action?: string;
-	bucket?: string;
-	view?: string;
-	relation?: string;
-	scope?: string;
-	/** Fit / zoom / expand live inside the graph, which is rebuilt each render. */
-	dagControl?: "fit" | "zoom-in" | "zoom-out" | "reset" | "expand";
-}
-
 const DAG_CONTROLS: Array<[FocusSnapshot["dagControl"], string]> = [
 	["fit", "dag-fit"],
 	["reset", "dag-zoom-reset"],
@@ -225,20 +187,9 @@ function captureFocus(): FocusSnapshot | null {
 }
 
 function restoreFocus(saved: FocusSnapshot | null): void {
-	if (!saved) return;
-	const selector = saved.bucket
-		? `[data-bucket="${saved.bucket}"]`
-		: saved.view
-			? `[data-view="${saved.view}"]`
-			: saved.relation
-				? `.dag-panel button[data-relation="${saved.relation}"]`
-				: saved.scope
-					? `.dag-panel .dag-scope[data-scope="${saved.scope}"]`
-					: saved.dagControl
-						? `.dag-panel .dag-${saved.dagControl}`
-						: saved.itemId
-							? `[data-item-id="${saved.itemId}"]${saved.action ? ` [data-action="${saved.action}"]` : ""}`
-							: null;
+	// Attribute values come from the ledger, so the selector is built with
+	// `CSS.escape` (see focus.ts): an id containing `"` must not break it.
+	const selector = focusSelector(saved);
 	if (!selector) return;
 	document.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
 }
@@ -248,17 +199,21 @@ function restoreFocus(saved: FocusSnapshot | null): void {
 async function load(signal: AbortSignal): Promise<Snapshot> {
 	const [dashboard, items] = await Promise.all([
 		api.getDashboard(signal),
-		api.getItems({ all: true, limit: 500 }, signal),
+		api.getItems({ all: true, limit: ITEM_LIST_LIMIT }, signal),
 	]);
-	return { dashboard: dashboard.dashboard, items: items.items, fetchedAt: Date.now() };
+	return {
+		dashboard: dashboard.dashboard,
+		items: items.items,
+		fetchedAt: Date.now(),
+		truncated: isListTruncated(items.items.length, ITEM_LIST_LIMIT),
+	};
 }
 
 /** Drop a selection only when the item is really gone from the ledger. */
 function reconcileSelectionWith(items: WorkItem[]): void {
 	const next = reconcileSelection(selectedId, items);
 	selectedId = next.selectedId;
-	const pruned = pruneCache(details, items);
-	for (const id of pruned) detailRequests.delete(id);
+	lazy.prune(items);
 	if (next.dropped) notice("The selected item is no longer in the ledger.");
 }
 

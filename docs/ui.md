@@ -169,6 +169,17 @@ curl -H "Authorization: Bearer $(cat .apm/rest-token)" \
   state the workflow does not declare renders an explicit unknown-stage warning —
   the UI never guesses the default six states.
 
+Only a real `404` is cached as "no workflow definition". A transient failure
+(network, 5xx) keeps the badge in the loading state and is retried after a short
+cooldown, and a failed acceptance-detail fetch is rate-limited per
+`(item, version)` — a hiccuping backend can neither pin the UI to `missing` nor
+turn one render into a request storm.
+
+The flat item snapshot is capped (`limit=1000`). When a fetch comes back at the
+cap the dashboard shows a visible truncation notice above the queue, because the
+header totals and the topology are computed from that list and must not look
+complete when they are not.
+
 **Topology workspace (master/detail).** The topology view is a two-column
 workspace (list column + ~55 % graph column, single column below 900 px): the
 item groups scroll in their own left column, and the right column is pinned — the

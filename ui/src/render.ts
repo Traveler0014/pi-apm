@@ -50,6 +50,8 @@ export interface Shell {
 	dataTime: HTMLElement;
 	refreshButton: HTMLButtonElement;
 	metrics: HTMLElement;
+	/** Visible warning when the flat item fetch hit its cap. */
+	truncation: HTMLElement;
 	banner: HTMLElement;
 	viewToggle: HTMLElement;
 	statusScope: HTMLElement;
@@ -126,6 +128,12 @@ export function createShell(root: HTMLElement): Shell {
 
 	// --- metrics ----------------------------------------------------------
 	const metrics = el("section", { className: "metrics", attrs: { "aria-label": "Summary" } });
+
+	// --- truncation notice (list hit the fetch cap) -----------------------
+	const truncation = el("p", {
+		className: "truncation",
+		attrs: { role: "status", "aria-live": "polite", "data-state": "truncated", hidden: "" },
+	});
 
 	// --- banner (offline / stale) ----------------------------------------
 	const banner = el("p", { className: "banner", attrs: { role: "status", "aria-live": "polite", hidden: "" } });
@@ -220,7 +228,7 @@ export function createShell(root: HTMLElement): Shell {
 	topologyView.append(dagDialog);
 
 	main.append(listView, topologyView);
-	shellRoot.append(header, metrics, banner, controls, main);
+	shellRoot.append(header, metrics, truncation, banner, controls, main);
 	root.append(shellRoot);
 
 	let selectionHandler: ((id: string | null) => void) | null = null;
@@ -237,6 +245,7 @@ export function createShell(root: HTMLElement): Shell {
 		dataTime,
 		refreshButton: refresh,
 		metrics,
+		truncation,
 		banner,
 		viewToggle,
 		statusScope,
@@ -403,6 +412,31 @@ export function updateBanner(shell: Shell, connection: ConnectionView): void {
 		connection.state === "offline"
 			? `Offline — showing ${connection.detail}. Filters, the done fold and the selected item are kept; retrying every few seconds.`
 			: `Showing cached data — ${connection.detail}.`;
+}
+
+export interface TruncationInfo {
+	/** How many items were fetched. */
+	shown: number;
+	/** The cap the fetch asked for. */
+	limit: number;
+}
+
+/**
+ * Show or hide the "list may be truncated" notice.
+ *
+ * The header metrics and the topology are derived from the flat item list, so a
+ * capped fetch must not look like a complete ledger: say so, with the numbers
+ * the user needs to interpret the screen.
+ */
+export function updateTruncation(shell: Shell, info: TruncationInfo | null): void {
+	if (!info) {
+		shell.truncation.hidden = true;
+		shell.truncation.textContent = "";
+		return;
+	}
+	shell.truncation.hidden = false;
+	shell.truncation.dataset.state = "truncated";
+	shell.truncation.textContent = `Showing the newest ${info.shown} items (list limit ${info.limit}) — the ledger has more, so the header totals and the topology omit the rest.`;
 }
 
 export function updateFilters(shell: Shell, state: ViewState, dashboard: Dashboard | null): void {
