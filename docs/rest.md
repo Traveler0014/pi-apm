@@ -79,7 +79,7 @@ ledger:
 
 ```bash
 curl -sS http://127.0.0.1:7788/health
-{"ok": true, "service": "apm-rest", "version": "0.2.0"}
+{"ok": true, "service": "apm-rest", "version": "0.3.0"}
 ```
 
 ## 3. Routes

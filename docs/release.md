@@ -168,7 +168,7 @@ packaged; `scripts/package-release.sh` copies only named files, and
 ```bash
 just build                      # release binaries for this machine
 just release-package            # dist/apm-<version>-<host-target>.tar.gz
-just release-check dist/apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+just release-check dist/apm-0.3.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Both publishing branches are covered offline by `just test-release-scripts`
@@ -221,7 +221,7 @@ so an interrupted `curl | bash` transfer cannot execute half a script.
 
 | flag | environment | default | meaning |
 |---|---|---|---|
-| `--version <tag>` | `APM_VERSION` | latest release | release tag, `v0.2.0` or `0.2.0` |
+| `--version <tag>` | `APM_VERSION` | latest release | release tag, e.g. `v0.3.0` (leading `v` optional) |
 | `--bin-dir <dir>` | `APM_BIN_DIR`, `BINDIR` | `$HOME/.local/bin` | install destination |
 | `--repo <owner/name>` | `APM_REPO` | `Traveler0014/pi-apm` | GitHub repository |
 | `--help` | – | – | usage |
@@ -229,10 +229,10 @@ so an interrupted `curl | bash` transfer cannot execute half a script.
 ```bash
 # pinned version and custom directory
 curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh \
-  | bash -s -- --version v0.2.0 --bin-dir /usr/local/bin
+  | bash -s -- --version v0.3.0 --bin-dir /usr/local/bin
 
 # environment form (also useful when the script is saved locally)
-APM_VERSION=v0.2.0 APM_BIN_DIR="$HOME/bin" bash scripts/install.sh
+APM_VERSION=v0.3.0 APM_BIN_DIR="$HOME/bin" bash scripts/install.sh
 ```
 
 `repo` and `version` are validated against a strict whitelist before they reach a
@@ -244,25 +244,25 @@ archives and checksums, injected `uname`), which runs in `just verify` and CI.
 
 ```bash
 # 1. Pick a release; download the archive and the aggregate checksum list
-gh release download v0.2.0 --repo Traveler0014/pi-apm \
-  --pattern 'apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz' \
+gh release download v0.3.0 --repo Traveler0014/pi-apm \
+  --pattern 'apm-0.3.0-x86_64-unknown-linux-gnu.tar.gz' \
   --pattern 'SHA256SUMS.txt'
 
 # 2. Verify just this archive against the aggregate list (the list covers all
 #    platforms, so check one line instead of `sha256sum -c` on the whole file)
-grep 'apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
+grep 'apm-0.3.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
 # macOS has no sha256sum: use `shasum -a 256 -c -` instead.
 
-tar -xzf apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz
-cd apm-0.2.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS   # per-package list
+tar -xzf apm-0.3.0-x86_64-unknown-linux-gnu.tar.gz
+cd apm-0.3.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS   # per-package list
 
 # 2. Install all three binaries (macOS/Linux)
 install -m 0755 apm apm-mcp apm-serve ~/.local/bin/
 apm --version && apm-mcp --version && apm-serve --version
 
 # Windows (PowerShell)
-# Expand-Archive apm-0.2.0-x86_64-pc-windows-msvc.zip -DestinationPath .
-# Copy-Item .\apm-0.2.0-x86_64-pc-windows-msvc\*.exe $env:USERPROFILE\.local\bin
+# Expand-Archive apm-0.3.0-x86_64-pc-windows-msvc.zip -DestinationPath .
+# Copy-Item .\apm-0.3.0-x86_64-pc-windows-msvc\*.exe $env:USERPROFILE\.local\bin
 ```
 
 Upgrade = install the newer release over the same paths; the SQLite ledger
@@ -285,9 +285,9 @@ archive by tag.
 4. Only then create the tag:
 
    ```bash
-   git tag -a v0.2.0 -m "apm 0.2.0"
-   git push origin v0.2.0        # this publishes the release
-   gh release view v0.2.0
+   git tag -a v0.3.0 -m "apm 0.3.0"
+   git push origin v0.3.0        # this publishes the release
+   gh release view v0.3.0
    ```
 
 If anything fails after the tag, fix forward with a new tag; do not move or

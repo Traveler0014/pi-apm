@@ -59,16 +59,16 @@ Pin a version or choose a directory with flags or the matching environment
 variables:
 
 ```bash
-# --version / APM_VERSION accepts v0.2.0 or 0.2.0
+# --version / APM_VERSION accepts 0.3.0 or v0.3.0 (leading v optional)
 # --bin-dir / APM_BIN_DIR (BINDIR also accepted) defaults to ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh \
-  | bash -s -- --version v0.2.0 --bin-dir /usr/local/bin
+  | bash -s -- --version v0.3.0 --bin-dir /usr/local/bin
 
 # or configure a saved copy from the environment
-APM_VERSION=v0.2.0 APM_BIN_DIR="$HOME/bin" bash install.sh
+APM_VERSION=v0.3.0 APM_BIN_DIR="$HOME/bin" bash install.sh
 ```
 
-**Windows:** download `apm-0.2.0-x86_64-pc-windows-msvc.zip` from
+**Windows:** download `apm-0.3.0-x86_64-pc-windows-msvc.zip` from
 [GitHub Releases](https://github.com/Traveler0014/pi-apm/releases), extract it,
 and put the three `.exe` files on `PATH`.
 

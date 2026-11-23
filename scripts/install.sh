@@ -2,7 +2,7 @@
 # One-line installer for the AgentPM binaries (Linux and macOS).
 #
 #   curl -fsSL https://raw.githubusercontent.com/Traveler0014/pi-apm/main/scripts/install.sh | bash
-#   curl -fsSL .../install.sh | bash -s -- --version v0.2.0 --bin-dir "$HOME/bin"
+#   curl -fsSL .../install.sh | bash -s -- --version v0.3.0 --bin-dir "$HOME/bin"
 #
 # Overrides: --version/-v, --bin-dir/-d, --repo/-r, or the environment variables
 # APM_VERSION, APM_BIN_DIR (BINDIR also accepted), APM_REPO.

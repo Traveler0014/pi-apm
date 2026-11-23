@@ -1,6 +1,6 @@
 {
   "name": "pi-apm",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AgentPM (apm) integration for pi: claims, handover context, and a run-end side-run that keeps the work ledger honest.",
   "type": "module",
   "license": "MIT",
