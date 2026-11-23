@@ -10,7 +10,7 @@ package registry; the GitHub Release is the only distribution channel.
 | File | Trigger | What it does |
 |---|---|---|
 | `.github/workflows/ci.yml` | push to `main`, pull request, manual | calls the shared verify workflow |
-| `.github/workflows/verify.yml` | `workflow_call` | fmt, clippy `-D warnings`, Rust tests, `npm ci`, tsc + UI typecheck, vitest, both stress scripts |
+| `.github/workflows/verify.yml` | `workflow_call` | fmt, clippy `-D warnings`, Rust tests, `npm ci`, **`ui/dist` rebuild + freshness gate**, tsc + UI typecheck, vitest, both stress scripts, release-script tests |
 | `.github/workflows/release.yml` | tag `v*` | gate → verify → build matrix → package → publish |
 | `.github/workflows/release.yml` | push `main` touching `Cargo.toml` | gate → verify → build → **auto-tag** `v<version>` → publish |
 | `.github/workflows/release.yml` | `workflow_dispatch` | gate → verify → build → upload artifacts only (no release) |

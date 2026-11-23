@@ -931,6 +931,7 @@ whole path with:
 ```bash
 just verify        # Rust + extension + frontend typecheck/tests
 just ui-check      # frontend typecheck + vitest for ui/
+just ui-dist-check # rebuild ui/dist and fail if the committed bundle is stale
 just ui-browser    # real Chromium run: ticket, live data, filters, drawer,
                    # refresh, offline cache, XSS, storage and console hygiene
 ```

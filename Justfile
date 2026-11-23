@@ -5,6 +5,7 @@
 #   just ui-build       rebuild ui/dist with Vite (needs Node; committed after each build)
 #   just verify         fmt + clippy + Rust tests + extension/UI typecheck + tests
 #   just ui-check       frontend typecheck + vitest for the ui/ workspace
+#   just ui-dist-check  rebuild ui/dist and fail if the committed bundle differs
 #   just lint-workflows   actionlint the GitHub Actions YAML (needs actionlint)
 #   just release-package  build a release archive for this machine (dist/)
 #   just test-release-scripts  offline tests for the publish/create-or-update logic
@@ -36,6 +37,16 @@ build:
 ui-build:
     npm run ui:build
 
+# Rebuild the dashboard bundle, then fail when the committed ui/dist does not
+# match git. `--untracked-files=all` matters: Vite content-hashes asset names, so
+# a stale bundle shows up as *new* untracked files that `git diff` would miss.
+# (Build.rs only requires ui/dist/index.html; without this check a stale or
+# missing bundle silently ships — or falls back to src/ui_fallback.)
+ui-dist-check:
+    npm run ui:build
+    test -s ui/dist/index.html
+    @if [ -n "$(git status --porcelain --untracked-files=all ui/dist)" ]; then echo "ui/dist is stale — run 'just ui-build' and commit it"; git status --porcelain --untracked-files=all ui/dist; exit 1; fi
+
 # Frontend checks: TS typecheck plus the ui/**/*.test.ts suite.
 ui-check:
     npm run ui:typecheck
@@ -61,6 +72,7 @@ verify:
     cargo test --all-targets
     npx tsc -p tsconfig.json
     npm run ui:typecheck
+    @[ -s ui/dist/index.html ] || { echo "ui/dist/index.html is missing: run 'just ui-build' and commit it" >&2; exit 1; }
     npx vitest run
     bash scripts/test-release-scripts.sh
     bash scripts/test-package-windows.sh

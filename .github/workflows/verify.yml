@@ -49,6 +49,29 @@ jobs:
       - name: Node dependencies
         run: npm ci
 
+      # `ui/dist` is committed and embedded at compile time (build.rs) for the
+      # binaries this job tests and the release job publishes. A stale bundle
+      # silently ships an old dashboard, and a missing one falls back to
+      # `src/ui_fallback` (build.rs only checks that `ui/dist/index.html`
+      # exists). Rebuild and require the *whole* directory to match git.
+      #
+      # `--porcelain` is deliberate: Vite content-hashes asset filenames, so a
+      # rebuilt bundle adds untracked files and removes tracked ones. A plain
+      # `git diff --exit-code ui/dist` would miss the untracked half and pass.
+      - name: ui/dist is up to date
+        run: |
+          npm run ui:build
+          test -s ui/dist/index.html || {
+            echo "::error::ui/dist/index.html is missing; the binary would fall back to src/ui_fallback"
+            exit 1
+          }
+          if [ -n "$(git status --porcelain --untracked-files=all ui/dist)" ]; then
+            echo "::error::ui/dist is stale: run 'npm run ui:build' and commit the result"
+            git status --porcelain --untracked-files=all ui/dist
+            git diff --stat ui/dist
+            exit 1
+          fi
+
       - name: TypeScript (extension + dashboard)
         run: |
           npx tsc -p tsconfig.json

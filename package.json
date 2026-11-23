@@ -1,6 +1,6 @@
 {
   "name": "pi-apm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AgentPM (apm) integration for pi: claims, handover context, and a run-end side-run that keeps the work ledger honest.",
   "type": "module",
   "license": "MIT",
@@ -30,7 +30,7 @@
     "test:rust": "cargo test --all-targets",
     "test:stress": "bash scripts/stress.sh 10",
     "typecheck": "tsc -p tsconfig.json",
-    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && tsc -p tsconfig.json && vitest run",
+    "verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets && npx tsc -p tsconfig.json && npm run ui:typecheck && test -s ui/dist/index.html && npx vitest run && bash scripts/test-release-scripts.sh && bash scripts/test-package-windows.sh && bash scripts/test-release-gate.sh",
     "ui:dev": "vite --config ui/vite.config.ts",
     "ui:build": "vite build --config ui/vite.config.ts",
     "ui:test": "vitest run ui",

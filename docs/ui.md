@@ -104,9 +104,16 @@ just ui-build          # = npm run ui:build
 cargo build --release  # picks up the new ui/dist automatically
 ```
 
+CI rebuilds the bundle and fails when `git status --porcelain ui/dist` is not
+empty, so a change under `ui/src` without a matching rebuild cannot merge (Vite
+content-hashes asset names, which is why untracked files count as stale). Run
+`just ui-dist-check` locally for the same check.
+
 When `ui/dist` is absent (a checkout without a frontend build), the binary falls
 back to a small built-in page that still exercises the ticket → token → API
-flow; the startup line reports `assets: fallback`.
+flow; the startup line reports `assets: fallback`. A build that only *looks*
+fine is caught by the CI check (or `ui/dist/index.html` existing in
+`just verify`).
 
 Because assets are looked up by exact name in the embedded table, path
 traversal (`/ui/../Cargo.toml`, `%2e%2e`) is rejected before any lookup and can
