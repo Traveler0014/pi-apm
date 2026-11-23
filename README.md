@@ -813,8 +813,8 @@ apm-serve --listen 127.0.0.1:0 --print-token  # ephemeral port, token on stdout
 |---|---|
 | bind | loopback only; a non-loopback `--listen` needs `--allow-remote` + a warning |
 | auth | `Authorization: Bearer <token>` on everything except `GET /health`; the token lives in `.apm/rest-token` (0600) |
-| browser | any `Origin` header is refused (`403 forbidden_origin`) and `Host` must name loopback (`403 forbidden_host`) — no CORS, no DNS-rebinding hole |
-| limits | 8 KiB headers, 64 KiB body, 10 s per connection, one request per connection |
+| browser | any `Origin` header is refused (`403 forbidden_origin`); `Host` must name loopback (`403 forbidden_host`) and a missing/empty `Host` is a `400` — no CORS, no DNS-rebinding hole |
+| limits | 8 KiB headers, 64 KiB body, 10 s per connection, 128 concurrent connections (`503 server_busy` beyond that), one request per connection |
 
 Routes: `GET /health`, `GET /dashboard`, `GET /items`, `GET /items/{id}`,
 `GET /claims`, `POST /items/{id}/claim|release|progress|status`. Writes take

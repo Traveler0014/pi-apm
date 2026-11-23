@@ -166,6 +166,20 @@ fn request_anonymous(addr: &str, method: &str, path: &str, headers: &[(&str, &st
     }
 }
 
+/// Send a raw HTTP request exactly as written (no automatic `Host`) and return
+/// the full response text, so protocol-level failures can be asserted.
+fn raw_exchange(addr: &str, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    String::from_utf8_lossy(&raw).to_string()
+}
+
 fn request(
     addr: &str,
     method: &str,
@@ -294,6 +308,62 @@ fn browser_origins_and_foreign_hosts_are_refused() {
     );
     assert_eq!(host.status, 403);
     assert_eq!(host.error_code(), "forbidden_host");
+}
+
+#[test]
+fn a_missing_host_header_is_a_protocol_error() {
+    let ledger = Ledger::new();
+    let server = Server::start(&ledger, &[]);
+
+    // HTTP/1.1 requires Host. The old guard only checked "when present", so a
+    // request without one skipped the loopback rule entirely.
+    let missing = raw_exchange(
+        &server.addr,
+        &format!(
+            "GET /items HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(missing.starts_with("HTTP/1.1 400"), "{missing}");
+    assert!(missing.contains("bad_request"), "{missing}");
+
+    // An explicitly empty Host is no better than an absent one.
+    let empty = raw_exchange(
+        &server.addr,
+        &format!(
+            "GET /items HTTP/1.1\r\nHost:\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(empty.starts_with("HTTP/1.1 400"), "{empty}");
+}
+
+#[test]
+fn allow_remote_accepts_a_matching_remote_host() {
+    let ledger = Ledger::new();
+    // `--allow-remote` opts into a LAN-visible Host name; the Origin check still
+    // refuses a cross-site browser page in that mode.
+    let server = Server::start(&ledger, &["--allow-remote"]);
+
+    let accepted = request(
+        &server.addr,
+        "GET",
+        "/items",
+        None,
+        &[("Host", "ledger.lan:7717")],
+    );
+    assert_eq!(accepted.status, 200, "{:?}", accepted.body);
+
+    let cross_site = request(
+        &server.addr,
+        "GET",
+        "/items",
+        None,
+        &[
+            ("Host", "ledger.lan:7717"),
+            ("Origin", "http://evil.example"),
+        ],
+    );
+    assert_eq!(cross_site.status, 403);
+    assert_eq!(cross_site.error_code(), "forbidden_origin");
 }
 
 #[test]

@@ -76,13 +76,15 @@ Restart=on-failure
 | request body | 64 KiB | progress summaries are the largest legitimate payload |
 | transfer encoding | `Content-Length` only | no chunked parsing surface |
 | connections | one request per connection, `Connection: close` | no keep-alive state machine |
+| concurrent connections | 128, further clients get `503 server_busy` | bounds threads and per-connection buffers under a burst |
 | read/write timeout | 10 s per connection (`--timeout`) | a slow client cannot pin a thread indefinitely |
 | framing | HTTP/1.1 only, no TLS, no WebSocket, no CORS headers | local-only tool; a proxy terminates TLS |
-| concurrency | thread per connection + SQLite `BEGIN IMMEDIATE` | no async runtime, no connection pool to tune |
+| concurrency | thread per connection (capped at 128) + SQLite `BEGIN IMMEDIATE` | no async runtime, no connection pool to tune |
 
 When you hit a limit you get a structured error, never a silent truncation:
-`413 payload_too_large`, `431 headers_too_large`, `400 bad_request` (malformed or
-`Transfer-Encoding`), `405 method_not_allowed`, `404 not_found`.
+`413 payload_too_large`, `431 headers_too_large`, `503 server_busy` (connection
+cap), `400 bad_request` (malformed or `Transfer-Encoding`), `405
+method_not_allowed`, `404 not_found`.
 
 ## 4. Local access protection
 
@@ -90,7 +92,7 @@ When you hit a limit you get a structured error, never a silent truncation:
 |---|---|---|
 | bind address | `127.0.0.1:7717` | `--listen` (non-loopback also needs `--allow-remote`) |
 | bearer token | `<data_dir>/rest-token`, mode 0600, generated on first start | `--token` / `APM_REST_TOKEN`, `--token-file` |
-| `Host` | must be `127.0.0.1`, `localhost` or `::1` | not configurable (DNS-rebinding guard) |
+| `Host` | must be `127.0.0.1`, `localhost` or `::1` unless `--allow-remote`; missing `Host` is `400` | not configurable (DNS-rebinding guard) |
 | `Origin` | any `Origin` header is refused | not configurable (browser guard) |
 | `/health` | the only unauthenticated route, and it says nothing about the ledger | – |
 
@@ -189,7 +191,8 @@ copy it to a shared ticket.
 | `refusing to bind 0.0.0.0:...` (exit 2) | loopback-only default | pass `--allow-remote` **and** read §1 before doing it |
 | `401 unauthorized` | missing/wrong `Authorization` header | `curl -H "Authorization: Bearer $(cat .apm/rest-token)" …` |
 | `403 forbidden_origin` | the client is a browser (or sends `Origin`) | use a non-browser client; do not add CORS |
-| `403 forbidden_host` | reverse proxy passes a public `Host` | proxy must rewrite `Host` to `127.0.0.1…` (and terminate TLS itself) |
+| `403 forbidden_host` | reverse proxy passes a public `Host`, or the server was started without `--allow-remote` | proxy must rewrite `Host` to `127.0.0.1…` (and terminate TLS itself), or start with `--allow-remote` |
+| `400 bad_request` ("HTTP/1.1 requires a Host header") | client sent no `Host` (or an empty one) | send `Host: 127.0.0.1:7717`; HTTP/1.1 requires it |
 | `409 claim_required` | the session has no claim (or the wrong `X-APM-Session`) | `POST /items/{id}/claim` first, or send the session that owns it |
 | `409 claim_invalid` | lease expired | re-claim with `{"takeover": true, "reason": …}` |
 | `409 claim_conflict` | another session holds a live lease | stop; do not force-takeover, report who holds it (`/items/{id}`) |
@@ -198,6 +201,7 @@ copy it to a shared ticket.
 | `422 completion_evidence_required` | closing with open acceptance criteria | attach evidence and mark acceptance `met` first |
 | `400 invalid_input` mentioning an unknown field | strict body validation | send only the documented fields (a typo must not silently drop `expect_version`) |
 | `413` / `431` | body > 64 KiB / headers > 8 KiB | shrink the payload; progress summaries are not blobs |
+| `503 server_busy` | more than 128 live connections | retry shortly; a local client should never get here |
 | request hangs ~10 s then connection closes | the client sent no/partial body | send `Content-Length` and a complete body |
 | `500 database_error` | disk full, locked beyond `busy_timeout`, corrupt file | check `apm doctor --json`; do not run it on a network filesystem |
 

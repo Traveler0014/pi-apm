@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,6 +52,19 @@ pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// Hard cap on a JSON body. Ledger payloads are small; progress summaries are
 /// the largest thing a caller sends.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Upper bound on connections served at once. Each connection owns a thread and
+/// up to `MAX_HEADER_BYTES + MAX_BODY_BYTES` of buffers, so an unbounded accept
+/// loop is an unbounded thread/memory budget: a burst of slow or hostile clients
+/// could exhaust the process. 128 is far more than local tooling needs (a couple
+/// of browser tabs plus a script) and small enough to stay harmless.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+/// Hard cap on the in-memory claim-token cache. Entries are also dropped once
+/// they are older than [`HELD_TOKEN_TTL_MS`]; the durable copy lives in the 0600
+/// session file, so an evicted entry only costs a disk read on the next write.
+pub const MAX_HELD_TOKENS: usize = 1024;
+/// How long a claim token stays in the in-memory cache. Default leases are 15
+/// minutes, so an hour-old entry is certainly stale.
+const HELD_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the browser has to exchange its startup ticket. A minute is enough
 /// for a slow browser to cold-start, and short enough that a stale URL in a
@@ -281,16 +295,74 @@ struct State {
     /// session as well is what keeps one caller's token from authenticating
     /// another caller's write (the audit trail would silently blame the wrong
     /// session).
-    held_tokens: Mutex<BTreeMap<(String, String), String>>,
+    held_tokens: Mutex<BTreeMap<(String, String), HeldToken>>,
     /// The one-time dashboard bootstrap ticket: handed out in the URL fragment,
     /// exchanged once for the bearer token, then dead.
     bootstrap: Mutex<Bootstrap>,
+}
+
+/// One cached claim token plus the moment it was stored, so the cache can be
+/// pruned instead of growing for the lifetime of the process.
+struct HeldToken {
+    token: String,
+    stored_at: i64,
 }
 
 struct Bootstrap {
     ticket: String,
     expires_at: i64,
     consumed: bool,
+}
+
+/// Counts live connections and hands out an RAII permit. The permit returns its
+/// slot on drop, so a handler that panics cannot leak a slot forever.
+struct ConnectionLimiter {
+    active: AtomicUsize,
+    max: usize,
+}
+
+impl ConnectionLimiter {
+    fn new(max: usize) -> ConnectionLimiter {
+        ConnectionLimiter {
+            active: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// Take a slot, or `None` when the server is at its cap. Refusing is
+    /// deliberate: queueing would keep the socket (and its kernel buffers) open
+    /// with no bound of its own.
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut current = self.active.load(Ordering::Relaxed);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionPermit {
+                        limiter: Arc::clone(self),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl RestServer {
@@ -340,31 +412,56 @@ impl RestServer {
             .map_err(|e| Error::Internal(format!("cannot read the bound address: {e}")))
     }
 
-    /// Accept connections until the process is stopped.
+    /// Accept connections until the process is stopped. Threads are spawned per
+    /// connection, but never more than [`MAX_CONCURRENT_CONNECTIONS`] at a time:
+    /// beyond that the client gets an immediate `503 server_busy`.
     pub fn serve(&self) -> Result<()> {
+        let limiter = Arc::new(ConnectionLimiter::new(MAX_CONCURRENT_CONNECTIONS));
         for incoming in self.listener.incoming() {
-            let stream = match incoming {
+            let mut stream = match incoming {
                 Ok(stream) => stream,
                 Err(err) => {
                     eprintln!("apm-serve: accept failed: {err}");
                     continue;
                 }
             };
+            let Some(permit) = limiter.try_acquire() else {
+                // The refusal must never stall the accept loop: with every slot
+                // taken by a slow client that never reads its 503, an unbounded
+                // write here would block the main loop indefinitely. A short
+                // write timeout keeps the refusal best-effort and bounded.
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                let _ = write_response(
+                    &mut stream,
+                    Response::error(
+                        503,
+                        "server_busy",
+                        format!(
+                            "too many concurrent connections (max {MAX_CONCURRENT_CONNECTIONS}); retry shortly"
+                        ),
+                    ),
+                );
+                continue;
+            };
             let state = Arc::clone(&self.state);
-            std::thread::spawn(move || match handle_connection(stream, &state) {
-                Ok(()) => {}
-                // Normal client behaviour (tab closed, refresh, navigation):
-                // stay quiet unless explicitly asked for connection-level debug
-                // output. `APM_REST_DEBUG=1` keeps the diagnostic available.
-                Err(ConnectionError::ClientGone(err)) => {
-                    if std::env::var("APM_REST_DEBUG")
-                        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                    {
-                        eprintln!("apm-serve: client disconnected: {err}");
+            std::thread::spawn(move || {
+                // The permit lives as long as the handler, including unwinding.
+                let _permit = permit;
+                match handle_connection(stream, &state) {
+                    Ok(()) => {}
+                    // Normal client behaviour (tab closed, refresh, navigation):
+                    // stay quiet unless explicitly asked for connection-level debug
+                    // output. `APM_REST_DEBUG=1` keeps the diagnostic available.
+                    Err(ConnectionError::ClientGone(err)) => {
+                        if std::env::var("APM_REST_DEBUG")
+                            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                        {
+                            eprintln!("apm-serve: client disconnected: {err}");
+                        }
                     }
-                }
-                Err(ConnectionError::Internal(err)) => {
-                    eprintln!("apm-serve: connection error: {err}");
+                    Err(ConnectionError::Internal(err)) => {
+                        eprintln!("apm-serve: connection error: {err}");
+                    }
                 }
             });
         }
@@ -573,17 +670,35 @@ impl From<Response> for RouteError {
     }
 }
 
+fn headers_too_large() -> Response {
+    Response::error(431, "headers_too_large", "header section is too large")
+}
+
+/// Read one request from a single connection.
+///
+/// The whole request is read through a *bounded* reader: `take` caps how many
+/// bytes can ever be pulled from the socket. A client that streams an endless
+/// line without a newline therefore hits the 431 branch after at most
+/// `MAX_HEADER_BYTES + 1` header bytes instead of growing a `String` until the
+/// process runs out of memory. The same bounded reader carries the body because
+/// it is read right after the headers through the same buffer; dropping the
+/// reader there would lose whatever it had already read from the socket.
 fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, RouteError> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(RouteError::Io)?);
+    let budget = (MAX_HEADER_BYTES + MAX_BODY_BYTES + 1) as u64;
+    let source = stream.try_clone().map_err(RouteError::Io)?.take(budget);
+    let mut reader = BufReader::new(source);
 
     let mut request_line = String::new();
     reader
         .read_line(&mut request_line)
         .map_err(RouteError::Io)?;
-    let request_line = request_line.trim_end();
     if request_line.is_empty() {
         return Err(Response::error(400, "bad_request", "empty request line").into());
     }
+    if request_line.len() > MAX_HEADER_BYTES {
+        return Err(headers_too_large().into());
+    }
+    let request_line = request_line.trim_end();
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
@@ -596,12 +711,15 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, RouteErr
     let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).map_err(RouteError::Io)?;
+        let read = reader.read_line(&mut line).map_err(RouteError::Io)?;
         header_bytes += line.len();
+        // Checked before parsing so a truncated (cap-limited) line is a 431, not
+        // a confusing 400 "malformed header".
         if header_bytes > MAX_HEADER_BYTES {
-            return Err(
-                Response::error(431, "headers_too_large", "header section is too large").into(),
-            );
+            return Err(headers_too_large().into());
+        }
+        if read == 0 {
+            return Err(Response::error(400, "bad_request", "incomplete header section").into());
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -650,7 +768,7 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, RouteErr
 
     Ok(Request {
         method: method.to_ascii_uppercase(),
-        path: percent_decode(&raw_path),
+        path: percent_decode_path(&raw_path),
         query,
         headers,
         body,
@@ -692,17 +810,33 @@ fn reason_phrase(status: u16) -> &'static str {
         422 => "Unprocessable Entity",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     }
 }
 
+/// `application/x-www-form-urlencoded` decoding for query keys/values: `%xx`
+/// escapes and `+` as space are both part of that format.
 fn percent_decode(raw: &str) -> String {
+    percent_decode_with(raw, true)
+}
+
+/// RFC 3986 path decoding: `%xx` escapes only. A literal `+` in a path is a plus
+/// sign, not a space (only form-encoded queries map `+` to space).
+fn percent_decode_path(raw: &str) -> String {
+    percent_decode_with(raw, false)
+}
+
+fn percent_decode_with(raw: &str, plus_as_space: bool) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
                 let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
                 match u8::from_str_radix(hex, 16) {
                     Ok(byte) => {
@@ -715,7 +849,7 @@ fn percent_decode(raw: &str) -> String {
                     }
                 }
             }
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 index += 1;
             }
@@ -759,7 +893,7 @@ fn route(request: &Request, state: &State) -> Response {
 
     // Local-access protection. Order matters: host/origin checks explain *why* a
     // request from a browser is refused before the token check hides it.
-    if let Some(response) = guard_local(request) {
+    if let Some(response) = guard_local(request, state.config.allow_remote) {
         return response;
     }
 
@@ -791,7 +925,7 @@ fn route(request: &Request, state: &State) -> Response {
                 .to_string()
         })
         .filter(|token| !token.is_empty());
-    let token = match bearer.or_else(|| session_cookie(request, state)) {
+    let token = match bearer.or_else(|| session_cookie(request, state.config.ui)) {
         Some(token) => token,
         None => {
             let hint = if state.config.ui {
@@ -905,26 +1039,37 @@ fn route(request: &Request, state: &State) -> Response {
 /// unchanged; a request that *does* carry one must come from this very server
 /// (scheme `http` plus the same authority). That blocks cross-site requests and
 /// DNS-rebinding pages while still allowing the UI's own future writes.
-fn guard_local(request: &Request) -> Option<Response> {
-    if let Some(origin) = request.headers.get("origin") {
-        let host = request
-            .headers
-            .get("host")
-            .map(String::as_str)
-            .unwrap_or("");
-        if !origin_matches_host(origin, host) {
-            return Some(Response::error(
-                403,
-                "forbidden_origin",
-                format!(
-                    "origin {origin} is not this server ({host}); cross-origin browser                      requests are refused"
-                ),
-            ));
-        }
-    }
-    if let Some(host) = request.headers.get("host")
-        && !host_names_loopback(host)
+///
+/// The loopback `Host` rule only applies when the server was *not* started with
+/// `--allow-remote`: an operator who opted into remote access has already
+/// accepted that a LAN name is a legitimate `Host`. A missing `Host` is a
+/// malformed HTTP/1.1 request in either mode, so it is refused with 400 rather
+/// than silently skipped (which is what made the old check bypassable).
+fn guard_local(request: &Request, allow_remote: bool) -> Option<Response> {
+    let host = request
+        .headers
+        .get("host")
+        .map(|host| host.trim())
+        .unwrap_or("");
+    if let Some(origin) = request.headers.get("origin")
+        && !origin_matches_host(origin, host)
     {
+        return Some(Response::error(
+            403,
+            "forbidden_origin",
+            format!(
+                "origin {origin} is not this server ({host}); cross-origin browser requests are refused"
+            ),
+        ));
+    }
+    if host.is_empty() {
+        return Some(Response::error(
+            400,
+            "bad_request",
+            "HTTP/1.1 requires a Host header",
+        ));
+    }
+    if !allow_remote && !host_names_loopback(host) {
         return Some(Response::error(
             403,
             "forbidden_host",
@@ -1089,18 +1234,23 @@ fn bootstrap(request: &Request, state: &State) -> Response {
 
 /// Read the UI session cookie (only in `apm ui` mode; `apm-serve` keeps the
 /// pure Bearer contract).
-fn session_cookie(request: &Request, state: &State) -> Option<String> {
-    if !state.config.ui {
+fn session_cookie(request: &Request, ui: bool) -> Option<String> {
+    if !ui {
         return None;
     }
     let raw = request.headers.get("cookie")?;
     for part in raw.split(';') {
-        let part = part.trim();
-        if let Some(value) = part.strip_prefix(UI_SESSION_COOKIE) {
-            let value = value.trim_start_matches('=').trim_matches('"').trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
+        // Exact-name match on the first `=`: `apm_ui_session_extra=...` must not
+        // authenticate as `apm_ui_session`, which `strip_prefix` used to allow.
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim() != UI_SESSION_COOKIE {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        if !value.is_empty() {
+            return Some(value.to_string());
         }
     }
     None
@@ -1111,10 +1261,43 @@ fn index_response() -> Response {
     Response::ui_bytes(200, index.mime, Cache::NoStore, index.bytes.to_vec())
 }
 
+/// A `Host` header port must be non-empty and all ASCII digits.
+fn host_port_is_valid(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// True when a `Host` header names this machine's loopback interface: `127.0.0.1`,
+/// `localhost` (any case) or `::1`, each optionally followed by a port.
+///
+/// IPv6 needs care in both forms: a bracketed literal (`[::1]`, `[::1]:7717`)
+/// must be split *after* the `]`, and a bare literal (`::1`) must not be split at
+/// all — splitting on the last colon would turn it into an empty host name.
 fn host_names_loopback(host: &str) -> bool {
-    let name = host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host);
-    let name = name.trim_start_matches('[').trim_end_matches(']');
-    matches!(name, "127.0.0.1" | "localhost" | "::1")
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        let Some((name, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_ok = after.is_empty() || after.strip_prefix(':').is_some_and(host_port_is_valid);
+        if !port_ok {
+            return false;
+        }
+        name
+    } else if host.matches(':').count() == 1 {
+        // Exactly one colon: `host:port` for a name or an IPv4 literal. The port
+        // must be real too — `localhost:` and `127.0.0.1:abc` are not loopback
+        // hosts, they are malformed values.
+        match host.split_once(':') {
+            Some((name, port)) if host_port_is_valid(port) => name,
+            Some(_) => return false,
+            None => host,
+        }
+    } else {
+        // Zero colons (a bare name) or two or more (a bare IPv6 literal): the
+        // whole value is the host.
+        host
+    };
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
 }
 
 /// Compare without an early exit, so a caller cannot learn the token prefix by
@@ -1345,14 +1528,18 @@ fn persist_token(state: &State, session: &str, issued: &ClaimIssued) -> Result<&
     if issued.token.is_empty() {
         return Ok("unavailable");
     }
-    state
-        .held_tokens
-        .lock()
-        .map_err(|_| Error::Internal("token lock poisoned".into()))?
-        .insert(
+    {
+        let mut held = state
+            .held_tokens
+            .lock()
+            .map_err(|_| Error::Internal("token lock poisoned".into()))?;
+        remember_held_token(
+            &mut held,
             (session.to_string(), issued.claim.work_item_id.clone()),
             issued.token.clone(),
+            state.now(),
         );
+    }
     let record = SessionToken {
         session_id: session.to_string(),
         claim_id: issued.claim.id.clone(),
@@ -1372,6 +1559,41 @@ fn persist_token(state: &State, session: &str, issued: &ClaimIssued) -> Result<&
             Ok("memory_only")
         }
     }
+}
+
+/// Store one claim token in the process-local cache, keeping the cache bounded:
+/// entries past [`HELD_TOKEN_TTL_MS`] are dropped first, then — if the map is
+/// still at [`MAX_HELD_TOKENS`] — the older half is evicted in one pass. Eviction
+/// is safe because the session file holds the durable copy and [`token_for`]
+/// falls back to it; the worst case is a disk read on the next write.
+fn remember_held_token(
+    held: &mut BTreeMap<(String, String), HeldToken>,
+    key: (String, String),
+    token: String,
+    now: i64,
+) {
+    held.retain(|_, entry| now.saturating_sub(entry.stored_at) <= HELD_TOKEN_TTL_MS);
+    if held.len() >= MAX_HELD_TOKENS && !held.contains_key(&key) {
+        let mut stored: Vec<i64> = held.values().map(|entry| entry.stored_at).collect();
+        stored.sort_unstable();
+        let cutoff = stored[stored.len() / 2];
+        held.retain(|_, entry| entry.stored_at >= cutoff);
+        // Ties on `stored_at` survive the retain above, so fall back to key order
+        // to keep the cap hard rather than approximate.
+        while held.len() >= MAX_HELD_TOKENS {
+            let Some(first) = held.keys().next().cloned() else {
+                break;
+            };
+            held.remove(&first);
+        }
+    }
+    held.insert(
+        key,
+        HeldToken {
+            token,
+            stored_at: now,
+        },
+    );
 }
 
 fn release(id: &str, request: &Request, state: &State, session: &str) -> Result<Response> {
@@ -1482,7 +1704,7 @@ fn token_for(state: &State, session: &str, id: &str) -> Result<Option<String>> {
         .map_err(|_| Error::Internal("token lock poisoned".into()))?
         .get(&(session.to_string(), item_id.clone()))
     {
-        return Ok(Some(token.clone()));
+        return Ok(Some(token.token.clone()));
     }
     Ok(state
         .tokens
@@ -1626,13 +1848,231 @@ mod tests {
         assert!(!allowed.ip().is_loopback());
     }
 
+    /// A minimal request, so the guards can be exercised without a socket.
+    fn request_with(headers: &[(&str, &str)]) -> Request {
+        Request {
+            method: "GET".to_string(),
+            path: "/items".to_string(),
+            query: BTreeMap::new(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+                .collect(),
+            body: Vec::new(),
+        }
+    }
+
     #[test]
     fn host_header_must_name_loopback() {
         assert!(host_names_loopback("127.0.0.1:7717"));
         assert!(host_names_loopback("localhost"));
+        assert!(host_names_loopback("localhost:7717"));
+        assert!(host_names_loopback("LOCALHOST:7717"));
         assert!(host_names_loopback("[::1]:7717"));
+        assert!(host_names_loopback("[::1]"));
+        assert!(host_names_loopback("::1"));
+        assert!(!host_names_loopback("localhost:"));
+        assert!(!host_names_loopback("127.0.0.1:"));
+        assert!(!host_names_loopback("127.0.0.1:abc"));
+        assert!(!host_names_loopback("localhost:77a"));
+        assert!(!host_names_loopback("localhost:7717:1"));
+        assert!(!host_names_loopback("[::2]:7717"));
+        assert!(!host_names_loopback("::2"));
+        assert!(!host_names_loopback("[::1]evil"));
+        assert!(!host_names_loopback("[::1]:"));
+        assert!(!host_names_loopback("localhost.evil.example"));
         assert!(!host_names_loopback("evil.example.com"));
         assert!(!host_names_loopback("192.168.1.5:7717"));
+    }
+
+    #[test]
+    fn guard_local_only_forces_loopback_when_remote_access_is_off() {
+        // A missing Host is a malformed HTTP/1.1 request, not a free pass.
+        let missing = guard_local(&request_with(&[]), false).expect("missing Host must be refused");
+        assert_eq!(missing.status, 400);
+        assert!(guard_local(&request_with(&[]), true).is_some());
+
+        // Default mode: a foreign Host is refused, loopback passes.
+        let foreign = guard_local(&request_with(&[("Host", "evil.example.com")]), false)
+            .expect("foreign Host must be refused");
+        assert_eq!(foreign.status, 403);
+        assert!(guard_local(&request_with(&[("Host", "[::1]:7717")]), false).is_none());
+
+        // `--allow-remote`: the operator opted into a LAN name.
+        assert!(guard_local(&request_with(&[("Host", "ledger.lan:7717")]), true).is_none());
+        assert!(
+            guard_local(
+                &request_with(&[
+                    ("Host", "ledger.lan:7717"),
+                    ("Origin", "http://ledger.lan:7717"),
+                ]),
+                true
+            )
+            .is_none()
+        );
+        let cross_site = guard_local(
+            &request_with(&[
+                ("Host", "evil.example.com"),
+                ("Origin", "http://evil.example"),
+            ]),
+            false,
+        )
+        .expect("cross-origin must be refused");
+        assert_eq!(cross_site.status, 403);
+        let body = String::from_utf8_lossy(&cross_site.body);
+        assert!(
+            body.contains("cross-origin browser requests are refused"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn session_cookie_matches_the_name_exactly() {
+        let request = request_with(&[(
+            "Cookie",
+            "not_apm_ui_session=nope; apm_ui_session_extra=leak; apm_ui_session=good",
+        )]);
+        assert_eq!(session_cookie(&request, true).as_deref(), Some("good"));
+
+        let prefix_collision = request_with(&[("Cookie", "apm_ui_session_extra=leak")]);
+        assert_eq!(session_cookie(&prefix_collision, true), None);
+
+        let quoted = request_with(&[("Cookie", "apm_ui_session=\"quoted\"")]);
+        assert_eq!(session_cookie(&quoted, true).as_deref(), Some("quoted"));
+
+        // `apm-serve` keeps the pure Bearer contract.
+        let plain = request_with(&[("Cookie", "apm_ui_session=good")]);
+        assert_eq!(session_cookie(&plain, false), None);
+    }
+
+    #[test]
+    fn connection_slots_are_bounded_and_released() {
+        let limiter = Arc::new(ConnectionLimiter::new(2));
+        let first = limiter.try_acquire().expect("first slot");
+        let second = limiter.try_acquire().expect("second slot");
+        assert!(
+            limiter.try_acquire().is_none(),
+            "the cap must refuse, not queue"
+        );
+        assert_eq!(limiter.active.load(Ordering::SeqCst), 2);
+        drop(first);
+        let third = limiter.try_acquire().expect("a released slot is reusable");
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn held_tokens_are_pruned_and_capped() {
+        let mut held = BTreeMap::new();
+        let old_key = ("session".to_string(), "OLD".to_string());
+        remember_held_token(&mut held, old_key.clone(), "t0".to_string(), 0);
+        // A later claim drops the now-stale entry instead of keeping it forever.
+        remember_held_token(
+            &mut held,
+            ("session".to_string(), "NEW".to_string()),
+            "t1".to_string(),
+            HELD_TOKEN_TTL_MS + 1,
+        );
+        assert!(!held.contains_key(&old_key));
+
+        // Filling past the cap evicts entries instead of growing without bound.
+        let mut held = BTreeMap::new();
+        for index in 0..(MAX_HELD_TOKENS + 64) {
+            remember_held_token(
+                &mut held,
+                ("session".to_string(), format!("I{index}")),
+                format!("token-{index}"),
+                index as i64,
+            );
+        }
+        assert!(
+            held.len() <= MAX_HELD_TOKENS,
+            "cache grew to {}",
+            held.len()
+        );
+    }
+
+    /// Drive `read_request` over a real socket pair, so the bounded reader and the
+    /// parser are exercised together (unit-testing them with a `Cursor` would not
+    /// prove the socket actually stops being read).
+    fn read_one(payload: Vec<u8>) -> std::result::Result<Request, Response> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let writer = std::thread::spawn(move || {
+            if let Ok(mut client) = TcpStream::connect(addr) {
+                let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
+                let _ = client.write_all(&payload);
+                let _ = client.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let outcome = read_request(&mut stream).map_err(|err| match err {
+            RouteError::Http(response) => response,
+            RouteError::Io(err) => panic!("unexpected io error: {err}"),
+        });
+        // Close our end *before* joining: a client still writing an oversized
+        // request only unblocks on the reset, otherwise the join waits for its
+        // write timeout and turns a fast unit test into a 10 s stall.
+        drop(stream);
+        writer.join().expect("writer panicked");
+        outcome
+    }
+
+    #[test]
+    fn an_endless_header_line_is_cut_off_at_the_byte_cap() {
+        // One line, no newline, far larger than any budget: the old code buffered
+        // it all before checking the cap, i.e. a trivial remote OOM.
+        let mut payload = b"GET /items HTTP/1.1\r\nX-Big: ".to_vec();
+        payload.extend(std::iter::repeat_n(b'a', 4 * 1024 * 1024));
+        match read_one(payload) {
+            Err(response) => {
+                assert_eq!(response.status, 431);
+                let body = String::from_utf8_lossy(&response.body);
+                assert!(body.contains("headers_too_large"), "{body}");
+            }
+            Ok(_) => panic!("an oversized header line must be rejected"),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_request_decodes_path_and_query_separately() {
+        let payload = b"GET /items/a+b?keywords=a+b&plus=%2B&id=APM%2D1 HTTP/1.1\r\nHost: 127.0.0.1:7717\r\n\r\n".to_vec();
+        let request = match read_one(payload) {
+            Ok(request) => request,
+            Err(response) => panic!(
+                "request should parse: {}",
+                String::from_utf8_lossy(&response.body)
+            ),
+        };
+        assert_eq!(request.method, "GET");
+        // Path: `+` stays a literal plus, `%2D` is decoded.
+        assert_eq!(request.path, "/items/a+b");
+        assert_eq!(
+            request.query.get("keywords").map(String::as_str),
+            Some("a b")
+        );
+        assert_eq!(request.query.get("plus").map(String::as_str), Some("+"));
+        assert_eq!(request.query.get("id").map(String::as_str), Some("APM-1"));
+    }
+
+    #[test]
+    fn percent_decoding_handles_queries_and_plus() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%2B"), "+");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("APM%2D1"), "APM-1");
+        // Paths are RFC 3986: `+` is a plus sign, not a space.
+        assert_eq!(percent_decode_path("a+b"), "a+b");
+        assert_eq!(percent_decode_path("a%20b"), "a b");
+        assert_eq!(percent_decode_path("100%"), "100%");
+        // `%+f` is not a hex escape (`from_str_radix` would accept the sign).
+        assert_eq!(percent_decode_path("%+f"), "%+f");
+        assert_eq!(percent_decode("%2Bf"), "+f");
     }
 
     #[test]
@@ -1672,14 +2112,6 @@ mod tests {
         assert!(constant_time_eq(b"apm_rest_abc", b"apm_rest_abc"));
         assert!(!constant_time_eq(b"apm_rest_abc", b"apm_rest_abd"));
         assert!(!constant_time_eq(b"apm_rest_abc", b"apm_rest_abcd"));
-    }
-
-    #[test]
-    fn percent_decoding_handles_queries_and_plus() {
-        assert_eq!(percent_decode("hello%20world"), "hello world");
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("APM%2D1"), "APM-1");
     }
 
     #[test]

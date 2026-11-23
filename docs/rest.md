@@ -67,9 +67,9 @@ SQLite file anyway" — and makes it hard for anything *else* to drive it:
 |---|---|
 | loopback bind | `--listen` must resolve to a loopback address unless `--allow-remote` is passed; the default is `127.0.0.1:7717` |
 | bearer token | every route except `GET /health` needs `Authorization: Bearer <token>`; the token is generated at first start into `<data_dir>/rest-token` with mode `0600` and compared in constant time |
-| `Host` check | requests whose `Host` is not `127.0.0.1`, `localhost` or `::1` are refused (`403 forbidden_host`) — this is what stops DNS-rebinding |
+| `Host` check | with `--allow-remote` off (the default) `Host` must be `127.0.0.1`, `localhost` or `::1` (any case, IPv6 bracketed or bare) — otherwise `403 forbidden_host`; a missing or empty `Host` is `400 bad_request` in both modes because HTTP/1.1 requires it. This is what stops DNS-rebinding |
 | `Origin` check | any request carrying an `Origin` header is refused (`403 forbidden_origin`), so a web page in your browser cannot POST to the ledger |
-| body limits | 8 KiB of headers, 64 KiB body; `Transfer-Encoding` is rejected, `Content-Length` is required for bodies |
+| body limits | 8 KiB of headers, 64 KiB body, read through a bounded socket reader (an endless header line is cut off at the cap instead of buffered); `Transfer-Encoding` is rejected, `Content-Length` is required for bodies |
 | strict bodies | unknown JSON fields are rejected (`400 invalid_input` listing the allowed keys), so a typo like `expect_versoin` cannot silently turn a locked write into an unlocked one |
 | timeouts | 10 s read/write per connection, one request per connection (`Connection: close`) |
 | no CORS | no `Access-Control-Allow-*` headers are ever sent |
@@ -199,11 +199,14 @@ instances starting together all end up holding the one token that is on disk.
   requests are serialised the same way concurrent CLI processes are: exactly one
   claim wins, the loser gets `409 claim_conflict`, and a stale write gets
   `409 version_conflict` instead of overwriting.
-* Thread per connection, `Connection: close`, bounded bodies: a slow or hostile
-  client cannot hold the server hostage beyond the 10 s timeout.
+* Thread per connection, capped at 128 concurrent connections (further clients get
+  `503 server_busy` immediately instead of an unbounded thread and buffer
+  budget), `Connection: close`, bounded bodies: a slow or hostile client cannot
+  hold the server hostage beyond the 10 s timeout.
 * Stopping mid-request is safe: either the transaction committed or it did not.
   There is no in-memory state worth flushing beyond the claim-token cache, which
-  is rebuilt from the session file on the next `claim`.
+  is rebuilt from the session file on the next `claim` and is pruned (TTL + hard
+  cap) so a long-running server cannot grow it forever.
 
 Operational depth — single-machine boundary, limits rationale, multi-instance
 behaviour, backup/restore/migration, token rotation and a troubleshooting table —
@@ -240,10 +243,11 @@ reverse proxy in front instead.
 ## 8. Tests
 
 ```bash
-cargo test --test rest               # 7 end-to-end tests against the real binary
+cargo test --test rest               # 11 end-to-end tests against the real binary
 cargo test --test rest_concurrency   # 9 race tests (claims, versions, HTTP+CLI, token bootstrap,
                                      # sessions, expired lease, strict fields, server-gone CLI)
-cargo test rest::                    # 10 unit tests (bind rules, host/origin checks, token atomicity, strict fields)
+cargo test rest::                    # 17 unit tests (bind rules, host/origin guards, bounded reads,
+                                     # cookie matching, token-cache pruning, strict fields)
 bash scripts/stress-rest.sh 10       # multi-process: 10 servers, 10 HTTP racers, mixed writers
 npx vitest run                       # unrelated: plugin + MCP client tests
 ```
