@@ -26,7 +26,7 @@ pub const REPLACEMENT: &str = "apm_[redacted]";
 /// Replace any token-shaped run in `text` with [`REPLACEMENT`].
 ///
 /// Best effort only: this is a belt-and-braces scrub for accidental leaks, not a
-/// general-purpose secret scanner (see README).
+/// general-purpose secret scanner (see docs/concepts.md).
 pub fn redact_tokens(text: &str) -> String {
     if !text.contains(TOKEN_PREFIX) {
         return text.to_string();

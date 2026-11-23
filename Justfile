@@ -7,6 +7,7 @@
 #   just ui-check       frontend typecheck + vitest for the ui/ workspace
 #   just ui-dist-check  rebuild ui/dist and fail if the committed bundle differs
 #   just lint-workflows   actionlint the GitHub Actions YAML (needs actionlint)
+#   just lint-docs      check README/docs relative links and anchors
 #   just release-package  build a release archive for this machine (dist/)
 #   just test-release-scripts  offline tests for the publish/create-or-update logic
 #   just release-check ARCHIVE  verify structure, checksums and CLI smoke
@@ -77,6 +78,11 @@ verify:
     bash scripts/test-release-scripts.sh
     bash scripts/test-package-windows.sh
     bash scripts/test-release-gate.sh
+
+# Offline sanity for the documentation tree: every relative link in README.md and
+# docs/*.md must resolve, and every `#fragment` must match a heading slug.
+lint-docs:
+    python3 scripts/check-doc-links.py
 
 # Static validation of the GitHub Actions YAML. Install actionlint with
 # `go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7`.

@@ -1,7 +1,7 @@
 //! Error type shared by the library and the CLI.
 //!
 //! Every variant carries a stable machine-readable `code`, documented in
-//! `README.md` (section "Error model"), plus the process exit code the CLI
+//! `docs/cli-reference.md` (section "Error model and exit codes"), plus the process exit code the CLI
 //! uses. Agents are expected to branch on `code`, never on the message text.
 
 use serde_json::json;

@@ -168,7 +168,7 @@ packaged; `scripts/package-release.sh` copies only named files, and
 ```bash
 just build                      # release binaries for this machine
 just release-package            # dist/apm-<version>-<host-target>.tar.gz
-just release-check dist/apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+just release-check dist/apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Both publishing branches are covered offline by `just test-release-scripts`
@@ -192,25 +192,25 @@ Use `--skip-run` to check only structure/checksums (for a foreign package).
 
 ```bash
 # 1. Pick a release; download the archive and the aggregate checksum list
-gh release download v0.1.0 \
-  --pattern 'apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz' \
+gh release download v0.2.0 --repo Traveler0014/pi-apm \
+  --pattern 'apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz' \
   --pattern 'SHA256SUMS.txt'
 
 # 2. Verify just this archive against the aggregate list (the list covers all
 #    platforms, so check one line instead of `sha256sum -c` on the whole file)
-grep ' apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
+grep ' apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS.txt | sha256sum -c -
 # macOS has no sha256sum: use `shasum -a 256 -c -` instead.
 
-tar -xzf apm-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd apm-0.1.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS   # per-package list
+tar -xzf apm-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd apm-0.2.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS   # per-package list
 
 # 2. Install all three binaries (macOS/Linux)
 install -m 0755 apm apm-mcp apm-serve ~/.local/bin/
 apm --version && apm-mcp --version && apm-serve --version
 
 # Windows (PowerShell)
-# Expand-Archive apm-0.1.0-x86_64-pc-windows-msvc.zip -DestinationPath .
-# Copy-Item .\apm-0.1.0-x86_64-pc-windows-msvc\*.exe $env:USERPROFILE\.local\bin
+# Expand-Archive apm-0.2.0-x86_64-pc-windows-msvc.zip -DestinationPath .
+# Copy-Item .\apm-0.2.0-x86_64-pc-windows-msvc\*.exe $env:USERPROFILE\.local\bin
 ```
 
 Upgrade = install the newer release over the same paths; the SQLite ledger
@@ -233,9 +233,9 @@ archive by tag.
 4. Only then create the tag:
 
    ```bash
-   git tag -a v0.1.0 -m "apm 0.1.0"
-   git push origin v0.1.0        # this publishes the release
-   gh release view v0.1.0
+   git tag -a v0.2.0 -m "apm 0.2.0"
+   git push origin v0.2.0        # this publishes the release
+   gh release view v0.2.0
    ```
 
 If anything fails after the tag, fix forward with a new tag; do not move or

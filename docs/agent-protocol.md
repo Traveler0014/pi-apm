@@ -1,8 +1,10 @@
 # AgentPM agent protocol (copy-paste contract)
 
 Use this file as `AGENTS.md` (or a section of it) in a repository that uses
-`apm`. It is the short version of `README.md` for an agent that has just been
-started and has no memory of previous runs.
+`apm`. It is the short version of the documentation set
+([`cli-reference.md`](cli-reference.md), [`concepts.md`](concepts.md),
+[`workflows.md`](workflows.md)) for an agent that has just been started and has no
+memory of previous runs.
 
 ## Before you touch anything
 

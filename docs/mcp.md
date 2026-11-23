@@ -49,6 +49,19 @@ The server starts in any directory when `--db`/`APM_DB` is given; otherwise it
 walks up from its working directory. It never creates a database — run
 `apm init --name <project>` first.
 
+### Quick transport check
+
+Before wiring a client, confirm the transport answers (handshake + tool list, no
+model needed):
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  | apm-mcp --db "$PWD/.apm/apm.db" | head -2
+```
+
 ## 2. Protocol surface
 
 * Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout (MCP stdio). One
