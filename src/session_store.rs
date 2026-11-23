@@ -10,6 +10,7 @@
 //! verifies the token against the live claim.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -73,13 +74,7 @@ impl TokenStore {
         let mut tokens = self.load(&token.session_id);
         tokens.retain(|t| t.item_id != token.item_id);
         tokens.push(token.clone());
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&tokens)?)
-            .map_err(|e| Error::Internal(format!("cannot write {}: {e}", tmp.display())))?;
-        restrict(&tmp)?;
-        fs::rename(&tmp, &path)
-            .map_err(|e| Error::Internal(format!("cannot replace {}: {e}", path.display())))?;
-        Ok(())
+        self.replace_tokens(&token.session_id, &tokens)
     }
 
     pub fn forget(&self, session: &str, item_id: &str) {
@@ -92,11 +87,23 @@ impl TokenStore {
         let mut tokens = self.load(session);
         let before = tokens.len();
         tokens.retain(|t| t.item_id != item_id);
-        if tokens.len() != before
-            && fs::write(&path, serde_json::to_vec_pretty(&tokens).unwrap()).is_ok()
-        {
-            let _ = restrict(&path);
+        if tokens.len() != before {
+            // Same atomic replace as `save`: a reader never sees a half-written
+            // session file, and a crash mid-forget leaves the old file intact.
+            let _ = self.replace_tokens(session, &tokens);
         }
+    }
+
+    /// Serialise the session's tokens to a private temp file, then swap it in.
+    fn replace_tokens(&self, session: &str, tokens: &[SessionToken]) -> Result<()> {
+        let path = self.file(session);
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(tokens)?;
+        if let Err(err) = write_private(&tmp, &bytes).and_then(|()| replace_file(&tmp, &path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Exclusive advisory lock for one session file.
@@ -211,6 +218,56 @@ fn restrict(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write `bytes` to `path` so the file is never readable by another user, not
+/// even briefly: on Unix the create itself carries mode 0600, so there is no
+/// window between `create` (default umask) and a later `chmod`.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| Error::Internal(format!("cannot write {}: {e}", path.display())))?;
+    // OpenOptions' mode only applies at creation: a temp file left behind by a
+    // crashed writer may already exist with wider permissions, so narrow it
+    // *before* writing any token into it.
+    restrict(path)?;
+    file.write_all(bytes)
+        .map_err(|e| Error::Internal(format!("cannot write {}: {e}", path.display())))?;
+    // Flush to disk before the rename, so a crash cannot publish an empty file.
+    file.sync_all()
+        .map_err(|e| Error::Internal(format!("cannot sync {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Swap `src` in for `dest`.
+///
+/// Unix `rename(2)` replaces an existing destination atomically. Windows
+/// `fs::rename` fails when the destination exists, so remove it first and retry:
+/// the file is a session-local cache of bearer tokens (the claims themselves are
+/// authoritative in SQLite), so the tiny non-atomic window is acceptable there
+/// and never exposes another user's data.
+fn replace_file(src: &Path, dest: &Path) -> Result<()> {
+    match fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(_) if dest.exists() => {
+            fs::remove_file(dest)
+                .map_err(|e| Error::Internal(format!("cannot replace {}: {e}", dest.display())))?;
+            fs::rename(src, dest)
+                .map_err(|e| Error::Internal(format!("cannot replace {}: {e}", dest.display())))
+        }
+        Err(err) => Err(Error::Internal(format!(
+            "cannot replace {}: {err}",
+            dest.display()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +360,65 @@ mod tests {
         store.forget("a", "item-1");
         assert!(store.find("a", "item-1", "ITEM-1").is_none());
         assert!(store.find("b", "item-1", "ITEM-1").is_some());
+    }
+
+    fn leftovers(store: &TokenStore) -> Vec<String> {
+        std::fs::read_dir(store.dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp") || name.ends_with(".lock"))
+            .collect()
+    }
+
+    #[test]
+    fn a_second_save_replaces_the_file_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path());
+        store.save(&token("shared", "item-1", "apm_first")).unwrap();
+        store
+            .save(&token("shared", "item-1", "apm_second"))
+            .unwrap();
+        let saved = store.load("shared");
+        assert_eq!(saved.len(), 1, "the same item is replaced, not duplicated");
+        assert_eq!(saved[0].token, "apm_second");
+        assert!(leftovers(&store).is_empty(), "{:?}", leftovers(&store));
+    }
+
+    #[test]
+    fn forgetting_a_token_is_atomic_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path());
+        store.save(&token("shared", "keep", "apm_keep")).unwrap();
+        store.save(&token("shared", "drop", "apm_drop")).unwrap();
+        store.forget("shared", "drop");
+        let saved = store.load("shared");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].item_id, "keep");
+        assert!(leftovers(&store).is_empty(), "{:?}", leftovers(&store));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_files_are_private_even_when_a_temp_file_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path());
+        let path = store.dir().join(format!("{}.json", safe_name("shared")));
+        let tmp = path.with_extension("json.tmp");
+        fs::create_dir_all(store.dir()).unwrap();
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        store.save(&token("shared", "item-1", "apm_x")).unwrap();
+
+        assert!(!tmp.exists(), "the temp file must be renamed away");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the token file must never be group-readable"
+        );
+        assert_eq!(store.load("shared").len(), 1);
     }
 }

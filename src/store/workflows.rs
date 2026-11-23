@@ -287,32 +287,39 @@ impl Store {
         self.load_workflow(project_id, &id, version)
     }
 
-    /// The snapshot an existing item runs on.
-    pub(crate) fn workflow_for_item(&self, item: &RawItem) -> Result<Workflow> {
-        self.load_workflow(&item.project_id, &item.workflow_id, item.workflow_version)
-    }
-
     pub(crate) fn load_workflow(
         &self,
         project_id: &str,
         id: &str,
         version: i64,
     ) -> Result<Workflow> {
-        let json: String = self
-            .conn
-            .query_row(
-                "SELECT definition_json FROM workflows
-                 WHERE project_id = ?1 AND id = ?2 AND version = ?3",
-                params![project_id, id, version],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| Error::NotFound {
-                entity: "workflow",
-                id: format!("{id}@{version}"),
-            })?;
-        Workflow::from_json(&json)
+        load_workflow_on(&self.conn, project_id, id, version)
     }
+}
+
+/// Load a workflow document through an arbitrary connection/transaction.
+///
+/// Transitions and progress writes call this with their open transaction so the
+/// guard and the write it authorises observe the same snapshot.
+pub(crate) fn load_workflow_on(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    id: &str,
+    version: i64,
+) -> Result<Workflow> {
+    let json: String = conn
+        .query_row(
+            "SELECT definition_json FROM workflows
+             WHERE project_id = ?1 AND id = ?2 AND version = ?3",
+            params![project_id, id, version],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound {
+            entity: "workflow",
+            id: format!("{id}@{version}"),
+        })?;
+    Workflow::from_json(&json)
 }
 
 /// Seed the default workflow for a freshly created project. Called inside

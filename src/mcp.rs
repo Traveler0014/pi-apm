@@ -27,6 +27,7 @@ use serde_json::{Map, Value, json};
 use crate::dashboard::DashboardOptions;
 use crate::error::{Error, Result};
 use crate::model::*;
+use crate::redact::redact_value;
 use crate::session_store::{SessionToken, TokenStore};
 use crate::store::Store;
 use crate::store::claims::{ClaimPolicy, ClaimRequest};
@@ -1359,50 +1360,18 @@ fn render_context(identifier: &str, context: &ContextVersionView) -> String {
 // Token redaction
 // ---------------------------------------------------------------------------
 
-/// Scrub anything shaped like an APM claim token (`apm_` + 32+ hex chars).
+/// Scrub anything shaped like an APM secret (`apm_` + 32+ token characters).
 ///
-/// The adapter never puts a token in a result on purpose; this is the same
-/// belt-and-braces scrub the Pi extension applies to digests and prompts, in
-/// case a token reaches a ledger field from some other process.
-pub fn redact_tokens(text: &str) -> String {
-    if !text.contains("apm_") {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        let Some(position) = rest.find("apm_") else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..position]);
-        let after = &rest[position + 4..];
-        let hex_len = after
-            .bytes()
-            .take_while(|byte| byte.is_ascii_hexdigit())
-            .count();
-        if hex_len >= 32 {
-            out.push_str("apm_[redacted]");
-            rest = &after[hex_len..];
-        } else {
-            out.push_str("apm_");
-            rest = after;
-        }
-    }
-    out
-}
+/// The implementation lives in [`crate::redact`] so the MCP adapter and the
+/// NDJSON export cannot drift apart: it covers claim tokens and the
+/// `apm_rest_` / `apm_ui_` / `apm_boot_` shapes. The adapter never puts a token
+/// in a result on purpose; this is the same belt-and-braces scrub the Pi
+/// extension applies to digests and prompts, in case a token reaches a ledger
+/// field from some other process.
+pub use crate::redact::redact_tokens;
 
 fn scrub_value(value: Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(redact_tokens(&text)),
-        Value::Array(items) => Value::Array(items.into_iter().map(scrub_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| (key, scrub_value(value)))
-                .collect(),
-        ),
-        other => other,
-    }
+    redact_value(value)
 }
 
 // ---------------------------------------------------------------------------

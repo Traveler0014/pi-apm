@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::model::{Category, StateKey};
 use crate::workflow::Workflow;
@@ -176,7 +176,6 @@ CREATE TABLE IF NOT EXISTS evidence (
     created_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS evidence_item ON evidence(work_item_id);
-CREATE INDEX IF NOT EXISTS evidence_item ON evidence(work_item_id);
 
 CREATE TABLE IF NOT EXISTS attention_requests (
     id                TEXT PRIMARY KEY,
@@ -208,19 +207,43 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
 
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    // Opening a database at the current schema is the common path (every CLI
+    // call); running the whole `SCHEMA` batch again just to reach the same
+    // `user_version` is pure overhead. A newer database is left untouched
+    // rather than rewritten backwards by an older binary.
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // The DDL, the data migration and the version stamp are one unit: a crash
+    // must not leave a database whose tables are v3 but whose `user_version`
+    // still says v1 (or the other way round).
+    //
+    // `IMMEDIATE` takes the write lock up front, which is what makes the second
+    // `user_version` read meaningful: two processes opening a v1 database
+    // serialise here, and the loser re-reads the version under the lock instead
+    // of replaying the migration against an already-upgraded schema (the old
+    // `DEFERRED` path could re-run `DROP TABLE idempotency` from a stale read).
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version >= SCHEMA_VERSION {
+        // Another process migrated while we waited for the lock; drop the empty
+        // transaction and leave its work alone.
+        return Ok(());
+    }
     if version > 0 && version < 2 {
         // v2 bound idempotency records to (operation, item, request fingerprint)
         // and removed the plaintext-token leak. The table is a short-lived replay
         // cache, so dropping it on upgrade is safe; the events stay untouched.
-        conn.execute_batch("DROP TABLE IF EXISTS idempotency;")?;
+        tx.execute_batch("DROP TABLE IF EXISTS idempotency;")?;
     }
 
-    conn.execute_batch(SCHEMA)?;
+    tx.execute_batch(SCHEMA)?;
     if version < 3 {
-        migrate_v3(conn)?;
+        migrate_v3(&tx)?;
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    Ok(())
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
 }
 
 /// Schema v3: versioned workflows, per-type bindings and per-item snapshots.
@@ -230,29 +253,27 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 /// leave a half-upgraded database behind. Every item ends up bound to a workflow
 /// that actually declares its state; anything else is repaired to the workflow's
 /// initial state and recorded as a `workflow_migrated` event.
-fn migrate_v3(conn: &mut Connection) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-
+fn migrate_v3(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     add_column_if_missing(
-        &tx,
+        tx,
         "work_items",
         "workflow_id",
         "TEXT NOT NULL DEFAULT 'apm-default'",
     )?;
     add_column_if_missing(
-        &tx,
+        tx,
         "work_items",
         "workflow_version",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
     add_column_if_missing(
-        &tx,
+        tx,
         "work_items",
         "state_category",
         "TEXT NOT NULL DEFAULT 'open'",
     )?;
-    add_column_if_missing(&tx, "projects", "default_workflow_id", "TEXT")?;
-    add_column_if_missing(&tx, "projects", "default_workflow_version", "INTEGER")?;
+    add_column_if_missing(tx, "projects", "default_workflow_id", "TEXT")?;
+    add_column_if_missing(tx, "projects", "default_workflow_version", "INTEGER")?;
 
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflows (
@@ -414,7 +435,6 @@ fn migrate_v3(conn: &mut Connection) -> rusqlite::Result<()> {
         }
     }
 
-    tx.commit()?;
     Ok(())
 }
 
@@ -452,5 +472,37 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+
+        // The evidence index is declared exactly once (it used to be listed
+        // twice in `SCHEMA`, which made the migration look like it was adding
+        // two indexes that SQLite silently collapsed into one).
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'evidence_item'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+    }
+
+    #[test]
+    fn a_newer_schema_is_left_alone() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "never downgrade user_version");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_items'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "an older binary must not rewrite a newer schema");
     }
 }

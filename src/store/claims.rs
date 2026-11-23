@@ -119,13 +119,18 @@ impl Store {
                 });
             }
 
-            // Snapshot what this session last held *before* any state change below,
-            // so `recover-only` can tell "lost my lease" from "I gave it up".
-            let prior = previous_claim_by_session(tx, &raw.id, actor.session_id.as_deref())?;
-            let prior_recoverable = matches!(
-                prior.as_ref().map(|c| c.status.as_str()),
-                Some("active") | Some("expired")
-            );
+            // Snapshot the item's *latest* claim before any state change below.
+            // Recovery is a property of that claim only: if another session later
+            // took the item over (even if it released it again), this session's
+            // older claim must not lend it recovery rights.
+            let prior = latest_claim(tx, &raw.id)?;
+            let prior_recoverable = match (&prior, actor.session_id.as_deref()) {
+                (Some(claim), Some(session)) => {
+                    claim.session_id.as_deref() == Some(session)
+                        && matches!(claim.status.as_str(), "active" | "expired")
+                }
+                _ => false,
+            };
 
             // Expire stale claims lazily so the partial unique index frees up.
             let mut lease_expired = false;
@@ -595,23 +600,6 @@ pub(crate) fn require_write_claim(
         item: item.identifier.clone(),
     })?;
     Ok(Some(verify_claim(conn, &item.id, token, at)?))
-}
-
-fn previous_claim_by_session(
-    conn: &rusqlite::Connection,
-    item_id: &str,
-    session: Option<&str>,
-) -> Result<Option<RawClaim>> {
-    let Some(session) = session else {
-        return Ok(None);
-    };
-    let sql = format!(
-        "{CLAIM_SELECT} WHERE work_item_id = ?1 AND session_id = ?2
-         ORDER BY leased_at DESC, rowid DESC LIMIT 1"
-    );
-    Ok(conn
-        .query_row(&sql, params![item_id, session], RawClaim::from_row)
-        .optional()?)
 }
 
 fn mark_claim(

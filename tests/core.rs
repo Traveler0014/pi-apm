@@ -3260,3 +3260,340 @@ fn upgrade_plan_refuses_to_overwrite_a_concurrently_changed_item() {
     assert_eq!(event.new_version, Some(4));
     assert_eq!(event.payload["to_category"], "review");
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings (APM-54)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recover_only_ignores_an_older_claim_after_another_session_released_a_takeover() {
+    let mut fx = Fx::new();
+    let me = fx.agent("agent-a", "sess-a");
+    let other = fx.agent("agent-b", "sess-b");
+    let item = fx.create("Taken over, then handed back");
+
+    // My claim expires; another session legitimately claims the expired work and
+    // then releases it. My old claim is no longer the item's latest claim.
+    fx.claim(&item.identifier, &me, 0);
+    let taken = fx
+        .store
+        .claim(
+            &item.identifier,
+            &other,
+            ClaimRequest::default(),
+            fx.at(61),
+            None,
+        )
+        .unwrap();
+    assert!(taken.takeover);
+    fx.store
+        .release(
+            &item.identifier,
+            &taken.token,
+            Some("handoff"),
+            &other,
+            fx.at(62),
+            None,
+        )
+        .unwrap();
+
+    // A side-run of the *old* session must not borrow recovery rights from its
+    // stale, pre-takeover claim.
+    let err = fx
+        .store
+        .claim(
+            &item.identifier,
+            &me,
+            ClaimRequest {
+                takeover: true,
+                policy: ClaimPolicy::RecoverOnly,
+                ..Default::default()
+            },
+            fx.at(63),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "forbidden");
+}
+
+#[test]
+fn reparenting_rejects_closed_parents_and_deep_cycles() {
+    let mut fx = Fx::new();
+    let human = fx.human("alice");
+    let a = fx.create("A");
+    let b = fx.create("B");
+    let c = fx.create("C");
+
+    // Build a chain C -> B -> A with ordinary updates.
+    for (child, parent, at) in [
+        (c.identifier.clone(), b.identifier.clone(), 1),
+        (b.identifier.clone(), a.identifier.clone(), 2),
+    ] {
+        let version = fx.store.get_item(&child, fx.at(at)).unwrap().item.version;
+        fx.store
+            .update_item(
+                &child,
+                None,
+                Some(version),
+                ItemPatch {
+                    parent: Some(Some(parent)),
+                    ..Default::default()
+                },
+                &human,
+                fx.at(at),
+                None,
+            )
+            .unwrap();
+    }
+
+    // A -> C would close a three-node cycle; only the ancestor walk sees it.
+    let version = fx
+        .store
+        .get_item(&a.identifier, fx.at(3))
+        .unwrap()
+        .item
+        .version;
+    let err = fx
+        .store
+        .update_item(
+            &a.identifier,
+            None,
+            Some(version),
+            ItemPatch {
+                parent: Some(Some(c.identifier.clone())),
+                ..Default::default()
+            },
+            &human,
+            fx.at(3),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_input");
+    assert!(err.to_string().contains("cycle"), "got: {err}");
+
+    // Closed work is not a container.
+    let closed = fx.create("Closed parent");
+    let version = fx
+        .store
+        .get_item(&closed.identifier, fx.at(4))
+        .unwrap()
+        .item
+        .version;
+    fx.store
+        .set_status(
+            &closed.identifier,
+            None,
+            Some(version),
+            StateKey::cancelled(),
+            Some("obsolete"),
+            None,
+            &human,
+            fx.at(4),
+            None,
+        )
+        .unwrap();
+    let version = fx
+        .store
+        .get_item(&a.identifier, fx.at(5))
+        .unwrap()
+        .item
+        .version;
+    let err = fx
+        .store
+        .update_item(
+            &a.identifier,
+            None,
+            Some(version),
+            ItemPatch {
+                parent: Some(Some(closed.identifier.clone())),
+                ..Default::default()
+            },
+            &human,
+            fx.at(5),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_input");
+    assert!(err.to_string().contains("closed item"), "got: {err}");
+}
+
+#[test]
+fn a_second_completion_replaces_the_stale_completion_note() {
+    let mut fx = Fx::new();
+    let item = fx.create("Finish twice");
+    let human = fx.human("alice");
+    fx.store
+        .add_evidence(
+            &item.identifier,
+            "test",
+            "cargo test --all-targets",
+            Some("green"),
+            None,
+            &human,
+            fx.at(1),
+            None,
+        )
+        .unwrap();
+
+    let version = fx
+        .store
+        .get_item(&item.identifier, fx.at(2))
+        .unwrap()
+        .item
+        .version;
+    fx.store
+        .set_status(
+            &item.identifier,
+            None,
+            Some(version),
+            StateKey::doing(),
+            None,
+            None,
+            &human,
+            fx.at(2),
+            None,
+        )
+        .unwrap();
+    let version = fx
+        .store
+        .get_item(&item.identifier, fx.at(3))
+        .unwrap()
+        .item
+        .version;
+    let first = fx
+        .store
+        .set_status(
+            &item.identifier,
+            None,
+            Some(version),
+            StateKey::done(),
+            None,
+            Some("first completion note"),
+            &human,
+            fx.at(3),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        first.completion_note.as_deref(),
+        Some("first completion note")
+    );
+
+    // Reopen and finish again with a new note: the note must not stay at the
+    // first completion's text.
+    let version = first.version;
+    fx.store
+        .set_status(
+            &item.identifier,
+            None,
+            Some(version),
+            StateKey::doing(),
+            Some("reopened for a second pass"),
+            None,
+            &human,
+            fx.at(4),
+            None,
+        )
+        .unwrap();
+    let version = fx
+        .store
+        .get_item(&item.identifier, fx.at(5))
+        .unwrap()
+        .item
+        .version;
+    let second = fx
+        .store
+        .set_status(
+            &item.identifier,
+            None,
+            Some(version),
+            StateKey::done(),
+            None,
+            Some("second completion note"),
+            &human,
+            fx.at(5),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        second.completion_note.as_deref(),
+        Some("second completion note")
+    );
+}
+
+#[test]
+fn run_sync_preserves_a_custom_claim_lease() {
+    let mut fx = Fx::new();
+    let item = fx.create("Long lease");
+    let actor = fx.agent("agent-a", "sess-a");
+    let issued = fx
+        .store
+        .claim(
+            &item.identifier,
+            &actor,
+            ClaimRequest {
+                lease_seconds: Some(3600),
+                ..Default::default()
+            },
+            fx.at(0),
+            None,
+        )
+        .unwrap();
+    assert_eq!(issued.claim.lease_seconds, 3600);
+
+    // A run sync renews the lease the caller asked for, not the project default
+    // (60s in the fixture) — otherwise a long-running task loses its lease.
+    fx.store
+        .sync_run(
+            &item.identifier,
+            Some(&issued.token),
+            RunOutcome::Completed,
+            None,
+            &actor,
+            fx.at(1800),
+            None,
+        )
+        .unwrap();
+    let claim = fx
+        .store
+        .get_item(&item.identifier, fx.at(1800))
+        .unwrap()
+        .item
+        .claim
+        .unwrap();
+    assert_eq!(claim.lease_seconds, 3600);
+    assert_eq!(claim.expires_at, ts(fx.at(5400)));
+}
+
+#[test]
+fn keyword_search_treats_like_metacharacters_literally() {
+    let mut fx = Fx::new();
+    fx.create("100% coverage");
+    fx.create("100x coverage");
+    fx.create("snake_case title");
+    fx.create("snakeXcase title");
+    fx.create(r"back\slash");
+
+    let hits = |fx: &Fx, keywords: &str| {
+        fx.store
+            .list_items(
+                ListFilter {
+                    project: Some(fx.project.clone()),
+                    keywords: Some(keywords.to_string()),
+                    ..Default::default()
+                },
+                fx.at(1),
+            )
+            .unwrap()
+            .len()
+    };
+    assert_eq!(hits(&fx, "100%"), 1, "`%` must not act as a wildcard");
+    assert_eq!(hits(&fx, "coverage"), 2);
+    assert_eq!(hits(&fx, "snake_case"), 1, "`_` must not act as a wildcard");
+    assert_eq!(hits(&fx, "snake_case_"), 0);
+    assert_eq!(
+        hits(&fx, r"back\slash"),
+        1,
+        "`\\` must not escape the pattern"
+    );
+}

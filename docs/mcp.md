@@ -153,8 +153,10 @@ A claim token is a bearer secret; the database stores only `sha256(token)`, and
   (`session_file` | `memory_only` | `unavailable`).
 * Later writes resolve the token from that file; the caller never passes one, so
   a model cannot copy a token into `summary`/context by accident.
-* Every tool result is also scrubbed with the same `apm_[0-9a-f]{32,}` redaction
-  the Pi extension applies, and stderr diagnostics are token-free.
+* Every tool result is also scrubbed with the shared `apm_[A-Za-z0-9_-]{32,}`
+  redaction (`src/redact.rs`, also used by the NDJSON export), so claim tokens
+  and the `apm_rest_` / `apm_ui_` / `apm_boot_` shapes are covered alike; stderr
+  diagnostics are token-free.
 * `apm-mcp` never puts a token in an environment variable. It does not create
   child processes at all.
 

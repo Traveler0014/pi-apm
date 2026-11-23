@@ -98,6 +98,11 @@ impl Store {
         project: Option<&str>,
         mut out: impl Write,
     ) -> Result<ExportReport> {
+        // One read snapshot for the whole walk. Without it each table read would
+        // take its own SQLite snapshot, so a concurrent writer could make an
+        // item and its events/acceptance disagree. `unchecked_transaction` is
+        // the `&Connection` variant (we only read; the name is rusqlite's).
+        let tx = self.conn.unchecked_transaction()?;
         let project = self.require_project(project)?;
         let mut records = Vec::new();
         let push = |value: Value, records: &mut Vec<Value>| {
@@ -133,6 +138,11 @@ impl Store {
         for event in self.event_export(&project.id)? {
             push(event, &mut records);
         }
+
+        // Release the read snapshot before touching the output: writing to a
+        // slow pipe/stdout must not keep the WAL read transaction open (and
+        // hold back checkpoints) for as long as the consumer is slow.
+        tx.commit()?;
 
         let mut bytes = 0u64;
         for record in &records {
@@ -416,11 +426,14 @@ fn sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS.contains(&lower.as_str())
 }
 
-/// Remove known sensitive keys recursively, then redact token-shaped strings.
+/// Remove known sensitive keys recursively, then redact token-shaped strings
+/// with the shared [`crate::redact::redact_tokens`] scrub — the same one the MCP
+/// adapter uses, so claim / `apm_rest_` / `apm_ui_` / `apm_boot_` tokens cannot
+/// slip out of one surface while being caught by the other.
 /// Best effort only: it is not a general-purpose secret scanner (see README).
 fn sanitize_value(value: Value) -> Value {
     match value {
-        Value::String(text) => Value::String(redact_secrets(&text)),
+        Value::String(text) => Value::String(crate::redact::redact_tokens(&text)),
         Value::Array(items) => Value::Array(items.into_iter().map(sanitize_value).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()
@@ -432,47 +445,24 @@ fn sanitize_value(value: Value) -> Value {
     }
 }
 
-fn redact_secrets(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index..].starts_with(b"apm_") {
-            let start = index;
-            index += 4;
-            let body = index;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric()
-                    || bytes[index] == b'_'
-                    || bytes[index] == b'-')
-            {
-                index += 1;
-            }
-            if index - body >= 32 {
-                out.push_str("apm_[redacted]");
-            } else {
-                out.push_str(&input[start..index]);
-            }
-        } else {
-            let ch = input[index..].chars().next().expect("valid boundary");
-            out.push(ch);
-            index += ch.len_utf8();
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn redacts_token_shaped_strings_only() {
+        // Shared scrub: claim tokens and the prefixed REST/UI/boot shapes.
         let token = format!("apm_{}", "a".repeat(48));
         let text = format!("wrote {token} and apm_short here");
-        let redacted = redact_secrets(&text);
-        assert!(!redacted.contains(&token));
-        assert!(redacted.contains("apm_[redacted]"));
-        assert!(redacted.contains("apm_short"));
+        let redacted = sanitize_value(Value::String(text));
+        assert!(!redacted.to_string().contains(&token));
+        assert!(redacted.to_string().contains("apm_[redacted]"));
+        assert!(redacted.to_string().contains("apm_short"));
+        for prefix in ["apm_rest_", "apm_ui_", "apm_boot_"] {
+            let secret = format!("{prefix}{}", "b".repeat(40));
+            let scrubbed = sanitize_value(Value::String(format!("id {secret}"))).to_string();
+            assert!(!scrubbed.contains(&secret), "shape {prefix}");
+            assert!(scrubbed.contains("apm_[redacted]"), "shape {prefix}");
+        }
     }
 }

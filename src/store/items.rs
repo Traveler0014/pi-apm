@@ -186,7 +186,7 @@ impl Store {
                         return Err(Error::invalid("parent belongs to another project"));
                     }
                     if parent.state_category == Category::Closed.as_str() {
-                        return Err(Error::invalid("cannot nest under a cancelled item"));
+                        return Err(Error::invalid("cannot nest under a closed item"));
                     }
                     Some(parent.id)
                 }
@@ -241,13 +241,12 @@ impl Store {
                 at,
             )?;
 
-            for (i, label) in new.labels.iter().enumerate() {
+            for label in &new.labels {
                 let label = label.trim();
                 if label.is_empty() {
                     return Err(Error::invalid("labels must be non-empty"));
                 }
                 super::misc::attach_label(tx, &project_row.id, &id, label, &actor, at)?;
-                let _ = i;
             }
 
             for (seq, criterion) in new.acceptance.iter().enumerate() {
@@ -390,8 +389,10 @@ impl Store {
             args.push(Value::Text(agent.clone()));
         }
         if let Some(keywords) = &filter.keywords {
-            sql.push_str(" AND (i.title LIKE ? OR i.identifier LIKE ?)");
-            let like = format!("%{}%", keywords.trim());
+            // `LIKE` treats `%` and `_` as wildcards and `\` as the escape char;
+            // a keyword search must match the literal text the user typed.
+            sql.push_str(" AND (i.title LIKE ? ESCAPE '\\' OR i.identifier LIKE ? ESCAPE '\\')");
+            let like = format!("%{}%", escape_like(keywords.trim()));
             args.push(Value::Text(like.clone()));
             args.push(Value::Text(like));
         }
@@ -482,16 +483,7 @@ impl Store {
             }
             if let Some(parent) = &patch.parent {
                 raw.parent_id = match parent {
-                    Some(sel) => {
-                        let parent = require_raw_item(tx, sel)?;
-                        if parent.id == raw.id {
-                            return Err(Error::invalid("an item cannot be its own parent"));
-                        }
-                        if parent.project_id != raw.project_id {
-                            return Err(Error::invalid("parent belongs to another project"));
-                        }
-                        Some(parent.id)
-                    }
+                    Some(sel) => Some(resolve_parent_link(tx, &raw, sel)?),
                     None => None,
                 };
             }
@@ -539,14 +531,9 @@ impl Store {
         at: i64,
         idempotency_key: Option<&str>,
     ) -> Result<WorkItemView> {
-        let (project_row, item_id, item_workflow) = {
+        let (project_row, item_id) = {
             let raw = require_raw_item(&self.conn, selector)?;
-            let workflow = self.workflow_for_item(&raw)?;
-            (
-                self.require_project(Some(&raw.project_id))?,
-                raw.id.clone(),
-                workflow,
-            )
+            (self.require_project(Some(&raw.project_id))?, raw.id.clone())
         };
         let idem = Idem::new("item.status", idempotency_key)
             .item(Some(&item_id))
@@ -569,7 +556,16 @@ impl Store {
                 )));
             }
 
-            let workflow = &item_workflow;
+            // Read the snapshot *inside* `BEGIN IMMEDIATE`: the transition guard
+            // and the write it authorises must come from the same view of the
+            // workflow, never from a pre-transaction read that another process
+            // could have re-bound in between.
+            let workflow = super::workflows::load_workflow_on(
+                tx,
+                &raw.project_id,
+                &raw.workflow_id,
+                raw.workflow_version,
+            )?;
             let Some(target) = workflow.state(to.as_str()) else {
                 return Err(Error::WorkflowViolation(format!(
                     "state '{}' is not part of this item's workflow {} v{}",
@@ -615,8 +611,11 @@ impl Store {
                     raw.cancelled_at = None;
                 }
                 raw.waiting_on_human = false;
-                if raw.completion_note.is_none() {
-                    raw.completion_note = note.map(str::to_string);
+                // A new completion note replaces the old one: otherwise a reopen
+                // followed by a second done would keep reporting the first
+                // completion's note (and the guard would see stale text).
+                if let Some(note) = note {
+                    raw.completion_note = Some(note.to_string());
                 }
             } else {
                 raw.done_at = None;
@@ -868,14 +867,15 @@ impl Store {
         self.idempotent(idem, |tx| {
             let raw = require_raw_item(tx, selector)?;
             let claim = require_write_claim(tx, &raw, token, actor, at)?;
-            let settings = &project_row.settings;
 
             // Run sync is an explicit liveness ping from the holder, so it
-            // renews the lease. `last_progress_at` stays untouched.
+            // renews the lease. `last_progress_at` stays untouched. The renewed
+            // window is the claim's own lease: a caller that asked for a long
+            // lease must not be shortened to the project default by a sync.
             if let Some(claim) = &claim {
                 tx.execute(
                     "UPDATE claims SET heartbeat_at = ?1, expires_at = ?2 WHERE id = ?3",
-                    params![at, at + settings.lease_ms(), claim.id],
+                    params![at, at + claim.lease_seconds * 1000, claim.id],
                 )?;
                 tx.execute(
                     "UPDATE work_items SET last_heartbeat_at = ?1 WHERE id = ?2",
@@ -1031,6 +1031,62 @@ fn write_item(tx: &Transaction<'_>, raw: &RawItem, at: i64) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Validate a new parent link for `child`, returning the parent id.
+///
+/// Rejects a closed parent (finished work is not a container) and walks the
+/// whole ancestor chain, so reparenting cannot close a cycle of any depth — not
+/// just the direct self-parent case the old check covered.
+fn resolve_parent_link(
+    tx: &rusqlite::Connection,
+    child: &RawItem,
+    selector: &str,
+) -> Result<String> {
+    let parent = require_raw_item(tx, selector)?;
+    if parent.id == child.id {
+        return Err(Error::invalid("an item cannot be its own parent"));
+    }
+    if parent.project_id != child.project_id {
+        return Err(Error::invalid("parent belongs to another project"));
+    }
+    if parent.state_category == Category::Closed.as_str() {
+        return Err(Error::invalid("cannot nest under a closed item"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = parent.parent_id.clone();
+    while let Some(ancestor_id) = cursor {
+        if ancestor_id == child.id {
+            return Err(Error::invalid("parent chain would create a cycle"));
+        }
+        if !seen.insert(ancestor_id.clone()) {
+            // A cycle already exists upstream (corrupt/legacy data): fail closed
+            // instead of looping forever.
+            return Err(Error::invalid("parent chain already contains a cycle"));
+        }
+        cursor = tx
+            .query_row(
+                "SELECT parent_id FROM work_items WHERE id = ?1",
+                params![ancestor_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    Ok(parent.id)
+}
+
+/// Escape SQLite `LIKE` metacharacters so a keyword is matched literally.
+/// The caller pairs this with `ESCAPE '\'`.
+fn escape_like(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn changed_fields(before: &RawItem, after: &RawItem) -> Vec<&'static str> {

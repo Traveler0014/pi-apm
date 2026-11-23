@@ -177,13 +177,15 @@ apm export | jq -c .                        # or stream it to stdout
   stale credentials and will be rejected.
 - **Export** is NDJSON with `schema_version: 1`: a `meta` line (project +
   timestamp), then `item`, `context` (latest version), `acceptance`, `evidence`,
-  `dependency` and `event` records. Claims, sessions, run ids and token files are
-  excluded by construction; known session/run/token/idempotency keys are removed
-  recursively (including nested event payloads), and token-shaped strings are
-  redacted defensively. That replacement is **not** a general secret scanner:
-  review an export before publishing it. It is for audit and archival — there is
-  no importer and it is not a sync format. A file target is created exclusively
-  with mode 0600 and is never overwritten.
+  `dependency` and `event` records, all read inside one SQLite read transaction
+  so a concurrent write cannot make an item and its history disagree. Claims,
+  sessions, run ids and token files are excluded by construction; known
+  session/run/token/idempotency keys are removed recursively (including nested
+  event payloads), and token-shaped strings are redacted defensively. That
+  replacement is **not** a general secret scanner: review an export before
+  publishing it. It is for audit and archival — there is no importer and it is
+  not a sync format. A file target is created exclusively with mode 0600 and is
+  never overwritten.
 
 
 ---

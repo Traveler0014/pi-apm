@@ -14,6 +14,7 @@ pub mod db;
 pub mod error;
 pub mod mcp;
 pub mod model;
+pub mod redact;
 pub mod rest;
 pub mod session_store;
 pub mod store;
